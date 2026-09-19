@@ -1,7 +1,10 @@
 use crate::device::CUDA_TOP_K_LIMIT;
+use crate::executable::{
+    compile_stateful_with_layout, CudaKvCache, CudaKvSnapshot, CudaStateLayout,
+};
 use crate::{
-    compile_stateful_with_options, compile_with_options, CudaDevice, CudaExecutable,
-    CudaSequenceState, CudaStateInvocation, CudaValue,
+    compile_with_options, CudaDevice, CudaExecutable, CudaSequenceState, CudaStateInvocation,
+    CudaValue,
 };
 use cudarc::driver::CudaSlice;
 use effect_torch_compiler::{
@@ -15,7 +18,8 @@ use effect_torch_graph::{
 use effect_torch_napi::{run_compute, CancellationState};
 use effect_torch_runtime::{
     effective_probabilities, purpose_counter, random_unit, sample_logits, sample_probabilities,
-    DType, GgmlKQuant, SamplingOptions, SamplingPurpose,
+    DType, PackedFormat, SamplingOptions, SamplingPurpose, StorageMetadata, StorageRepresentation,
+    ValueSpec,
 };
 use napi::bindgen_prelude::{Buffer, Uint8Array};
 use napi::{Error, Result, Status};
@@ -55,31 +59,49 @@ fn parse_dtype(dtype: &str) -> Result<DType> {
     }
 }
 
-fn parse_kquant(encoding: &str) -> Result<GgmlKQuant> {
-    match encoding {
-        "Q2_K" => Ok(GgmlKQuant::Q2K),
-        "Q3_K" => Ok(GgmlKQuant::Q3K),
-        "Q4_K" => Ok(GgmlKQuant::Q4K),
-        "Q5_K" => Ok(GgmlKQuant::Q5K),
-        "Q6_K" => Ok(GgmlKQuant::Q6K),
-        _ => Err(invalid(format!("unsupported CUDA encoding {encoding}"))),
+#[napi(object)]
+pub struct NativeStorageMetadata {
+    pub representation: String,
+    pub format: Option<String>,
+}
+
+fn native_storage(representation: StorageRepresentation) -> NativeStorageMetadata {
+    match representation {
+        StorageRepresentation::Dense => NativeStorageMetadata {
+            representation: "dense".to_string(),
+            format: None,
+        },
+        StorageRepresentation::Packed(format) => NativeStorageMetadata {
+            representation: "packed".to_string(),
+            format: Some(format.name().to_string()),
+        },
     }
 }
 
-fn encode(values: Vec<f64>, dtype: DType) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for value in values {
-        match dtype {
-            DType::F64 => bytes.extend_from_slice(&value.to_le_bytes()),
-            DType::F32 | DType::F16 | DType::BF16 => {
-                bytes.extend_from_slice(&(value as f32).to_le_bytes());
-            }
-            DType::I64 => bytes.extend_from_slice(&(value as i64).to_le_bytes()),
-            DType::U32 => bytes.extend_from_slice(&(value as u32).to_le_bytes()),
-            DType::U8 => bytes.push(value as u8),
-        }
+fn input_storage(attributes: &JsonValue) -> Result<StorageMetadata> {
+    let Some(storage) = attributes.get("storage") else {
+        return Ok(StorageMetadata::dense());
+    };
+    let object = storage
+        .as_object()
+        .ok_or_else(|| invalid("input storage must be an object"))?;
+    if object
+        .keys()
+        .any(|key| key != "representation" && key != "format")
+    {
+        return Err(invalid("input storage contains an unknown field"));
     }
-    bytes
+    match string(storage, "representation")? {
+        "dense" if !object.contains_key("format") => Ok(StorageMetadata::dense()),
+        "packed" => {
+            let PackedFormat::GgmlKQuant(codec) =
+                PackedFormat::from_name(string(storage, "format")?).map_err(invalid)?;
+            Ok(StorageMetadata::packed(codec))
+        }
+        other => Err(invalid(format!(
+            "invalid input storage representation {other:?}"
+        ))),
+    }
 }
 
 fn shape(shape: Vec<u32>) -> Vec<usize> {
@@ -256,6 +278,22 @@ pub struct NativeMemoryDiagnostics {
 }
 
 #[napi(object)]
+pub struct NativeDTypeLegalizationDiagnostics {
+    pub target_backend: String,
+    pub target_architecture: String,
+    pub lowering_abi_revision: f64,
+    pub policy_revision: f64,
+    pub capability_queries: f64,
+    pub native_lowering_units: f64,
+    pub legalized_lowering_units: f64,
+    pub kernel_local_legalizations: f64,
+    pub materialized_conversions: f64,
+    pub materialized_conversion_bytes: f64,
+    pub decompositions: f64,
+    pub rejected_region_candidates: f64,
+}
+
+#[napi(object)]
 pub struct NativeExecutableDiagnostics {
     pub semantic_nodes_before_optimization: f64,
     pub semantic_nodes_after_optimization: f64,
@@ -264,6 +302,7 @@ pub struct NativeExecutableDiagnostics {
     pub command_count: f64,
     pub synchronization_count: f64,
     pub memory: NativeMemoryDiagnostics,
+    pub legalization: NativeDTypeLegalizationDiagnostics,
     pub compile_phases: Vec<NativeCompilePhaseDiagnostics>,
 }
 
@@ -271,6 +310,7 @@ fn executable_diagnostics(
     diagnostics: &effect_torch_runtime::ExecutableDiagnostics,
 ) -> NativeExecutableDiagnostics {
     let memory = &diagnostics.memory;
+    let legalization = &diagnostics.legalization;
     NativeExecutableDiagnostics {
         semantic_nodes_before_optimization: diagnostics.semantic_nodes_before_optimization as f64,
         semantic_nodes_after_optimization: diagnostics.semantic_nodes_after_optimization as f64,
@@ -294,6 +334,20 @@ fn executable_diagnostics(
             transaction_bytes: memory.transaction_bytes as f64,
             peak_live_bytes: memory.peak_live_bytes as f64,
             packing_overhead_bytes: memory.packing_overhead_bytes as f64,
+        },
+        legalization: NativeDTypeLegalizationDiagnostics {
+            target_backend: legalization.target_backend.clone(),
+            target_architecture: legalization.target_architecture.clone(),
+            lowering_abi_revision: legalization.lowering_abi_revision as f64,
+            policy_revision: legalization.policy_revision as f64,
+            capability_queries: legalization.capability_queries as f64,
+            native_lowering_units: legalization.native_lowering_units as f64,
+            legalized_lowering_units: legalization.legalized_lowering_units as f64,
+            kernel_local_legalizations: legalization.kernel_local_legalizations as f64,
+            materialized_conversions: legalization.materialized_conversions as f64,
+            materialized_conversion_bytes: legalization.materialized_conversion_bytes as f64,
+            decompositions: legalization.decompositions as f64,
+            rejected_region_candidates: legalization.rejected_region_candidates as f64,
         },
         compile_phases: diagnostics
             .compile_phases
@@ -422,10 +476,9 @@ impl Hash for BlockKey {
 struct SequenceState {
     cursor: u32,
     tokens: Vec<u32>,
-    keys: Vec<Vec<f64>>,
-    values: Vec<Vec<f64>>,
-    kda_states: Vec<Vec<f64>>,
-    conv_states: Vec<Vec<f64>>,
+    kv_storage: Option<CudaKvSnapshot>,
+    kda_states: Vec<Vec<f32>>,
+    conv_states: Vec<Vec<f32>>,
     block_keys: Vec<BlockKey>,
 }
 
@@ -438,9 +491,7 @@ struct SequenceInner {
 }
 
 struct SequenceDeviceCache {
-    keys: Arc<CudaSlice<f32>>,
-    values: Arc<CudaSlice<f32>>,
-    layer_size: usize,
+    kv: CudaKvCache,
     cursor: Option<Arc<CudaSlice<u32>>>,
     valid: Option<Arc<CudaSlice<u32>>>,
     decode_graph: Option<crate::executable::CudaDecodeGraph>,
@@ -555,8 +606,6 @@ impl NativeKvPool {
             inner: Arc::new(SequenceInner {
                 pool: self.inner.clone(),
                 state: Mutex::new(SequenceState {
-                    keys: vec![Vec::new(); self.inner.layers as usize],
-                    values: vec![Vec::new(); self.inner.layers as usize],
                     kda_states: vec![
                         vec![0.0; kda_state_size];
                         self.inner.recurrent.kda_layers as usize
@@ -629,22 +678,8 @@ impl NativeKvSequence {
                 .as_ref()
                 .map(|cache| {
                     let device = CudaDevice::get(self.inner.pool.ordinal).map_err(failure)?;
-                    let mut keys = unsafe { device.stream.alloc::<f32>(cache.keys.len()) }
-                        .map_err(|error| failure(error.to_string()))?;
-                    let mut values = unsafe { device.stream.alloc::<f32>(cache.values.len()) }
-                        .map_err(|error| failure(error.to_string()))?;
-                    device
-                        .stream
-                        .memcpy_dtod(cache.keys.as_ref(), &mut keys)
-                        .map_err(|error| failure(error.to_string()))?;
-                    device
-                        .stream
-                        .memcpy_dtod(cache.values.as_ref(), &mut values)
-                        .map_err(|error| failure(error.to_string()))?;
                     Ok::<_, Error>(SequenceDeviceCache {
-                        keys: Arc::new(keys),
-                        values: Arc::new(values),
-                        layer_size: cache.layer_size,
+                        kv: cache.kv.try_clone(&device).map_err(failure)?,
                         cursor: None,
                         valid: None,
                         decode_graph: None,
@@ -697,12 +732,7 @@ impl NativeKvSequence {
                     *references = references.saturating_sub(1);
                 }
             }
-            for layer in &mut state.keys {
-                layer.fill(0.0);
-            }
-            for layer in &mut state.values {
-                layer.fill(0.0);
-            }
+            state.kv_storage = None;
             for layer in &mut state.kda_states {
                 layer.fill(0.0);
             }
@@ -957,6 +987,11 @@ impl LazyTensor {
     }
 
     #[napi(getter)]
+    pub fn storage(&self) -> NativeStorageMetadata {
+        native_storage(self.node.value_spec().storage.representation)
+    }
+
+    #[napi(getter)]
     pub fn device(&self) -> String {
         match self.node.device {
             Device::Cuda(ordinal) => format!("cuda:{ordinal}"),
@@ -1023,28 +1058,7 @@ impl NativeTensor {
 
     #[napi(js_name = "writeBytes")]
     pub fn write_bytes(&self, data: Uint8Array) -> Result<()> {
-        let value = self.value()?;
-        if value.dtype() == DType::I64 {
-            if !data.len().is_multiple_of(8) {
-                return Err(invalid(format!(
-                    "CUDA i64 byte length {} is not divisible by 8",
-                    data.len()
-                )));
-            }
-            return value
-                .write_i64_host(
-                    &data
-                        .chunks_exact(8)
-                        .map(|bytes| {
-                            i64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"))
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(failure);
-        }
-        value
-            .write_host(&crate::executable::decode(&data, value.dtype()).map_err(failure)?)
-            .map_err(failure)
+        self.value()?.write_storage_bytes(&data).map_err(failure)
     }
 
     #[napi(getter)]
@@ -1060,6 +1074,11 @@ impl NativeTensor {
     #[napi(getter)]
     pub fn dtype(&self) -> Result<String> {
         Ok(self.value()?.dtype().name().to_string())
+    }
+
+    #[napi(getter)]
+    pub fn storage(&self) -> Result<NativeStorageMetadata> {
+        Ok(native_storage(self.value()?.spec().storage.representation))
     }
 
     #[napi(getter)]
@@ -1079,20 +1098,25 @@ impl NativeTensor {
             if cancelled.is_cancelled() {
                 return Err(Error::new(Status::Cancelled, "operation aborted"));
             }
-            let dtype = value.dtype();
-            if dtype == DType::I64 {
-                let values = value.readback_i64().map_err(failure)?;
-                let mut bytes = Vec::with_capacity(values.len() * 8);
-                for value in values {
-                    bytes.extend_from_slice(&value.to_le_bytes());
-                }
-                return Ok(Buffer::from(bytes));
+            if value.spec().storage.representation != StorageRepresentation::Dense {
+                return Err(invalid(
+                    "packed tensors require explicit dequantization before readback",
+                ));
             }
-            let values = value.readback().map_err(failure)?;
+            let bytes = if matches!(value.dtype(), DType::F16 | DType::BF16) {
+                value
+                    .readback()
+                    .map_err(failure)?
+                    .into_iter()
+                    .flat_map(|value| (value as f32).to_le_bytes())
+                    .collect()
+            } else {
+                value.read_storage_bytes().map_err(failure)?
+            };
             if cancelled.is_cancelled() {
                 return Err(Error::new(Status::Cancelled, "operation aborted"));
             }
-            Ok(Buffer::from(encode(values, dtype)))
+            Ok(Buffer::from(bytes))
         })
         .await
     }
@@ -1322,12 +1346,49 @@ impl Executable {
     }
 
     fn decode_state_with_schema(
+        executable: &CudaExecutable,
         schema: &CudaStateSchema,
         leases: &[SequenceLease],
         slots: &[u32],
         valid_lengths: &[u32],
     ) -> Result<CudaStateInvocation> {
-        let device_cache = if leases.len() == 1 && slots == [0] && valid_lengths.len() == 1 {
+        let retains_single_cache = leases.len() == 1 && slots == [0] && valid_lengths.len() == 1;
+        if !retains_single_cache {
+            for lease in leases {
+                if lease
+                    .inner
+                    .device_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_none()
+                {
+                    continue;
+                }
+                let singleton = std::slice::from_ref(lease);
+                let mut retained =
+                    Self::decode_state_with_schema(executable, schema, singleton, &[0], &[0])?;
+                if let Err(error) = executable.readback_state(&mut retained) {
+                    Self::retain_device_cache(singleton, &[0], &mut retained);
+                    return Err(failure(error));
+                }
+                let snapshot = match retained.sequences[0].kv_storage.take() {
+                    Some(snapshot) => snapshot,
+                    None => {
+                        Self::retain_device_cache(singleton, &[0], &mut retained);
+                        return Err(failure(
+                            "CUDA retained cache readback did not publish a storage snapshot",
+                        ));
+                    }
+                };
+                lease
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .kv_storage = Some(snapshot);
+            }
+        }
+        let device_cache = if retains_single_cache {
             leases[0]
                 .inner
                 .device_cache
@@ -1338,12 +1399,10 @@ impl Executable {
             None
         };
         let retained_kv = device_cache.is_some();
-        let (key_cache, value_cache, cache_layer_size, cursor_device, valid_device, decode_graph) =
-            device_cache.map_or((None, None, None, None, None, None), |cache| {
+        let (cache, cursor_device, valid_device, decode_graph) =
+            device_cache.map_or((None, None, None, None), |cache| {
                 (
-                    Some(cache.keys),
-                    Some(cache.values),
-                    Some(cache.layer_size),
+                    Some(cache.kv),
                     cache.cursor,
                     cache.valid,
                     cache.decode_graph,
@@ -1360,15 +1419,12 @@ impl Executable {
                         .unwrap_or_else(|error| error.into_inner());
                     CudaSequenceState {
                         cursor: state.cursor,
-                        keys: if retained_kv {
-                            Vec::new()
+                        keys: Vec::new(),
+                        values: Vec::new(),
+                        kv_storage: if retained_kv {
+                            None
                         } else {
-                            state.keys.clone()
-                        },
-                        values: if retained_kv {
-                            Vec::new()
-                        } else {
-                            state.values.clone()
+                            state.kv_storage.clone()
                         },
                         kda_states: state.kda_states.clone(),
                         conv_states: state.conv_states.clone(),
@@ -1380,13 +1436,10 @@ impl Executable {
             capacity: leases[0].inner.pool.max_tokens,
             cache_dtype: leases[0].inner.pool.dtype,
             packed_rows_per_sequence: schema.packed_rows_per_sequence,
-            key_cache,
-            value_cache,
-            cache_layer_size,
+            cache,
             cursor_device,
             valid_device,
             decode_graph,
-            prepared_kv: None,
         })
     }
 
@@ -1395,18 +1448,15 @@ impl Executable {
             return true;
         }
         let pool = &leases[0].inner.pool;
-        if pool.recurrent.kda_layers > 0 || pool.recurrent.conv_layers > 0 {
-            let cursor = leases[0]
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .cursor;
-            return cursor
-                .saturating_add(advances[0])
-                .is_multiple_of(pool.block_size);
-        }
-        false
+        let cursor = leases[0]
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cursor;
+        cursor
+            .saturating_add(advances[0])
+            .is_multiple_of(pool.block_size)
     }
 
     fn retain_device_cache(
@@ -1417,11 +1467,7 @@ impl Executable {
         if leases.len() != 1 || slots != [0] || decoded.valid_lengths.len() != 1 {
             return;
         }
-        let (Some(keys), Some(values), Some(layer_size)) = (
-            decoded.key_cache.take(),
-            decoded.value_cache.take(),
-            decoded.cache_layer_size,
-        ) else {
+        let Some(cache) = decoded.cache.take() else {
             return;
         };
         *leases[0]
@@ -1429,9 +1475,7 @@ impl Executable {
             .device_cache
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(SequenceDeviceCache {
-            keys,
-            values,
-            layer_size,
+            kv: cache,
             cursor: decoded.cursor_device.take(),
             valid: decoded.valid_device.take(),
             decode_graph: decoded.decode_graph.take(),
@@ -1469,8 +1513,7 @@ impl Executable {
             state.cursor = state.cursor.saturating_add(advance);
             state.tokens.extend_from_slice(&tokens[request]);
             if commit_kv {
-                state.keys = decoded.sequences[request].keys.clone();
-                state.values = decoded.sequences[request].values.clone();
+                state.kv_storage = decoded.sequences[request].kv_storage.clone();
             }
             state.kda_states = decoded.sequences[request].kda_states.clone();
             state.conv_states = decoded.sequences[request].conv_states.clone();
@@ -1519,8 +1562,7 @@ impl Executable {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if commit_kv {
-                state.keys = decoded.sequences[request].keys.clone();
-                state.values = decoded.sequences[request].values.clone();
+                state.kv_storage = decoded.sequences[request].kv_storage.clone();
             }
             state.kda_states = decoded.sequences[request].kda_states.clone();
             state.conv_states = decoded.sequences[request].conv_states.clone();
@@ -1702,8 +1744,13 @@ impl Executable {
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
         let notify = token.map(|token| token.notify.clone());
         run_compute(state, notify, move |cancelled, _| {
-            let mut decode_state =
-                Self::decode_state_with_schema(&schema, &leases, &slots, &valid_lengths)?;
+            let mut decode_state = Self::decode_state_with_schema(
+                &executable,
+                &schema,
+                &leases,
+                &slots,
+                &valid_lengths,
+            )?;
             Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
                 let pool = leases[0].inner.pool.clone();
                 let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
@@ -1783,8 +1830,13 @@ impl Executable {
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
         let notify = token.map(|token| token.notify.clone());
         run_compute(state, notify, move |cancelled, _| {
-            let mut decode_state =
-                Self::decode_state_with_schema(&schema, &leases, &slots, &valid_lengths)?;
+            let mut decode_state = Self::decode_state_with_schema(
+                &executable,
+                &schema,
+                &leases,
+                &slots,
+                &valid_lengths,
+            )?;
             Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
                 let pool = leases[0].inner.pool.clone();
                 let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
@@ -1927,8 +1979,13 @@ impl Executable {
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
         let notify = token.map(|token| token.notify.clone());
         run_compute(state, notify, move |cancelled, _| {
-            let mut decode_state =
-                Self::decode_state_with_schema(&schema, &leases, &slots, &valid_lengths)?;
+            let mut decode_state = Self::decode_state_with_schema(
+                &executable,
+                &schema,
+                &leases,
+                &slots,
+                &valid_lengths,
+            )?;
             Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
                 let pool = leases[0].inner.pool.clone();
                 let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
@@ -2112,7 +2169,7 @@ impl Executable {
         let notify = token.map(|token| token.notify.clone());
         run_compute(state, notify, move |cancelled, _| {
             let mut decode_state =
-                Self::decode_state_with_schema(&schema, &leases, &slots, &valid_lengths)?;
+                Self::decode_state_with_schema(&executable, &schema, &leases, &slots, &valid_lengths)?;
             Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
             let proposal = proposal_probabilities
                 .as_ref()
@@ -2323,14 +2380,13 @@ impl Executable {
                 .any(|(request, &slot)| actual_advances[slot as usize] != page_limits[request])
             {
                 let mut committed = Self::decode_state_with_schema(
+                    &executable,
                     &schema,
                     &leases,
                     &slots,
                     &actual_advances,
                 )?;
-                committed.key_cache = decode_state.key_cache.take();
-                committed.value_cache = decode_state.value_cache.take();
-                committed.cache_layer_size = decode_state.cache_layer_size;
+                committed.cache = decode_state.cache.take();
                 *decode_state = committed;
                 drop(values);
                 values = executable
@@ -2456,30 +2512,8 @@ impl CudaRuntime {
     ) -> Result<NativeTensor> {
         let dtype = parse_dtype(&dtype)?;
         let shape = shape(dimensions);
-        let value = if dtype == DType::I64 {
-            if !data.len().is_multiple_of(8) {
-                return Err(invalid(format!(
-                    "CUDA i64 byte length {} is not divisible by 8",
-                    data.len()
-                )));
-            }
-            CudaValue::from_i64_host(
-                self._device.clone(),
-                shape,
-                &data
-                    .chunks_exact(8)
-                    .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("eight-byte chunk")))
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            CudaValue::from_host(
-                self._device.clone(),
-                shape,
-                dtype,
-                &crate::executable::decode(&data, dtype).map_err(failure)?,
-            )
-        }
-        .map_err(failure)?;
+        let value = CudaValue::from_dense_bytes(self._device.clone(), shape, dtype, &data)
+            .map_err(failure)?;
         Ok(NativeTensor::wrap(value))
     }
 
@@ -2557,13 +2591,26 @@ impl CudaRuntime {
                 dtype: parse_dtype(string(&attributes, "dtype")?)?,
                 device: expected,
             },
-            "input" => NodeKind::Input {
-                slot: u32::try_from(integer(&attributes, "slot")?)
-                    .map_err(|_| invalid("input slot exceeds u32"))?,
-                shape: dimensions(&attributes, "shape")?,
-                dtype: parse_dtype(string(&attributes, "dtype")?)?,
-                device: expected,
-            },
+            "input" => {
+                let shape = dimensions(&attributes, "shape")?;
+                let dtype = parse_dtype(string(&attributes, "dtype")?)?;
+                let storage = input_storage(&attributes)?;
+                ValueSpec {
+                    semantic_dtype: dtype,
+                    logical_shape: &shape,
+                    storage: storage.as_spec(),
+                }
+                .validate()
+                .map_err(invalid)?;
+                NodeKind::Input {
+                    slot: u32::try_from(integer(&attributes, "slot")?)
+                        .map_err(|_| invalid("input slot exceeds u32"))?,
+                    shape,
+                    dtype,
+                    storage,
+                    device: expected,
+                }
+            }
             "scalarInput" => NodeKind::ScalarInput {
                 slot: u32::try_from(integer(&attributes, "slot")?)
                     .map_err(|_| invalid("scalar input slot exceeds u32"))?,
@@ -2735,29 +2782,12 @@ impl CudaRuntime {
                 weight: input(&inputs, 1, &operation)?,
                 bias: input(&inputs, 2, &operation)?,
             },
-            "quantizedLinear" => {
-                let logical = dimensions(&attributes, "logicalShape")?;
-                if logical.len() != 2 {
-                    return Err(invalid(
-                        "quantizedLinear: logical shape must be [rows, columns]",
-                    ));
-                }
-                let codec = parse_kquant(string(&attributes, "encoding")?)?;
-                NodeKind::QuantizedLinear {
-                    x: input(&inputs, 0, &operation)?,
-                    weight: input(&inputs, 1, &operation)?,
-                    bias: inputs.get(2).cloned(),
-                    codec,
-                    weight_shape: [logical[0], logical[1]],
-                }
-            }
+            "quantizedLinear" => NodeKind::QuantizedLinear {
+                x: input(&inputs, 0, &operation)?,
+                weight: input(&inputs, 1, &operation)?,
+                bias: inputs.get(2).cloned(),
+            },
             "quantizedEmbedding" => {
-                let logical = dimensions(&attributes, "logicalShape")?;
-                if logical.len() != 2 {
-                    return Err(invalid(
-                        "quantizedEmbedding: logical shape must be [rows, columns]",
-                    ));
-                }
                 let padding_index = match attributes.get("paddingIndex") {
                     None | Some(JsonValue::Null) => None,
                     Some(value) => Some(
@@ -2772,8 +2802,6 @@ impl CudaRuntime {
                 NodeKind::QuantizedEmbedding {
                     indexes: input(&inputs, 0, &operation)?,
                     weight: input(&inputs, 1, &operation)?,
-                    codec: parse_kquant(string(&attributes, "encoding")?)?,
-                    weight_shape: [logical[0], logical[1]],
                     padding_index,
                 }
             }
@@ -2900,6 +2928,10 @@ impl CudaRuntime {
                         "compile: batch, maxTokens, and blockSize must be positive and blockSize must divide maxTokens",
                     ));
                 }
+                let kv_dtype = parse_dtype(&native.kv_dtype)?;
+                if !matches!(kv_dtype, DType::F32 | DType::F16 | DType::BF16 | DType::U8) {
+                    return Err(invalid("compile: KV dtype must be f32, f16, bf16, or u8"));
+                }
                 if native
                     .window
                     .is_some_and(|window| window == 0 || window > native.max_tokens)
@@ -2947,7 +2979,7 @@ impl CudaRuntime {
                 Some(CudaStateSchema {
                     max_tokens: native.max_tokens,
                     block_size: native.block_size,
-                    kv_dtype: parse_dtype(&native.kv_dtype)?,
+                    kv_dtype,
                     window: if geometry.allows_window_eviction {
                         native.window
                     } else {
@@ -2961,12 +2993,18 @@ impl CudaRuntime {
         };
         let options = compile_options(options, state.is_some());
         let compiled = match &state {
-            Some(state) => compile_stateful_with_options(
+            Some(state) => compile_stateful_with_layout(
                 roots,
                 self.ordinal,
                 state.geometry.cursor_slot,
                 state.geometry.cursor_tensor,
                 options,
+                CudaStateLayout {
+                    capacity: state.max_tokens,
+                    dtype: state.kv_dtype,
+                    slots: state.batch,
+                    packed_rows_per_sequence: state.packed_rows_per_sequence,
+                },
             ),
             None => compile_with_options(roots, self.ordinal, options),
         };
@@ -3006,6 +3044,62 @@ pub struct NativeSafetensorsEntry {
 pub struct NativeSafetensorsArchive {
     pub entries: Vec<NativeSafetensorsEntry>,
     pub metadata: HashMap<String, String>,
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeSafetensorsTensorInfo {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u32>,
+    pub byte_length: f64,
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeSafetensorsInspection {
+    pub entries: Vec<NativeSafetensorsTensorInfo>,
+    pub metadata: HashMap<String, String>,
+}
+
+fn native_safetensors_inspection(
+    inspection: effect_torch_napi::safetensors::Inspection,
+) -> Result<NativeSafetensorsInspection> {
+    let mut entries = Vec::with_capacity(inspection.entries.len());
+    for meta in inspection.entries {
+        entries.push(NativeSafetensorsTensorInfo {
+            name: meta.name,
+            dtype: effect_torch_napi::safetensors::dtype_name(meta.dtype),
+            shape: meta.shape,
+            byte_length: effect_torch_napi::safetensors::byte_length_f64(meta.byte_length)
+                .map_err(effect_torch_napi::safetensors::Error::into_napi)?,
+        });
+    }
+    Ok(NativeSafetensorsInspection {
+        entries,
+        metadata: inspection.metadata,
+    })
+}
+
+/// Reads a standalone safetensors header or a Hugging Face index and every
+/// shard header it references without acquiring a CUDA device or allocating.
+#[napi]
+pub async fn inspect_safetensors(
+    path: String,
+    token: Option<&CancellationToken>,
+) -> Result<NativeSafetensorsInspection> {
+    let state = token
+        .map(|token| token.state.clone())
+        .unwrap_or_else(|| Arc::new(CancellationState::new()));
+    let notify = token.map(|token| token.notify.clone());
+    run_compute(state, notify, move |cancelled, _| {
+        if cancelled.is_cancelled() {
+            return Err(Error::new(Status::Cancelled, "operation aborted"));
+        }
+        let inspection =
+            effect_torch_napi::safetensors::inspect(&path, &|| cancelled.is_cancelled())
+                .map_err(effect_torch_napi::safetensors::Error::into_napi)?;
+        native_safetensors_inspection(inspection)
+    })
+    .await
 }
 
 #[napi]
@@ -3054,6 +3148,7 @@ pub async fn load_tensors(
     path: String,
     device: u32,
     token: Option<&CancellationToken>,
+    names: Option<Vec<String>>,
 ) -> Result<NativeSafetensorsArchive> {
     let device = CudaDevice::get(device).map_err(failure)?;
     let state = token
@@ -3064,7 +3159,10 @@ pub async fn load_tensors(
         if cancelled.is_cancelled() {
             return Err(Error::new(Status::Cancelled, "operation aborted"));
         }
-        let archive = safetensors_io::load(&path, device).map_err(failure)?;
+        let archive = safetensors_io::load(&path, names.as_deref(), device, &|| {
+            cancelled.is_cancelled()
+        })
+        .map_err(effect_torch_napi::safetensors::Error::into_napi)?;
         if cancelled.is_cancelled() {
             return Err(Error::new(Status::Cancelled, "operation aborted"));
         }
@@ -3081,4 +3179,61 @@ pub async fn load_tensors(
         })
     })
     .await
+}
+
+#[cfg(test)]
+#[path = "napi_state_storage_tests.rs"]
+mod state_storage_tests;
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn input_metadata_accepts_only_closed_representations() {
+        for invalid_storage in [
+            json!(null),
+            json!("Q4_K"),
+            json!({}),
+            json!({"representation": "opaque"}),
+            json!({"representation": "packed"}),
+            json!({"representation": "dense", "format": "Q4_K"}),
+            json!({"representation": "packed", "format": "GGML"}),
+            json!({"representation": "packed", "format": "Q4_K", "blockSize": 256}),
+        ] {
+            assert!(input_storage(&json!({"storage": invalid_storage})).is_err());
+        }
+        assert_eq!(input_storage(&json!({})).unwrap(), StorageMetadata::dense());
+        assert_eq!(
+            input_storage(&json!({"storage": {"representation": "dense"}})).unwrap(),
+            StorageMetadata::dense()
+        );
+        for format in ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"] {
+            let storage =
+                input_storage(&json!({"storage": {"representation": "packed", "format": format}}))
+                    .unwrap();
+            let spec = ValueSpec {
+                semantic_dtype: DType::F32,
+                logical_shape: &[2, 256],
+                storage: storage.as_spec(),
+            };
+            assert!(spec.validate().is_ok());
+            assert!(ValueSpec {
+                semantic_dtype: DType::U8,
+                ..spec
+            }
+            .validate()
+            .is_err());
+            assert!(ValueSpec {
+                logical_shape: &[2, 257],
+                ..spec
+            }
+            .validate()
+            .is_err());
+            let published = native_storage(storage.representation);
+            assert_eq!(published.representation, "packed");
+            assert_eq!(published.format.as_deref(), Some(format));
+        }
+    }
 }

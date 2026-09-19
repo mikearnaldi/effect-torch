@@ -244,8 +244,20 @@ const inferencePhases: ReadonlySet<string> = new Set([
 ])
 const isInferenceFailurePhase = (value: string): value is Runtime.InferenceFailurePhase => inferencePhases.has(value)
 const isGgufFormat = (value: string): value is Runtime.GgufTensorDescriptor["format"] =>
-  value === "F32" || value === "Q2_K" || value === "Q3_K" || value === "Q4_K" || value === "Q5_K" ||
-  value === "Q6_K"
+  value === "F32" || Runtime.isTensorStorageEncoding(value)
+
+const tensorStorage = (
+  shape: ReadonlyArray<number>,
+  storage: LazyTensor["storage"]
+): Runtime.EncodedTensorStorage | undefined => {
+  if (storage.representation === "dense" && storage.format === undefined) return undefined
+  if (storage.representation !== "packed" || !Runtime.isTensorStorageEncoding(storage.format)) {
+    throw new Error("native runtime returned an unsupported storage representation")
+  }
+  const geometry = Runtime.encodedStorageGeometry(storage.format, shape)
+  if (geometry === undefined) throw new Error("native runtime returned invalid packed tensor geometry")
+  return { encoding: storage.format, physicalShape: geometry.physicalShape, physicalDtype: "u8" }
+}
 
 const backendError = (
   operation: string,
@@ -495,8 +507,7 @@ export const createRuntimeAdapter = (
     }
     if (
       storage !== undefined &&
-      (tensorDtype !== "f32" || storage.physicalDtype !== "u8" ||
-        !storage.physicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0))
+      (tensorDtype !== "f32" || !Runtime.validEncodedStorage(shape, storage))
     ) {
       throw new Error("native runtime returned invalid encoded tensor metadata")
     }
@@ -533,12 +544,20 @@ export const createRuntimeAdapter = (
     }
   ): Runtime.LazyTensorHandle => {
     const [nativeShape, nativeDtype] = value.metadata()
+    const storage = tensorStorage(nativeShape, value.storage)
+    if (
+      logical !== undefined &&
+      (!sameShape(nativeShape, logical.shape) || nativeDtype !== logical.dtype ||
+        !sameStorage(storage, logical.storage))
+    ) {
+      throw new Error("native runtime returned tensor metadata inconsistent with its logical declaration")
+    }
     const handle = tensorObject<Runtime.LazyTensorHandle>(
       "LazyTensor",
-      logical?.shape ?? nativeShape,
-      logical?.dtype ?? nativeDtype,
+      nativeShape,
+      nativeDtype,
       device,
-      logical?.storage
+      storage
     )
     handleRecords.set(handle, {
       owner,
@@ -562,26 +581,22 @@ export const createRuntimeAdapter = (
       readonly storage?: Runtime.EncodedTensorStorage | undefined
     }
   ): Runtime.ConcreteTensorHandle => {
-    const expectedShape = logical?.storage?.physicalShape ?? logical?.shape
-    const expectedDtype = logical?.storage?.physicalDtype ?? logical?.dtype
+    const storage = tensorStorage(value.shape, value.storage)
     if (
-      expectedShape !== undefined &&
-      (value.shape.length !== expectedShape.length ||
-        value.shape.some((dimension, index) => dimension !== expectedShape[index]) ||
-        value.dtype !== expectedDtype)
+      logical !== undefined &&
+      (!sameShape(value.shape, logical.shape) || value.dtype !== logical.dtype ||
+        !sameStorage(storage, logical.storage))
     ) {
-      throw new Error(
-        `native runtime returned physical tensor ${value.dtype} [${value.shape}], expected ${expectedDtype} [${expectedShape}]`
-      )
+      throw new Error("native runtime returned tensor metadata inconsistent with its logical declaration")
     }
-    const graph = native.LazyTensor.fromMaterialized(value)
     const handle = tensorObject<Runtime.ConcreteTensorHandle>(
       "Tensor",
-      logical?.shape ?? value.shape,
-      logical?.dtype ?? value.dtype,
+      value.shape,
+      value.dtype,
       value.device,
-      logical?.storage
+      storage
     )
+    const graph = native.LazyTensor.fromMaterialized(value)
     handleRecords.set(handle, {
       owner,
       kind: "concrete-tensor",
@@ -623,31 +638,9 @@ export const createRuntimeAdapter = (
       ? right === undefined
       : right !== undefined && left.encoding === right.encoding && left.physicalDtype === right.physicalDtype &&
         sameShape(left.physicalShape, right.physicalShape)
-  const encodedRowBytes = (encoding: Runtime.TensorStorageEncoding, columns: number): number | undefined => {
-    if (columns % 256 !== 0) return undefined
-    const blockBytes = encoding === "Q2_K"
-      ? 84
-      : encoding === "Q3_K"
-      ? 110
-      : encoding === "Q4_K"
-      ? 144
-      : encoding === "Q5_K"
-      ? 176
-      : 210
-    return columns / 256 * blockBytes
-  }
-  const validEncodedGeometry = (
-    logicalShape: ReadonlyArray<number>,
-    storage: Runtime.EncodedTensorStorage
-  ): boolean => {
-    const columns = logicalShape.at(-1)
-    const rows = logicalShape.slice(0, -1).reduce((total, dimension) => total * dimension, 1)
-    const rowBytes = columns === undefined ? undefined : encodedRowBytes(storage.encoding, columns)
-    return rowBytes !== undefined && sameShape(storage.physicalShape, [rows, rowBytes])
-  }
   const sameBinding = (left: TensorBinding, right: TensorBinding): boolean =>
     left.dtype === right.dtype && sameShape(left.shape, right.shape) && sameStorage(left.storage, right.storage)
-  // Native LazyTensor nodes contain the physical graph but not the shared public
+  // Native LazyTensor nodes contain the semantic graph but not the shared public
   // slot namespace. The adapter propagates declarations in JavaScript so
   // compilation can reject gaps and conflicting tensor/scalar declarations
   // before splitting invocation bindings into native tensor and scalar arrays.
@@ -753,6 +746,7 @@ export const createRuntimeAdapter = (
       ...nativeDiagnostics,
       instructions: Object.freeze(nativeDiagnostics.instructions.map((instruction) => Object.freeze(instruction))),
       memory: Object.freeze(nativeDiagnostics.memory),
+      legalization: Object.freeze(nativeDiagnostics.legalization),
       compilePhases: Object.freeze(nativeDiagnostics.compilePhases.map((phase) => Object.freeze(phase)))
     })
     // SAFETY: ExecutableHandle is an opaque identity whose public diagnostics are supplied here.
@@ -932,14 +926,18 @@ export const createRuntimeAdapter = (
           case "input": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
             const storage = request.attributes.storage
-            if (storage !== undefined && !validEncodedGeometry(request.attributes.shape, storage)) {
+            if (
+              storage !== undefined &&
+              (request.attributes.dtype !== "f32" || !Runtime.validEncodedStorage(request.attributes.shape, storage))
+            ) {
               throw new Error("input: encoded storage does not match its logical GGML geometry")
             }
             return lazyHandle(
               native.LazyTensor.input(
                 request.attributes.slot,
-                [...(storage?.physicalShape ?? request.attributes.shape)],
-                nativeDtype(storage?.physicalDtype ?? request.attributes.dtype)
+                [...request.attributes.shape],
+                nativeDtype(request.attributes.dtype),
+                storage === undefined ? undefined : { representation: "packed", format: storage.encoding }
               ),
               {
                 shape: request.attributes.shape,
@@ -1138,19 +1136,13 @@ export const createRuntimeAdapter = (
             return graph(
               nativeGraph(request.inputs[0], operation).quantizedLinear(
                 nativeGraph(request.inputs[1], operation),
-                request.inputs[2] === undefined ? undefined : nativeGraph(request.inputs[2], operation),
-                request.attributes.encoding,
-                request.attributes.logicalShape[0],
-                request.attributes.logicalShape[1]
+                request.inputs[2] === undefined ? undefined : nativeGraph(request.inputs[2], operation)
               )
             )
           case "quantizedEmbedding":
             return graph(
               nativeGraph(request.inputs[0], operation).quantizedEmbedding(
                 nativeGraph(request.inputs[1], operation),
-                request.attributes.encoding,
-                request.attributes.logicalShape[0],
-                request.attributes.logicalShape[1],
                 request.attributes.paddingIndex
               )
             )
@@ -1903,6 +1895,26 @@ export const createRuntimeAdapter = (
   // adapter's logical-f32/packed-u8 GGML storage, so the adapter rejects encoded
   // handles instead of writing misleading u8 data.
   const pathSafetensors: Runtime.PathSafetensors = {
+    inspect: (path) =>
+      cancellableFor("inspectArchive", "io", (token) => native.inspectSafetensors(path, token)).pipe(
+        Effect.flatMap((inspection) =>
+          Effect.try({
+            try: () =>
+              Object.freeze({
+                entries: Object.freeze(inspection.entries.map((entry) =>
+                  Object.freeze({
+                    name: entry.name,
+                    dtype: dtype(entry.dtype),
+                    shape: Object.freeze([...entry.shape]),
+                    byteLength: entry.byteLength
+                  })
+                )),
+                metadata: Object.freeze({ ...inspection.metadata })
+              }),
+            catch: backendErrorFor("inspectArchive", "io", "io-failed")
+          })
+        )
+      ),
     save: (path, archive) =>
       archive.entries.some((entry) => entry.tensor.storage !== undefined)
         ? Effect.fail(
@@ -1926,11 +1938,11 @@ export const createRuntimeAdapter = (
               token
             )
         ),
-    load: (path) =>
+    load: (path, options = {}) =>
       cancellableFor(
         "load",
         "io",
-        (token) => native.loadTensors(path, token),
+        (token) => native.loadTensors(path, token, options.names === undefined ? undefined : [...options.names]),
         (archive) => clearBuffers(archive.entries.map((entry) => entry.tensor))
       ).pipe(
         Effect.flatMap((archive) =>
@@ -2017,7 +2029,8 @@ export const createRuntimeAdapter = (
       !Array.isArray(value.logicalShape) || !Array.isArray(value.physicalShape) ||
       !value.logicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0) ||
       !value.physicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0) ||
-      (format !== "F32" && !validEncodedGeometry(value.logicalShape, {
+      (format === "F32" && !sameShape(value.logicalShape, value.physicalShape)) ||
+      (format !== "F32" && !Runtime.validEncodedStorage(value.logicalShape, {
         encoding: format,
         physicalShape: value.physicalShape,
         physicalDtype: "u8"
@@ -2035,8 +2048,8 @@ export const createRuntimeAdapter = (
     })
   }
   // Inspection returns validated metadata and logical/physical descriptors
-  // without payloads. Loading preserves supported K-quant payloads as encoded u8
-  // tensors with logical f32 metadata. If native loading is interrupted or
+  // without payloads. Loading preserves supported K-quant payloads as logical f32
+  // tensors with packed storage metadata. If native loading is interrupted or
   // mapping fails, the adapter clears unpublished wrappers. Successful mapping
   // transfers them to caller-owned concrete handles.
   const gguf: Runtime.GgufRuntime = {
@@ -2053,11 +2066,11 @@ export const createRuntimeAdapter = (
           })
         )
       ),
-    load: (path) =>
+    load: (path, options = {}) =>
       cancellableFor(
         "loadGguf",
         "io",
-        (token) => native.loadGguf(path, token),
+        (token) => native.loadGguf(path, token, options.names === undefined ? undefined : [...options.names]),
         (archive) => clearBuffers(archive.entries.map((entry) => entry.tensor)),
         "io-failed"
       ).pipe(

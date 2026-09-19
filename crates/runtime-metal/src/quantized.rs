@@ -2634,19 +2634,21 @@ fn cached_pipeline(
         })
 }
 
-/// Selects the measured production kernel. Direct f32-faithful
+/// Selects kernels with canonical F32 decoded weights and F32 activations.
+/// Narrowing either operand to F16 changes the GGML operation contract.
+/// Direct f32-faithful
 /// Q2_K/Q3_K row-reuse variants remain explicit parity/profiling
 /// candidates: serializing vectors inside each SIMD lane loses to both
 /// parallel qmv and M=8 MMA on Apple silicon.
 fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
     if requirements.vectors >= 32 && requirements.vectors % 32 == 0 {
-        return KernelKind::LinearMma32SimpleHalf;
+        return KernelKind::LinearMma32Simple;
     }
     if requirements.vectors >= 16 && requirements.vectors % 16 == 0 {
-        return KernelKind::LinearMmaSimpleHalf;
+        return KernelKind::LinearMmaSimple;
     }
     if requirements.vectors >= 8 && requirements.vectors % 8 == 0 {
-        return KernelKind::LinearMma8SimpleHalf;
+        return KernelKind::LinearMma8Simple;
     }
     if requirements.vectors >= 4 {
         match requirements.codec {
@@ -2663,7 +2665,7 @@ fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
 /// asserts the Metal SIMD assumptions the kernels rely on (thread
 /// execution width 32, sufficient threadgroup capacity; 16 KB
 /// threadgroup memory for the f32 MMA variants, 8 KB for the
-/// default half variants).
+/// default simple F32 variants).
 pub fn warm_linear_exact(requirements: &LinearRequirements) -> Result<(), String> {
     if requirements.pipeline_count != 0 {
         use objc2_metal::{MTLComputePipelineState, MTLDevice as _};
@@ -3737,6 +3739,60 @@ mod tests {
     }
 
     #[test]
+    fn canonical_packed_mma_preserves_f32_range_and_precision() {
+        let device = MetalDevice::get();
+        let rows = 33;
+        let columns = 256;
+        for scale in [1.0_f32, 32768.0] {
+            let mut packed = vec![0_u8; rows * 84];
+            for block in packed.chunks_exact_mut(84) {
+                block[..16].fill(1);
+                block[16..80].fill(0xff);
+                block[80..82].copy_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+            }
+            let weight = MetalTensor {
+                buffer: device.upload_bytes(&packed),
+                layout: Layout::contiguous(vec![rows, 84]),
+                dtype: DType::U8,
+            };
+            for vectors in [8, 16, 32] {
+                let requirements = linear_requirements(
+                    &[vectors, columns],
+                    DType::F32,
+                    &[rows, 84],
+                    DType::U8,
+                    None,
+                    &[vectors, rows],
+                    DType::F32,
+                    GgmlKQuant::Q2K,
+                    [rows, columns],
+                )
+                .unwrap();
+                let mut values = vec![0.0; vectors * columns];
+                for vector in 0..vectors {
+                    values[vector * columns] = [65537.0, 1.0001, -65537.0][vector % 3];
+                }
+                let input = MetalTensor::from_f32(device, values.clone(), vec![vectors, columns]);
+                let output = MetalTensor::empty(device, vec![vectors, rows], DType::F32);
+                warm_linear_exact(&requirements).unwrap();
+                linear_into(&input, &weight, None, &output, &requirements).unwrap();
+                device.synchronize().unwrap();
+                let actual = output.buffer.contents_ptr().cast::<f32>();
+                for vector in 0..vectors {
+                    let expected = values[vector * columns] * (3.0 * scale);
+                    for row in 0..rows {
+                        assert_eq!(
+                            unsafe { *actual.add(vector * rows + row) },
+                            expected,
+                            "vectors={vectors}, vector={vector}, row={row}, scale={scale}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn kquant_mma_preserves_values_across_tiles() {
         let vectors = 16usize;
         let rows = 129usize;
@@ -3756,7 +3812,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             linear_kernel_kind(&requirements),
-            KernelKind::LinearMmaSimpleHalf
+            KernelKind::LinearMmaSimple
         ));
 
         let mut packed = vec![0u8; encoded_row_bytes * rows];
@@ -3808,7 +3864,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             linear_kernel_kind(&requirements),
-            KernelKind::LinearMma8SimpleHalf
+            KernelKind::LinearMma8Simple
         ));
 
         let mut packed = vec![0u8; encoded_row_bytes * rows];
@@ -3868,10 +3924,10 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 linear_kernel_kind(&requirements),
-                KernelKind::LinearMma32SimpleHalf
-                    | KernelKind::LinearMma32SwzHalf
-                    | KernelKind::LinearMmaSimpleHalf
-                    | KernelKind::LinearMma8SimpleHalf
+                KernelKind::LinearMma32Simple
+                    | KernelKind::LinearMma32
+                    | KernelKind::LinearMmaSimple
+                    | KernelKind::LinearMma8Simple
             ));
             let input =
                 MetalTensor::from_f32(device, vec![1.0; vectors * columns], vec![vectors, columns]);
@@ -3899,7 +3955,7 @@ mod tests {
     #[test]
     fn kquant_mma_half_matches_f32_mma_within_half_precision() {
         // Non-half-exact inputs and decodes: the only difference between
-        // the default half-operand kernels and the f32 MMA kernels is
+        // the experimental half-operand kernels and the f32 MMA kernels is
         // rounding both operands to half (11-bit significand, ≤ 2^-11
         // relative per operand, ≤ 2^-10 per product). Both kernels accumulate
         // in f32, so errors stay near sqrt(K) * 2^-10 of the per-product
@@ -3965,7 +4021,12 @@ mod tests {
                 [rows, columns],
             )
             .unwrap();
-            assert_eq!(linear_kernel_kind(&requirements), half_kind);
+            assert!(matches!(
+                linear_kernel_kind(&requirements),
+                KernelKind::LinearMma32Simple
+                    | KernelKind::LinearMmaSimple
+                    | KernelKind::LinearMma8Simple
+            ));
 
             let mut packed = (0..rows * encoded_row_bytes)
                 .map(|index| ((index * 31 + 7) % 251) as u8)
@@ -4010,7 +4071,16 @@ mod tests {
             warm_linear_exact(&requirements).unwrap();
             pipeline(f32_kind, codec, None).unwrap();
             pipeline(wide_kind, codec, None).unwrap();
-            linear_into(&input, &weight, None, &half_output, &requirements).unwrap();
+            pipeline(half_kind, codec, None).unwrap();
+            encode_linear(
+                &input,
+                &weight,
+                None,
+                &half_output,
+                &requirements,
+                half_kind,
+            )
+            .unwrap();
             encode_linear(&input, &weight, None, &f32_output, &requirements, f32_kind).unwrap();
             encode_linear(
                 &input,

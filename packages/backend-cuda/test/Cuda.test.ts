@@ -11,32 +11,36 @@ import type {
   NativeDecodeOutputSelection
 } from "../src/internal/native-addon.js"
 
-it.effect("uploads, adds, reads back, and releases f32 tensors on CUDA", () =>
-  Effect.flatMap(isAvailable, (available) => {
-    if (!available) return Effect.void
-    return Effect.gen(function*() {
-      const a = yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2])
-      const b = yield* Tensor.fromTypedArray(new Float32Array([10, 20, 30, 40]), [2, 2])
-      const sum = yield* Tensor.add(a, b)
-      const [output] = yield* Tensor.compute([sum])
+it.effect(
+  "uploads, adds, reads back, and releases f32 tensors on CUDA",
+  () =>
+    Effect.flatMap(isAvailable, (available) => {
+      if (!available) return Effect.void
+      return Effect.gen(function*() {
+        const a = yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2])
+        const b = yield* Tensor.fromTypedArray(new Float32Array([10, 20, 30, 40]), [2, 2])
+        const sum = yield* Tensor.add(a, b)
+        const [output] = yield* Tensor.compute([sum])
 
-      expect(output.placement.id).toBe("cuda:0")
-      const values = yield* Tensor.toTypedArray(output)
-      expect(Array.from<number | bigint>(values).map(Number)).toEqual([11, 22, 33, 44])
-      const downstream = yield* Tensor.add(output, output)
+        expect(output.placement.id).toBe("cuda:0")
+        const values = yield* Tensor.toTypedArray(output)
+        expect(Array.from<number | bigint>(values).map(Number)).toEqual([11, 22, 33, 44])
+        const downstream = yield* Tensor.add(output, output)
 
-      yield* Tensor.clear(output)
-      expect(Array.from<number | bigint>(values).map(Number)).toEqual([11, 22, 33, 44])
-      expect(Exit.isFailure(yield* Effect.exit(Tensor.toTypedArray(output)))).toBe(true)
-      expect(Exit.isFailure(yield* Effect.exit(Tensor.compute([downstream])))).toBe(true)
+        yield* Tensor.clear(output)
+        expect(Array.from<number | bigint>(values).map(Number)).toEqual([11, 22, 33, 44])
+        expect(Exit.isFailure(yield* Effect.exit(Tensor.toTypedArray(output)))).toBe(true)
+        expect(Exit.isFailure(yield* Effect.exit(Tensor.compute([downstream])))).toBe(true)
 
-      const empty = yield* Tensor.ones([0])
-      expect((yield* Tensor.toTypedArray(empty)).length).toBe(0)
+        const empty = yield* Tensor.ones([0])
+        expect((yield* Tensor.toTypedArray(empty)).length).toBe(0)
 
-      const filled = yield* Tensor.full([3], 2.5)
-      expect(Array.from<number | bigint>(yield* Tensor.toTypedArray(filled)).map(Number)).toEqual([2.5, 2.5, 2.5])
-    }).pipe(Effect.provide(layer()))
-  }))
+        const filled = yield* Tensor.full([3], 2.5)
+        expect(Array.from<number | bigint>(yield* Tensor.toTypedArray(filled)).map(Number)).toEqual([2.5, 2.5, 2.5])
+      }).pipe(Effect.provide(layer()))
+    }),
+  30_000
+) // The first hardware test initializes CUDA/cuBLAS and compiles the NVRTC module.
 
 it.effect("supports logical dtypes, broadcasting, and multiplication", () =>
   Effect.flatMap(isAvailable, (available) => {
@@ -76,6 +80,7 @@ it.effect("clears unpublished native outputs after interruption", () =>
       readonly shape = [1]
       readonly dtype = "f32"
       readonly device = "cuda:0"
+      readonly storage = { representation: "dense" }
 
       exposures() {
         return []
@@ -137,6 +142,20 @@ it.effect("clears unpublished native outputs after interruption", () =>
           transactionBytes: 0,
           peakLiveBytes: 0,
           packingOverheadBytes: 0
+        },
+        legalization: {
+          targetBackend: "cuda",
+          targetArchitecture: "test",
+          loweringAbiRevision: 1,
+          policyRevision: 1,
+          capabilityQueries: 1,
+          nativeLoweringUnits: 1,
+          legalizedLoweringUnits: 0,
+          kernelLocalLegalizations: 0,
+          materializedConversions: 0,
+          materializedConversionBytes: 0,
+          decompositions: 0,
+          rejectedRegionCandidates: 0
         },
         compilePhases: [{ phase: "graph_index", nanoseconds: 1 }]
       }
@@ -258,6 +277,7 @@ it.effect("clears unpublished native outputs after interruption", () =>
       grad: () => [new LazyTensorDouble()],
       isAvailable: () => true,
       inspectGguf: () => Promise.resolve({ metadata: [], tensors: [] }),
+      inspectSafetensors: () => Promise.resolve({ entries: [], metadata: {} }),
       loadGgufForDevice: () => Promise.resolve({ entries: [] }),
       loadTensors: () => Promise.resolve({ entries: [], metadata: {} }),
       saveTensors: () => Promise.resolve()
@@ -297,4 +317,66 @@ it.effect("clears unpublished native outputs after interruption", () =>
     yield* Effect.sync(() => resolve([duplicate, duplicate]))
     expect(Exit.isFailure(yield* Fiber.await(duplicateFiber))).toBe(true)
     expect(duplicateClear).toHaveBeenCalledTimes(1)
+
+    started = yield* Deferred.make<void>()
+    const lateArchiveClear = vi.fn(() => {
+      throw new Error("cleanup failed")
+    })
+    const lateTrailingClear = vi.fn()
+    let resolveArchive!: (archive: Awaited<ReturnType<NativeAddon["loadTensors"]>>) => void
+    native.loadTensors = (_path, ordinal, _token, names) => {
+      expect(ordinal).toBe(0)
+      expect(names).toEqual(["selected"])
+      Effect.runSync(Deferred.succeed(started, undefined))
+      return new Promise((resume) => resolveArchive = resume)
+    }
+    const loading = yield* runtime.extensions.pathSafetensors.load("selected.safetensors", { names: ["selected"] })
+      .pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+    yield* Deferred.await(started)
+    const stopLoading = yield* Fiber.interrupt(loading).pipe(Effect.forkChild({ startImmediately: true }))
+    yield* Effect.sync(() =>
+      resolveArchive({
+        entries: [
+          { name: "selected", tensor: new NativeTensorDouble(lateArchiveClear) },
+          { name: "trailing", tensor: new NativeTensorDouble(lateTrailingClear) }
+        ],
+        metadata: {}
+      })
+    )
+    yield* Fiber.join(stopLoading)
+    yield* Effect.promise(() => Promise.resolve())
+    expect(lateArchiveClear).toHaveBeenCalledTimes(1)
+    expect(lateTrailingClear).toHaveBeenCalledTimes(1)
+
+    const validClear = vi.fn(() => {
+      throw new Error("cleanup failed")
+    })
+    const invalidClear = vi.fn()
+    const malformed = new NativeTensorDouble(invalidClear)
+    Object.defineProperty(malformed, "dtype", { value: "invalid" })
+    native.loadTensors = () =>
+      Promise.resolve({
+        entries: [
+          { name: "valid", tensor: new NativeTensorDouble(validClear) },
+          { name: "invalid", tensor: malformed }
+        ],
+        metadata: {}
+      })
+    const invalidArchive = yield* Effect.flip(runtime.extensions.pathSafetensors.load("invalid.safetensors"))
+    expect(invalidArchive.reason).toBe("unsupported-dtype")
+    expect(validClear).toHaveBeenCalledTimes(1)
+    expect(invalidClear).toHaveBeenCalledTimes(1)
+
+    const aliasedClear = vi.fn()
+    const aliasedTensor = new NativeTensorDouble(aliasedClear)
+    native.loadTensors = () =>
+      Promise.resolve({
+        entries: [{ name: "first", tensor: aliasedTensor }, { name: "second", tensor: aliasedTensor }],
+        metadata: {}
+      })
+    const duplicateArchive = yield* Effect.flip(runtime.extensions.pathSafetensors.load("duplicates.safetensors"))
+    expect(duplicateArchive.message).toContain("duplicate tensor ownership")
+    expect(aliasedClear).toHaveBeenCalledTimes(1)
   }))

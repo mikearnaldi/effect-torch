@@ -11,7 +11,7 @@
 //!   pipeline key hashes shape and strides, so each layout gets a different
 //!   kernel. Destinations are contiguous.
 //! - These kernels support f32, f16, bf16, u8, u32, and i64. The fusion emitter
-//!   supports only f32 and bf16. f64 has MSL syntax here but the value boundary
+//!   supports f32, f16, and bf16. f64 has MSL syntax here but the value boundary
 //!   rejects it because Metal does not support it. Integer fill and arange use
 //!   64-bit arithmetic because values above 2^24 have no exact f32 form.
 //! - Dispatch uses one thread per output element over a padded flat grid
@@ -101,6 +101,317 @@ fn precompiled_pipeline(
             "metal kernel {name} pipeline {pipeline_key:#x} was not precompiled for the exact layout"
         )
     })
+}
+
+fn select_key(
+    layouts: &[crate::runtime::layout::Layout; 3],
+    condition: DType,
+    dtype: DType,
+) -> u64 {
+    key(&[
+        0x5E1EC7,
+        condition as u64,
+        dtype as u64,
+        layout_key(&layouts[0]),
+        layout_key(&layouts[1]),
+        layout_key(&layouts[2]),
+    ])
+}
+
+/// Precompile a typed select. Conditions retain their own dtype so nonzero
+/// values cannot become zero through a narrowing conversion.
+pub(crate) fn compile_select(
+    dev: &MetalDevice,
+    layouts: &[crate::runtime::layout::Layout; 3],
+    condition: DType,
+    dtype: DType,
+) -> Result<(), String> {
+    let n = layouts[0].numel();
+    if n == 0 {
+        return Ok(());
+    }
+    let cty = msl_type(condition);
+    let ty = msl_type(dtype);
+    let wide = MetalDevice::WIDE;
+    dev.compile_lazy(select_key(layouts, condition, dtype), "et_select", || {
+        let c = source_offset(&layouts[0], "i", "        ").replace("src_off", "c_off");
+        let a = source_offset(&layouts[1], "i", "        ").replace("src_off", "a_off");
+        let b = source_offset(&layouts[2], "i", "        ").replace("src_off", "b_off");
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_select(device const {cty}* cond [[buffer(0)]],
+                      device const {ty}* a [[buffer(1)]],
+                      device const {ty}* b [[buffer(2)]],
+                      device {ty}* out [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid.y) * {wide}ul + ulong(gid.x);
+    if (i < {n}ul) {{
+{c}{a}{b}        out[i] = cond[c_off] != {cty}(0) ? a[a_off] : b[b_off];
+    }}
+}}
+"#
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn select_into(
+    dev: &MetalDevice,
+    inputs: [&MetalTensor; 3],
+    out: &MetalTensor,
+) -> Result<(), String> {
+    let layouts = inputs.map(|input| input.layout.broadcast_to(out.layout.shape()));
+    let n = out.numel();
+    if n == 0 {
+        return Ok(());
+    }
+    let pipeline = precompiled_pipeline(
+        dev,
+        select_key(&layouts, inputs[0].dtype, out.dtype),
+        "et_select",
+    )?;
+    dev.with_encoder(|encoder| {
+        encoder.setComputePipelineState(pipeline.as_raw());
+        for (index, input) in inputs.iter().enumerate() {
+            set_buffer(
+                encoder,
+                index,
+                &input.buffer,
+                input.layout.offset() * input.dtype.size_in_bytes(),
+            );
+        }
+        set_buffer(
+            encoder,
+            3,
+            &out.buffer,
+            out.layout.offset() * out.dtype.size_in_bytes(),
+        );
+        let (grid, group) = MetalDevice::grid_flat(n.div_ceil(256) * 256);
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, group);
+    });
+    Ok(())
+}
+
+fn integer_binary_key(
+    layouts: &[crate::runtime::layout::Layout; 2],
+    dtype: DType,
+    op: crate::ops::BinOp,
+) -> u64 {
+    key(&[
+        0x1ADD,
+        op as u64,
+        dtype as u64,
+        layout_key(&layouts[0]),
+        layout_key(&layouts[1]),
+    ])
+}
+
+/// Exact integer comparisons and wrapping arithmetic, with no F32 intermediates.
+pub(crate) fn compile_integer_binary(
+    dev: &MetalDevice,
+    layouts: &[crate::runtime::layout::Layout; 2],
+    dtype: DType,
+    op: crate::ops::BinOp,
+) -> Result<(), String> {
+    if dtype.is_float() {
+        return Err("integer binary requires an integer dtype".to_string());
+    }
+    let n = layouts[0].numel();
+    if n == 0 {
+        return Ok(());
+    }
+    let ty = msl_type(dtype);
+    let carrier = if dtype == DType::I64 { "ulong" } else { "uint" };
+    use crate::ops::BinOp;
+    let expression = match op {
+        BinOp::Add => format!("{ty}({carrier}(av) + {carrier}(bv))"),
+        BinOp::Sub => format!("{ty}({carrier}(av) - {carrier}(bv))"),
+        BinOp::Mul => format!("{ty}({carrier}(av) * {carrier}(bv))"),
+        BinOp::Min => "min(av, bv)".to_string(),
+        BinOp::Max => "max(av, bv)".to_string(),
+        BinOp::Eq => "av == bv".to_string(),
+        BinOp::Ne => "av != bv".to_string(),
+        BinOp::Lt => "av < bv".to_string(),
+        BinOp::Le => "av <= bv".to_string(),
+        BinOp::Gt => "av > bv".to_string(),
+        BinOp::Ge => "av >= bv".to_string(),
+        BinOp::Div => return Err("integer division is unsupported on Metal".to_string()),
+    };
+    let out_ty = if op.is_comparison() { "uchar" } else { ty };
+    let wide = MetalDevice::WIDE;
+    dev.compile_lazy(integer_binary_key(layouts, dtype, op), "et_integer_binary", || {
+        let a = source_offset(&layouts[0], "i", "        ").replace("src_off", "a_off");
+        let b = source_offset(&layouts[1], "i", "        ").replace("src_off", "b_off");
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_integer_binary(device const {ty}* a [[buffer(0)]],
+                           device const {ty}* b [[buffer(1)]],
+                           device {out_ty}* out [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid.y) * {wide}ul + ulong(gid.x);
+    if (i < {n}ul) {{
+{a}{b}        const {ty} av = a[a_off], bv = b[b_off];
+        out[i] = {expression};
+    }}
+}}
+"#
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn integer_binary_into(
+    dev: &MetalDevice,
+    a: &MetalTensor,
+    b: &MetalTensor,
+    op: crate::ops::BinOp,
+    out: &MetalTensor,
+) -> Result<(), String> {
+    if a.dtype != b.dtype || a.dtype.is_float() {
+        return Err("integer binary requires matching integer dtypes".to_string());
+    }
+    let layouts = [a, b].map(|input| input.layout.broadcast_to(out.layout.shape()));
+    let n = out.numel();
+    if n == 0 {
+        return Ok(());
+    }
+    let pipeline = precompiled_pipeline(
+        dev,
+        integer_binary_key(&layouts, a.dtype, op),
+        "et_integer_binary",
+    )?;
+    dev.with_encoder(|encoder| {
+        encoder.setComputePipelineState(pipeline.as_raw());
+        for (index, input) in [a, b, out].iter().enumerate() {
+            set_buffer(
+                encoder,
+                index,
+                &input.buffer,
+                input.layout.offset() * input.dtype.size_in_bytes(),
+            );
+        }
+        let (grid, group) = MetalDevice::grid_flat(n.div_ceil(256) * 256);
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, group);
+    });
+    Ok(())
+}
+
+fn integer_reduce_layouts(
+    layout: &crate::runtime::layout::Layout,
+    dims: &[usize],
+) -> [crate::runtime::layout::Layout; 2] {
+    [false, true].map(|reduced| {
+        let axes = (0..layout.rank())
+            .filter(|axis| dims.contains(axis) == reduced)
+            .collect::<Vec<_>>();
+        crate::runtime::layout::Layout::new(
+            axes.iter().map(|&axis| layout.shape()[axis]).collect(),
+            axes.iter().map(|&axis| layout.strides()[axis]).collect(),
+            0,
+        )
+    })
+}
+
+fn integer_reduce_key(
+    layouts: &[crate::runtime::layout::Layout; 2],
+    dtype: DType,
+    op: crate::fusion::ReduceOp,
+) -> u64 {
+    key(&[
+        0x1ED0CE,
+        dtype as u64,
+        op as u64,
+        layout_key(&layouts[0]),
+        layout_key(&layouts[1]),
+    ])
+}
+
+/// Exact min/max reduction with signed comparisons and strided input access.
+pub(crate) fn compile_integer_reduce(
+    dev: &MetalDevice,
+    layout: &crate::runtime::layout::Layout,
+    dtype: DType,
+    dims: &[usize],
+    op: crate::fusion::ReduceOp,
+) -> Result<(), String> {
+    use crate::fusion::ReduceOp;
+    if dtype.is_float() || !matches!(op, ReduceOp::Min | ReduceOp::Max) {
+        return Err("integer reduction requires min or max on integer storage".to_string());
+    }
+    let layouts = integer_reduce_layouts(layout, dims);
+    let n = layouts[0].numel();
+    let reduced = layouts[1].numel();
+    if n == 0 {
+        return Ok(());
+    }
+    let ty = msl_type(dtype);
+    let pick_max = matches!(op, ReduceOp::Max);
+    let identity = match (dtype, pick_max) {
+        (DType::I64, true) => "long(0x8000000000000000ul)",
+        (DType::I64, false) => "long(0x7ffffffffffffffful)",
+        (DType::U32, false) => "0xffffffffu",
+        (DType::U8, false) => "uchar(255)",
+        _ => "0",
+    };
+    let combine = if pick_max { "max" } else { "min" };
+    let wide = MetalDevice::WIDE;
+    dev.compile_lazy(integer_reduce_key(&layouts, dtype, op), "et_integer_reduce", || {
+        let outer = source_offset(&layouts[0], "i", "        ").replace("src_off", "outer_off");
+        let inner = if reduced == 0 { String::new() } else {
+            source_offset(&layouts[1], "r", "            ").replace("src_off", "inner_off")
+                + &format!("            acc = {combine}(acc, src[outer_off + inner_off]);\n")
+        };
+        format!(r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_integer_reduce(device const {ty}* src [[buffer(0)]],
+                              device {ty}* out [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid.y) * {wide}ul + ulong(gid.x);
+    if (i < {n}ul) {{
+{outer}        {ty} acc = {identity};
+        for (ulong r = 0; r < {reduced}ul; ++r) {{
+{inner}        }}
+        out[i] = acc;
+    }}
+}}
+"#)
+    })?;
+    Ok(())
+}
+
+pub(crate) fn integer_reduce_into(
+    dev: &MetalDevice,
+    input: &MetalTensor,
+    dims: &[usize],
+    op: crate::fusion::ReduceOp,
+    out: &MetalTensor,
+) -> Result<(), String> {
+    let layouts = integer_reduce_layouts(&input.layout, dims);
+    let n = out.numel();
+    if n == 0 {
+        return Ok(());
+    }
+    let pipeline = precompiled_pipeline(
+        dev,
+        integer_reduce_key(&layouts, input.dtype, op),
+        "et_integer_reduce",
+    )?;
+    dev.with_encoder(|encoder| {
+        encoder.setComputePipelineState(pipeline.as_raw());
+        for (index, tensor) in [input, out].iter().enumerate() {
+            set_buffer(
+                encoder,
+                index,
+                &tensor.buffer,
+                tensor.layout.offset() * tensor.dtype.size_in_bytes(),
+            );
+        }
+        let (grid, group) = MetalDevice::grid_flat(n.div_ceil(256) * 256);
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, group);
+    });
+    Ok(())
 }
 
 fn fill_pipeline(
@@ -274,6 +585,22 @@ pub fn relu_i64_into(dev: &MetalDevice, x: &MetalTensor, out: &MetalTensor) -> R
     Ok(())
 }
 
+// Shared by materialized casts and fused Cast/RoundTo boundaries. Native
+// bfloat construction flushes F32 subnormals even with fast math disabled.
+pub(crate) const BF16_CONVERSION_MSL: &str = r#"
+inline bfloat et_bf16_from_float(float value) {
+    const uint bits = as_type<uint>(value);
+    const uint magnitude = bits & 0x7fffffffu;
+    const ushort rounded = magnitude > 0x7f800000u
+        ? ushort((bits >> 16) | 0x0040u)
+        : ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+    return as_type<bfloat>(rounded);
+}
+inline float et_bf16_to_float(bfloat value) {
+    return as_type<float>(uint(as_type<ushort>(value)) << 16);
+}
+"#;
+
 fn cast_pipeline(
     dev: &MetalDevice,
     layout: &crate::runtime::layout::Layout,
@@ -283,16 +610,46 @@ fn cast_pipeline(
     let wide = MetalDevice::WIDE;
     let n = layout.numel();
     let (src_ty, dst_ty) = (msl_type(source), msl_type(destination));
+    let conversion = if source == DType::F32 && destination == DType::BF16 {
+        "out[i] = et_bf16_from_float(a[src_off]);".to_string()
+    } else if source == DType::BF16 && destination == DType::F32 {
+        "out[i] = et_bf16_to_float(a[src_off]);".to_string()
+    } else if source == DType::I64 && destination == DType::F16 {
+        // MSL long -> half overflows immediately above 65504. RNE instead
+        // overflows at 65520. Every integer in the finite range is exact in
+        // F32, so this bounded conversion introduces no intermediate rounding.
+        "const long value = a[src_off];
+        out[i] = value >= 65520l ? half(INFINITY) : value <= -65520l ? half(-INFINITY) : half(float(value));".to_string()
+    } else if source.is_float() && !destination.is_float() {
+        // F16/BF16 widen exactly to F32. Compare against powers of two rather
+        // than integer maxima rounded up to an unrepresentable conversion.
+        let (minimum, maximum, lower, upper) = match destination {
+            DType::I64 => (
+                "long(0x8000000000000000ul)",
+                "long(0x7ffffffffffffffful)",
+                "-9223372036854775808.0f",
+                "9223372036854775808.0f",
+            ),
+            DType::U32 => ("0u", "0xffffffffu", "0.0f", "4294967296.0f"),
+            DType::U8 => ("uchar(0)", "uchar(255)", "0.0f", "256.0f"),
+            _ => unreachable!("integer destination"),
+        };
+        format!("const float value = float(a[src_off]);
+        out[i] = isnan(value) ? {dst_ty}(0) : value <= {lower} ? {minimum} : value >= {upper} ? {maximum} : {dst_ty}(value);")
+    } else {
+        format!("out[i] = ({dst_ty})a[src_off];")
+    };
     let offset = source_offset(layout, "i", "        ");
     let make_src = || {
         format!(
             r#"
 #include <metal_stdlib>
 using namespace metal;
+{BF16_CONVERSION_MSL}
 kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out [[buffer(1)]], uint2 gid2 [[thread_position_in_grid]]) {{
     const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
     if (i < {n}ul) {{
-{offset}        out[i] = ({dst_ty})a[src_off];
+{offset}        {conversion}
     }}
 }}
 "#
@@ -1231,6 +1588,7 @@ fn cumsum_pipeline(
     let kept_strides: Vec<usize> = kept.iter().map(|&d| layout.strides()[d]).collect();
     let kept_n: usize = kept_dims.iter().product();
     let ty = msl_type(dtype);
+    let accumulator = if dtype.is_float() { "float" } else { ty };
     let out_strides = crate::runtime::layout::Layout::contiguous(shape.to_vec());
     let os = out_strides.strides().to_vec();
     let kept_rank = kept.len();
@@ -1261,10 +1619,10 @@ kernel void et_cumsum(
     if (gid >= {kept_n}u) return;
     ulong base = 0ul;
     ulong obase = 0ul;
-{decompose}    {ty} acc = ({ty})0;
+{decompose}    {accumulator} acc = ({accumulator})0;
     for (uint i = 0u; i < {n}u; ++i) {{
-        acc += x[base + ulong(i) * {dstride}ul];
-        out[obase + ulong(i) * {os_dim}ul] = acc;
+        acc += {accumulator}(x[base + ulong(i) * {dstride}ul]);
+        out[obase + ulong(i) * {os_dim}ul] = {ty}(acc);
     }}
 }}
 "#,
@@ -1412,6 +1770,283 @@ mod tests {
             );
         }
         tensor
+    }
+
+    #[test]
+    fn integer_cast_to_f16_rounds_at_the_overflow_boundary() {
+        let dev = MetalDevice::get();
+        let values = [
+            65504,
+            65505,
+            65519,
+            65520,
+            65521,
+            -65504,
+            -65505,
+            -65519,
+            -65520,
+            -65521,
+            i64::MAX,
+            i64::MIN,
+        ];
+        let source = from_i64(dev, &values, vec![values.len()]);
+        let half = cast(dev, &source, DType::F16).unwrap();
+        let unsigned = MetalTensor {
+            buffer: dev.alloc_with_data_u32(&[
+                65504,
+                65505,
+                65519,
+                65520,
+                65521,
+                1 << 31,
+                u32::MAX,
+            ]),
+            layout: crate::runtime::layout::Layout::contiguous(vec![7]),
+            dtype: DType::U32,
+        };
+        let unsigned_half = cast(dev, &unsigned, DType::F16).unwrap();
+        dev.synchronize().unwrap();
+        let bits = |tensor: &MetalTensor| {
+            bytes(tensor)
+                .chunks_exact(2)
+                .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&half),
+            [
+                0x7bff, 0x7bff, 0x7bff, 0x7c00, 0x7c00, 0xfbff, 0xfbff, 0xfbff, 0xfc00, 0xfc00,
+                0x7c00, 0xfc00
+            ]
+        );
+        assert_eq!(
+            bits(&unsigned_half),
+            [0x7bff, 0x7bff, 0x7bff, 0x7c00, 0x7c00, 0x7c00, 0x7c00]
+        );
+    }
+
+    #[test]
+    fn dense_cast_modes_preserve_bits_wrap_saturate_and_round_once() {
+        let dev = MetalDevice::get();
+        let upload = |data: &[u8], dtype, count| MetalTensor {
+            buffer: dev.upload_bytes(data),
+            layout: crate::runtime::layout::Layout::contiguous(vec![count]),
+            dtype,
+        };
+        // Identity is a bit copy even for signaling NaNs and signed zero.
+        for (dtype, bits) in [
+            (DType::F16, [0x7c01u16, 0xfe55, 0x8000, 1]),
+            (DType::BF16, [0x7f81, 0xffa5, 0x8000, 1]),
+        ] {
+            let data = bits
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>();
+            let source = upload(&data, dtype, bits.len());
+            let output = MetalTensor::empty(dev, vec![bits.len()], dtype);
+            compile_cast_layout(dev, &source.layout, dtype, dtype).unwrap();
+            cast_into(dev, &source, &output).unwrap();
+            dev.synchronize().unwrap();
+            assert_eq!(bytes(&output), data);
+        }
+        let integer = from_i64(
+            dev,
+            &[i64::MIN, -1, 256, (1i64 << 62) + 257, i64::MAX],
+            vec![5],
+        );
+        for dtype in [DType::U8, DType::U32] {
+            let result = cast(dev, &integer, dtype).unwrap();
+            dev.synchronize().unwrap();
+            let expected = if dtype == DType::U8 {
+                vec![0, 255, 0, 1, 255]
+            } else {
+                [0u32, u32::MAX, 256, 257, u32::MAX]
+                    .iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect()
+            };
+            assert_eq!(bytes(&result), expected);
+        }
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let floats = MetalTensor::from_f32(
+                dev,
+                vec![
+                    f32::NEG_INFINITY,
+                    -1.75,
+                    -0.0,
+                    0.0,
+                    1.75,
+                    f32::INFINITY,
+                    f32::NAN,
+                ],
+                vec![7],
+            );
+            let source = cast(dev, &floats, dtype).unwrap();
+            for destination in [DType::U8, DType::U32, DType::I64] {
+                let result = cast(dev, &source, destination).unwrap();
+                dev.synchronize().unwrap();
+                let expected: Vec<u8> = match destination {
+                    DType::U8 => vec![0, 0, 0, 0, 1, u8::MAX, 0],
+                    DType::U32 => [0u32, 0, 0, 0, 1, u32::MAX, 0]
+                        .iter()
+                        .flat_map(|x| x.to_ne_bytes())
+                        .collect(),
+                    _ => [i64::MIN, -1, 0, 0, 1, i64::MAX, 0]
+                        .iter()
+                        .flat_map(|x| x.to_ne_bytes())
+                        .collect(),
+                };
+                assert_eq!(bytes(&result), expected, "{dtype:?} -> {destination:?}");
+            }
+        }
+        // Midpoint + sticky bit distinguishes one rounding from an F32 detour.
+        for (dtype, shift, step) in [(DType::BF16, 23, 24), (DType::F32, 7, 8)] {
+            let values = [(1u32 << 31) + (1 << shift), (1u32 << 31) + (1 << shift) + 1];
+            let source = upload(
+                &values
+                    .iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+                DType::U32,
+                2,
+            );
+            let rounded = cast(dev, &source, dtype).unwrap();
+            let wide = cast(dev, &rounded, DType::F32).unwrap();
+            dev.synchronize().unwrap();
+            assert_eq!(
+                wide.read_f32().unwrap(),
+                [(1u64 << 31) as f32, ((1u64 << 31) + (1 << step)) as f32]
+            );
+        }
+    }
+
+    #[test]
+    fn float_to_integer_casts_saturate_at_exact_destination_bounds() {
+        let dev = MetalDevice::get();
+        let values = [
+            f32::from_bits(0xdf000001),
+            -9223372036854775808.0,
+            f32::from_bits(0xdeffffff),
+            f32::from_bits(0x5effffff),
+            9223372036854775808.0,
+            f32::from_bits(0x5f000001),
+            f32::from_bits(0x4f7fffff),
+            4294967296.0,
+            f32::from_bits(0x4f800001),
+            -256.75,
+            -1.75,
+            -0.75,
+            0.75,
+            254.75,
+            255.75,
+            256.0,
+            f32::MAX,
+            -f32::MAX,
+        ];
+        let source = MetalTensor::from_f32(dev, values.to_vec(), vec![values.len()]);
+        for destination in [DType::I64, DType::U32, DType::U8] {
+            let output = cast(dev, &source, destination).unwrap();
+            dev.synchronize().unwrap();
+            // Rust's float-to-integer casts specify truncate-and-saturate.
+            let expected: Vec<u8> = values
+                .iter()
+                .flat_map(|&value| match destination {
+                    DType::I64 => (value as i64).to_ne_bytes().to_vec(),
+                    DType::U32 => (value as u32).to_ne_bytes().to_vec(),
+                    _ => vec![value as u8],
+                })
+                .collect();
+            assert_eq!(bytes(&output), expected, "F32 -> {destination:?}");
+        }
+    }
+
+    #[test]
+    fn float_casts_preserve_gradual_underflow_and_ties_to_even() {
+        let dev = MetalDevice::get();
+        for (destination, input_bits, expected) in [
+            (
+                DType::F16,
+                vec![
+                    0u32, 0x80000000, 0x33000000, 0x33000001, 0x33800000, 0xb3000000, 0xb3000001,
+                ],
+                vec![0u16, 0x8000, 0, 1, 1, 0x8000, 0x8001],
+            ),
+            (
+                DType::BF16,
+                vec![
+                    0u32, 0x80000000, 0x00008000, 0x00008001, 0x00018000, 0x80008000, 0x80008001,
+                ],
+                vec![0u16, 0x8000, 0, 1, 2, 0x8000, 0x8001],
+            ),
+        ] {
+            let input = MetalTensor::from_f32(
+                dev,
+                input_bits.into_iter().map(f32::from_bits).collect(),
+                vec![expected.len()],
+            );
+            let output = cast(dev, &input, destination).unwrap();
+            dev.synchronize().unwrap();
+            assert_eq!(
+                bytes(&output),
+                expected
+                    .iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+                "F32 -> {destination:?}"
+            );
+        }
+        for (source, bits) in [
+            (
+                DType::F16,
+                vec![0u16, 0x8000, 1, 0x8001, 0x7bff, 0x7c00, 0xfc00],
+            ),
+            (
+                DType::BF16,
+                vec![
+                    0u16, 0x8000, 1, 0x8001, 0x3300, 0x3301, 0x3380, 0x477f, 0x4780, 0x7f80, 0xff80,
+                ],
+            ),
+        ] {
+            let data = bits
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect::<Vec<_>>();
+            let input = MetalTensor {
+                buffer: dev.upload_bytes(&data),
+                layout: crate::runtime::layout::Layout::contiguous(vec![bits.len()]),
+                dtype: source,
+            };
+            let values = bits
+                .iter()
+                .map(|&bits| {
+                    if source == DType::F16 {
+                        half::f16::from_bits(bits).to_f32()
+                    } else {
+                        half::bf16::from_bits(bits).to_f32()
+                    }
+                })
+                .collect::<Vec<_>>();
+            for destination in [
+                DType::F32,
+                if source == DType::F16 {
+                    DType::BF16
+                } else {
+                    DType::F16
+                },
+            ] {
+                let output = cast(dev, &input, destination).unwrap();
+                dev.synchronize().unwrap();
+                let expected: Vec<u8> = values
+                    .iter()
+                    .flat_map(|&value| match destination {
+                        DType::F32 => value.to_bits().to_ne_bytes().to_vec(),
+                        DType::BF16 => half::bf16::from_f32(value).to_bits().to_ne_bytes().to_vec(),
+                        _ => half::f16::from_f32(value).to_bits().to_ne_bytes().to_vec(),
+                    })
+                    .collect();
+                assert_eq!(bytes(&output), expected, "{source:?} -> {destination:?}");
+            }
+        }
     }
 
     #[test]

@@ -4,6 +4,13 @@
 - **Created**: 2026-08-02
 - **Depends on**: RFC 0007 (kernel fusion), RFC 0008 (compilation), RFC 0010 (inference)
 - **Updates**: —
+- **Updated by**: RFC 0025 (storage support, operation-specific target legalization, and precision contracts)
+
+RFC 0025 supersedes the blanket emulation prohibition and the historical
+support matrix below. Storage and execution are validated separately. Approved
+same-device F16/BF16 legalizations preserve semantic dtypes and rounding
+boundaries; Metal F64 substitution remains unsupported. The current backend
+coverage is documented in the README and tested by the dtype suites.
 
 ## Summary
 

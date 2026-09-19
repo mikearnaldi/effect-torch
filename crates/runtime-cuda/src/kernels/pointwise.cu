@@ -1,31 +1,3 @@
-extern "C" __global__ void fill_f64(
-    double *out,
-    double value,
-    unsigned int len,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < len) out[index] = cast_dtype(value, dtype);
-}
-
-extern "C" __global__ void muse_gate_f32(
-    const float *value,
-    const float *gate,
-    const float *multiplier,
-    float *out,
-    unsigned int len,
-    unsigned int has_multiplier
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    float half_gate = __fmul_rn(gate[index], 0.5f);
-    float sigmoid = __fadd_rn(__fmul_rn(tanhf(half_gate), 0.5f), 0.5f);
-    float result = __fmul_rn(value[index], sigmoid);
-    out[index] = has_multiplier == 0
-        ? result
-        : __fmul_rn(result, multiplier[index]);
-}
-
 extern "C" __global__ void greedy_argmax_f64(
     const double *logits,
     unsigned int len,
@@ -126,8 +98,7 @@ void topk_f64(
         __syncthreads();
     }
     if (thread == 0) {
-        output[2 * gridDim.x * MAX_TOP_K + blockIdx.x] =
-            invalid[0] == 0xffffffffU ? -1.0 : (double)invalid[0];
+        ((unsigned int *)output)[2 * gridDim.x * MAX_TOP_K + blockIdx.x] = invalid[0];
     }
 
     unsigned int lane = thread & 31U;
@@ -180,183 +151,13 @@ void topk_f64(
             if (lane == 0) {
                 unsigned int output_offset = blockIdx.x * MAX_TOP_K + output_rank;
                 output[output_offset] = best_value;
-                output[gridDim.x * MAX_TOP_K + output_offset] = (double)best_token;
+                ((unsigned int *)output)[gridDim.x * MAX_TOP_K + output_offset] = best_token;
                 winner = best_owner;
             }
         }
         __syncthreads();
         if (thread == winner) ++local_rank;
     }
-}
-
-extern "C" __global__ void binary_f64(
-    unsigned int op,
-    const double *a,
-    const double *b,
-    double *out,
-    unsigned int len,
-    unsigned int rank,
-    const unsigned long long *shapes,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    const unsigned long long *a_shape = shapes + rank;
-    const unsigned long long *b_shape = shapes + rank * 2;
-    double x = a[mapped_index(index, rank, shapes, a_shape)];
-    double y = b[mapped_index(index, rank, shapes, b_shape)];
-    double value = 0.0;
-    switch (op) {
-        case 0: value = x + y; break;
-        case 1: value = x - y; break;
-        case 2: value = x * y; break;
-        case 3: value = x / y; break;
-        case 4: value = fmax(x, y); break;
-        case 5: value = fmin(x, y); break;
-        case 6: value = x == y; break;
-        case 7: value = x > y; break;
-        case 8: value = x < y; break;
-        case 9: value = x >= y; break;
-        case 10: value = x <= y; break;
-    }
-    out[index] = cast_dtype(value, dtype);
-}
-
-extern "C" __global__ void binary_i64(
-    unsigned int op,
-    const long long *a,
-    const long long *b,
-    long long *out,
-    double *out_f64,
-    unsigned int len,
-    unsigned int rank,
-    const unsigned long long *shapes
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    const unsigned long long *a_shape = shapes + rank;
-    const unsigned long long *b_shape = shapes + rank * 2;
-    long long x = a[mapped_index(index, rank, shapes, a_shape)];
-    long long y = b[mapped_index(index, rank, shapes, b_shape)];
-    long long value = 0;
-    switch (op) {
-        case 0: value = x + y; break;
-        case 1: value = x - y; break;
-        case 2: value = x * y; break;
-        case 3: value = x / y; break;
-        case 4: value = x > y ? x : y; break;
-        case 5: value = x < y ? x : y; break;
-    }
-    out[index] = value;
-    out_f64[index] = (double)value;
-}
-
-extern "C" __global__ void compare_i64(
-    unsigned int op,
-    const long long *a,
-    const long long *b,
-    double *out,
-    unsigned int len,
-    unsigned int rank,
-    const unsigned long long *shapes
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    const unsigned long long *a_shape = shapes + rank;
-    const unsigned long long *b_shape = shapes + rank * 2;
-    long long x = a[mapped_index(index, rank, shapes, a_shape)];
-    long long y = b[mapped_index(index, rank, shapes, b_shape)];
-    switch (op) {
-        case 6: out[index] = x == y; break;
-        case 7: out[index] = x > y; break;
-        case 8: out[index] = x < y; break;
-        case 9: out[index] = x >= y; break;
-        default: out[index] = x <= y; break;
-    }
-}
-
-extern "C" __global__ void unary_i64(
-    unsigned int op,
-    const long long *a,
-    long long *out,
-    double *out_f64,
-    unsigned int len
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    long long x = a[index];
-    long long value;
-    switch (op) {
-        case 0: value = -x; break;
-        case 1: value = x < 0 ? -x : x; break;
-        case 8: value = x > 0 ? x : 0; break;
-        case 13: value = (x > 0) - (x < 0); break;
-        default: value = x; break;
-    }
-    out[index] = value;
-    out_f64[index] = (double)value;
-}
-
-extern "C" __global__ void cast_from_i64(
-    const long long *a,
-    double *out,
-    unsigned int len,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < len) out[index] = cast_dtype((double)a[index], dtype);
-}
-
-extern "C" __global__ void cast_to_i64(
-    const double *a,
-    long long *out,
-    double *out_f64,
-    unsigned int len
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    long long value = (long long)a[index];
-    out[index] = value;
-    out_f64[index] = (double)value;
-}
-
-extern "C" __global__ void unary_f64(
-    unsigned int op,
-    const double *a,
-    double *out,
-    unsigned int len,
-    double parameter,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    double x = a[index];
-    double value = x;
-    switch (op) {
-        case 0: value = -x; break;
-        case 1: value = fabs(x); break;
-        case 2: value = sqrt(x); break;
-        case 3: value = exp(x); break;
-        case 4: value = log(x); break;
-        case 5: value = sin(x); break;
-        case 6: value = cos(x); break;
-        case 7: value = tanh(x); break;
-        case 8: value = fmax(x, 0.0); break;
-        case 9: value = erf(x); break;
-        case 10: value = floor(x); break;
-        case 11: value = ceil(x); break;
-        case 12: value = round(x); break;
-        case 13: value = (x > 0.0) - (x < 0.0); break;
-        case 14: value = pow(x, parameter); break;
-        case 15: value = 0.5 * x * (1.0 + erf(x * 0.7071067811865475244)); break;
-        case 16: {
-            double inner = 0.7978845608028653559 * (x + 0.044715 * x * x * x);
-            value = 0.5 * x * (1.0 + tanh(inner));
-            break;
-        }
-        case 17: value = x; break;
-    }
-    out[index] = cast_dtype(value, dtype);
 }
 
 __device__ unsigned long long mix64(unsigned long long x) {
@@ -370,7 +171,7 @@ __device__ double random_unit(unsigned long long seed) {
     return ((mix64(seed) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
 }
 
-extern "C" __global__ void random_f64(
+__device__ void random_f64(
     double *out,
     unsigned int len,
     unsigned long long seed,
@@ -390,105 +191,4 @@ extern "C" __global__ void random_f64(
         value = lo + (hi - lo) * u1;
     }
     out[index] = cast_dtype(value, dtype);
-}
-
-extern "C" __global__ void sequence_f64(
-    unsigned int op,
-    double *out,
-    unsigned int len,
-    double start,
-    double step,
-    unsigned int width,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    double value = op == 0 ? start + step * index : (index / width == index % width ? 1.0 : 0.0);
-    out[index] = cast_dtype(value, dtype);
-}
-
-extern "C" __global__ void reindex_f64(
-    unsigned int op,
-    const double *a,
-    double *out,
-    unsigned int len,
-    unsigned int rank,
-    const unsigned long long *metadata,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    const unsigned long long *out_shape = metadata;
-    const unsigned long long *in_shape = metadata + rank;
-    const unsigned long long *parameters = metadata + rank * 2;
-    unsigned long long linear = index;
-    unsigned long long input_index = 0;
-    for (int axis = (int)rank - 1; axis >= 0; --axis) {
-        unsigned long long width = out_shape[axis];
-        unsigned long long coordinate = width == 0 ? 0 : linear % width;
-        linear = width == 0 ? 0 : linear / width;
-        unsigned long long input_axis = op == 1 ? parameters[axis] : (unsigned long long)axis;
-        unsigned long long input_coordinate = coordinate;
-        if (op == 0 && in_shape[input_axis] == 1) input_coordinate = 0;
-        if (op == 2) input_coordinate = parameters[axis * 2] + coordinate * parameters[axis * 2 + 1];
-        unsigned long long stride = 1;
-        for (unsigned long long inner = input_axis + 1; inner < rank; ++inner) stride *= in_shape[inner];
-        input_index += input_coordinate * stride;
-    }
-    out[index] = cast_dtype(a[input_index], dtype);
-}
-
-extern "C" __global__ void where_f64(
-    const double *cond,
-    const double *a,
-    const double *b,
-    double *out,
-    unsigned int len,
-    unsigned int rank,
-    const unsigned long long *shapes,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    const unsigned long long *cond_shape = shapes + rank;
-    const unsigned long long *a_shape = shapes + rank * 2;
-    const unsigned long long *b_shape = shapes + rank * 3;
-    unsigned long long ci = mapped_index(index, rank, shapes, cond_shape);
-    unsigned long long ai = mapped_index(index, rank, shapes, a_shape);
-    unsigned long long bi = mapped_index(index, rank, shapes, b_shape);
-    out[index] = cast_dtype(cond[ci] != 0.0 ? a[ai] : b[bi], dtype);
-}
-
-extern "C" __global__ void concat_f64(
-    const double *a,
-    const double *b,
-    double *out,
-    unsigned int len,
-    unsigned int rank,
-    unsigned int dim,
-    const unsigned long long *shapes,
-    unsigned int dtype
-) {
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= len) return;
-    const unsigned long long *a_shape = shapes + rank;
-    const unsigned long long *b_shape = shapes + rank * 2;
-    unsigned long long linear = index;
-    unsigned long long ai = 0;
-    unsigned long long bi = 0;
-    unsigned long long coordinate_at_dim = 0;
-    for (int axis = (int)rank - 1; axis >= 0; --axis) {
-        unsigned long long coordinate = linear % shapes[axis];
-        linear /= shapes[axis];
-        if ((unsigned int)axis == dim) coordinate_at_dim = coordinate;
-        unsigned long long a_stride = 1;
-        unsigned long long b_stride = 1;
-        for (int inner = axis + 1; inner < (int)rank; ++inner) {
-            a_stride *= a_shape[inner];
-            b_stride *= b_shape[inner];
-        }
-        ai += coordinate * a_stride;
-        bi += (coordinate - ((unsigned int)axis == dim ? a_shape[dim] : 0)) * b_stride;
-    }
-    out[index] = cast_dtype(coordinate_at_dim < a_shape[dim] ? a[ai] : b[bi], dtype);
 }

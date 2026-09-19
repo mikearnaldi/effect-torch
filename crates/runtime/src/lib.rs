@@ -39,6 +39,7 @@ mod layout;
 mod memory;
 mod program;
 mod sampling;
+mod storage;
 mod workspace;
 
 pub use backend::{
@@ -51,9 +52,11 @@ pub use dense::{
 };
 pub use dtype::DType;
 pub use error::{BackendError, BackendResult};
-pub use executable::{CompilePhaseTiming, ExecutableDiagnostics, InstructionCount};
+pub use executable::{
+    CompilePhaseTiming, DTypeLegalizationDiagnostics, ExecutableDiagnostics, InstructionCount,
+};
 pub use gguf::{
-    parse_gguf, read_gguf_tensor_into, GgmlKQuant, GgufFile, GgufMetadataArray, GgufMetadataEntry,
+    parse_gguf, read_gguf_tensor_into, GgufFile, GgufMetadataArray, GgufMetadataEntry,
     GgufMetadataValue, GgufParseError, GgufTensorDescriptor, GgufTensorFormat,
 };
 pub use layout::{broadcast_shape, Layout};
@@ -72,6 +75,11 @@ pub use sampling::{
     sample_logits, sample_probabilities, sample_probabilities_at, sampling_coordinate,
     target_sample_match, RejectionResult, SamplingCoordinate, SamplingOptions, SamplingPurpose,
     TargetSampleMatchResult, MAX_SAMPLING_VOCABULARY,
+};
+pub use storage::{
+    decode_ggml_k_block, BackendLayoutAbi, GgmlKQuant, LayoutConstraintSpec, PackedFormat,
+    StorageGeometry, StorageLayout, StorageMetadata, StorageRepresentation, StorageSpec, ValueSpec,
+    GGML_K_BLOCK_VALUES,
 };
 pub use workspace::{
     LeasedWorkspace, WorkspaceAllocation, WorkspaceAllocator, WorkspaceLease, WorkspacePool,

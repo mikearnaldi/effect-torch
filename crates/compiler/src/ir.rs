@@ -7,6 +7,9 @@
 //! f32 for fused math and supports f32 or bf16 lane storage. The CPU interpreter
 //! supports f32 and f64.
 
+use crate::{DenseNodeId, OperationExecution};
+use effect_torch_runtime::DType;
+
 /// Row-major contiguous strides of `shape`, in elements.
 pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1usize; shape.len()];
@@ -60,6 +63,12 @@ pub enum KernelExpr {
     Scalar(u32),
     // f64 bits let the Eq + Hash IR key the pipeline cache.
     Const(u64),
+    /// Explicit graph-level conversion to a scalar dtype.
+    Cast(Box<KernelExpr>, DType),
+    /// Round to a semantic dtype while retaining the evaluator register type.
+    RoundTo(Box<KernelExpr>, DType),
+    /// Semantic result marker, removed by checked expression legalization.
+    Semantic(Box<KernelExpr>, DenseNodeId, DType),
     Add(Box<KernelExpr>, Box<KernelExpr>),
     Sub(Box<KernelExpr>, Box<KernelExpr>),
     Mul(Box<KernelExpr>, Box<KernelExpr>),
@@ -102,6 +111,78 @@ pub enum KernelExpr {
 pub type Expr = KernelExpr;
 
 impl KernelExpr {
+    /// Retains a semantic result boundary through region construction and merges.
+    pub fn semantic(self, node: DenseNodeId, dtype: DType) -> Self {
+        Self::Semantic(Box::new(self), node, dtype)
+    }
+
+    pub(crate) fn semantic_nodes(&self) -> Vec<DenseNodeId> {
+        let mut nodes = Vec::new();
+        let mut stack = vec![self];
+        while let Some(expression) = stack.pop() {
+            if let Self::Semantic(_, node, _) = expression {
+                nodes.push(*node);
+            }
+            stack.extend(expression.children());
+        }
+        nodes
+    }
+
+    pub(crate) fn apply_execution(
+        &self,
+        operations: &std::collections::HashMap<DenseNodeId, &OperationExecution>,
+    ) -> Result<Self, String> {
+        let mut stack = vec![(self, false)];
+        let mut values = Vec::new();
+        while let Some((expression, processed)) = stack.pop() {
+            let children = expression.children();
+            if !processed {
+                stack.push((expression, true));
+                for child in children.into_iter().rev() {
+                    stack.push((child, false));
+                }
+                continue;
+            }
+            let operands = values.split_off(values.len() - children.len());
+            if let Self::Semantic(_, node, dtype) = expression {
+                let operation = operations.get(node).ok_or_else(|| {
+                    format!("legalization: expression node {node} is absent from execution plan")
+                })?;
+                let result = operation
+                    .results
+                    .first()
+                    .ok_or_else(|| format!("legalization: expression node {node} has no result"))?;
+                let restored = match result.completion {
+                    crate::ResultCompletion::Direct => result.execution_dtype,
+                    crate::ResultCompletion::ConvertToBoundary(conversion) => {
+                        conversion.destination
+                    }
+                };
+                if restored != *dtype {
+                    return Err(format!(
+                        "legalization: expression node {node} restores the wrong dtype"
+                    ));
+                }
+                let mut operands = operands;
+                let value = operands.pop().expect("semantic expression has one child");
+                if operation
+                    .rounding_boundaries
+                    .iter()
+                    .any(|boundary| boundary.node == *node && boundary.result == 0)
+                {
+                    values.push(Self::RoundTo(Box::new(value), *dtype));
+                } else {
+                    values.push(value);
+                }
+            } else {
+                values.push(expression.rebuild(operands));
+            }
+        }
+        values
+            .pop()
+            .ok_or_else(|| "legalization: empty expression".to_string())
+    }
+
     // Moves child boxes into the worklist and leaves cheap leaves behind.
     // Drop uses this to avoid recursive destructor glue.
     fn drain_children(&mut self, worklist: &mut Vec<Box<KernelExpr>>) {
@@ -130,7 +211,10 @@ impl KernelExpr {
                 worklist.push(std::mem::replace(a, dummy()));
                 worklist.push(std::mem::replace(b, dummy()));
             }
-            KernelExpr::Neg(a)
+            KernelExpr::Cast(a, _)
+            | KernelExpr::RoundTo(a, _)
+            | KernelExpr::Semantic(a, _, _)
+            | KernelExpr::Neg(a)
             | KernelExpr::Sqrt(a)
             | KernelExpr::Exp(a)
             | KernelExpr::Sin(a)
@@ -221,6 +305,15 @@ impl KernelExpr {
         KernelExpr::Const(v.to_bits())
     }
 
+    /// Converts an inlined constructor constant before narrowing the register
+    /// carrier. This avoids double rounding F64 constants through F32 to F16.
+    pub fn typed_constant(value: f64, dtype: DType) -> Self {
+        Self::Cast(
+            Box::new(Self::cst(<f64 as Scalar>::cast(value, dtype))),
+            dtype,
+        )
+    }
+
     // Child references in left-to-right order.
     fn children(&self) -> Vec<&KernelExpr> {
         match self {
@@ -238,7 +331,10 @@ impl KernelExpr {
             | KernelExpr::Ge(a, b)
             | KernelExpr::Eq(a, b)
             | KernelExpr::Ne(a, b) => vec![a.as_ref(), b.as_ref()],
-            KernelExpr::Neg(a)
+            KernelExpr::Cast(a, _)
+            | KernelExpr::RoundTo(a, _)
+            | KernelExpr::Semantic(a, _, _)
+            | KernelExpr::Neg(a)
             | KernelExpr::Sqrt(a)
             | KernelExpr::Exp(a)
             | KernelExpr::Sin(a)
@@ -263,6 +359,9 @@ impl KernelExpr {
             KernelExpr::Input(k) => KernelExpr::Input(*k),
             KernelExpr::Scalar(k) => KernelExpr::Scalar(*k),
             KernelExpr::Const(b) => KernelExpr::Const(*b),
+            KernelExpr::Cast(_, dtype) => KernelExpr::Cast(next(), *dtype),
+            KernelExpr::RoundTo(_, dtype) => KernelExpr::RoundTo(next(), *dtype),
+            KernelExpr::Semantic(_, node, dtype) => KernelExpr::Semantic(next(), *node, *dtype),
             KernelExpr::Select(..) => KernelExpr::Select(next(), next(), next()),
             KernelExpr::Add(..) => KernelExpr::Add(next(), next()),
             KernelExpr::Sub(..) => KernelExpr::Sub(next(), next()),
@@ -393,6 +492,7 @@ impl std::hash::Hash for KernelExpr {
 /// `from_f64` narrows constants.
 pub trait Scalar: Copy {
     fn from_f64(v: f64) -> Self;
+    fn cast(self, dtype: DType) -> Self;
     fn add(self, o: Self) -> Self;
     fn sub(self, o: Self) -> Self;
     fn mul(self, o: Self) -> Self;
@@ -421,11 +521,67 @@ pub trait Scalar: Copy {
     fn ne(self, o: Self) -> Self;
 }
 
+// Round the binary64 significand once. half::from_f64 can discard sticky bits
+// for BF16, and some F16 implementations use an intermediate F32 conversion.
+// Both violate DenseConversionMode::FloatToFloatNearestEven near midpoints.
+fn f64_to_half_bits(value: f64, mantissa_bits: u32, bias: i32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let encoded_exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let infinity = (((bias * 2 + 1) as u16) << mantissa_bits) | sign;
+    if encoded_exponent == 0x7ff {
+        return infinity
+            | if fraction == 0 {
+                0
+            } else {
+                1 << (mantissa_bits - 1)
+            };
+    }
+    let exponent = encoded_exponent - 1023;
+    let minimum_normal = 1 - bias;
+    // Binary64 subnormals are below the half-ULP at zero for both half formats.
+    if exponent < minimum_normal - mantissa_bits as i32 - 1 {
+        return sign;
+    }
+    if exponent > bias {
+        return infinity;
+    }
+    let significand = fraction | (1u64 << 52);
+    let shift = 52 - mantissa_bits + (minimum_normal - exponent).max(0) as u32;
+    let retained = significand >> shift;
+    let remainder = significand & ((1u64 << shift) - 1);
+    let midpoint = 1u64 << (shift - 1);
+    let rounded =
+        retained + u64::from(remainder > midpoint || remainder == midpoint && retained & 1 != 0);
+    let magnitude = if exponent < minimum_normal {
+        rounded as u16
+    } else {
+        (((exponent + bias) as u16) << mantissa_bits) + (rounded - (1u64 << mantissa_bits)) as u16
+    };
+    sign | magnitude
+}
+
 macro_rules! impl_scalar {
     ($ty:ty, $erf:path) => {
         impl Scalar for $ty {
             fn from_f64(v: f64) -> Self {
                 v as $ty
+            }
+            fn cast(self, dtype: DType) -> Self {
+                match dtype {
+                    DType::F16 => {
+                        half::f16::from_bits(f64_to_half_bits(self as f64, 10, 15)).to_f64() as $ty
+                    }
+                    DType::BF16 => {
+                        half::bf16::from_bits(f64_to_half_bits(self as f64, 7, 127)).to_f64() as $ty
+                    }
+                    DType::F32 => (self as f32) as $ty,
+                    DType::F64 => self,
+                    DType::I64 => (self as i64) as $ty,
+                    DType::U32 => (self as u32) as $ty,
+                    DType::U8 => (self as u8) as $ty,
+                }
             }
             fn add(self, o: Self) -> Self {
                 self + o
@@ -548,6 +704,9 @@ enum Flat {
     Input(u32),
     Scalar(u32),
     Const(u64),
+    Cast(DType),
+    RoundTo(DType),
+    Semantic(DenseNodeId, DType),
     Add,
     Sub,
     Mul,
@@ -588,6 +747,9 @@ fn flatten_into(e: &KernelExpr, out: &mut Vec<Flat>) {
                 KernelExpr::Input(k) => Flat::Input(*k),
                 KernelExpr::Scalar(k) => Flat::Scalar(*k),
                 KernelExpr::Const(bits) => Flat::Const(*bits),
+                KernelExpr::Cast(_, dtype) => Flat::Cast(*dtype),
+                KernelExpr::RoundTo(_, dtype) => Flat::RoundTo(*dtype),
+                KernelExpr::Semantic(_, node, dtype) => Flat::Semantic(*node, *dtype),
                 KernelExpr::Add(..) => Flat::Add,
                 KernelExpr::Sub(..) => Flat::Sub,
                 KernelExpr::Mul(..) => Flat::Mul,
@@ -642,7 +804,10 @@ fn flatten_into(e: &KernelExpr, out: &mut Vec<Flat>) {
                 stack.push((b, false));
                 stack.push((a, false));
             }
-            KernelExpr::Neg(a)
+            KernelExpr::Cast(a, _)
+            | KernelExpr::RoundTo(a, _)
+            | KernelExpr::Semantic(a, _, _)
+            | KernelExpr::Neg(a)
             | KernelExpr::Sqrt(a)
             | KernelExpr::Exp(a)
             | KernelExpr::Sin(a)
@@ -725,7 +890,12 @@ impl CpuFusionProgram {
                         debug_assert!(depth >= 3);
                         depth -= 2;
                     }
-                    Flat::Neg
+                    Flat::Semantic(_, _) => {
+                        panic!("unlegalized semantic boundary reached CPU fusion preparation")
+                    }
+                    Flat::Cast(_)
+                    | Flat::RoundTo(_)
+                    | Flat::Neg
                     | Flat::Sqrt
                     | Flat::Exp
                     | Flat::Sin
@@ -855,6 +1025,10 @@ fn eval_plan<T: Scalar>(
                 values[depth - 3] =
                     T::pick(values[depth - 3], values[depth - 2], values[depth - 1]);
                 depth -= 2;
+            }
+            Flat::Semantic(_, _) => unreachable!("fusion preparation rejected semantic markers"),
+            Flat::Cast(dtype) | Flat::RoundTo(dtype) => {
+                values[depth - 1] = values[depth - 1].cast(*dtype);
             }
             Flat::Neg => unary!(neg, depth),
             Flat::Sqrt => unary!(sqrt, depth),
@@ -1249,25 +1423,6 @@ fn sgd_exprs_with(
         ),
         next_v,
     ]
-}
-
-/// Whether fusion supports a device and dtype pair. CPU supports f32 and f64.
-/// Metal supports f32 and bf16. CUDA fusion is not lowered yet.
-pub fn is_fusion_supported(
-    device: &effect_torch_graph::Device,
-    dtype: effect_torch_runtime::DType,
-) -> bool {
-    match device {
-        effect_torch_graph::Device::Cpu(_) => matches!(
-            dtype,
-            effect_torch_runtime::DType::F32 | effect_torch_runtime::DType::F64
-        ),
-        effect_torch_graph::Device::Metal(_) => matches!(
-            dtype,
-            effect_torch_runtime::DType::F32 | effect_torch_runtime::DType::BF16
-        ),
-        effect_torch_graph::Device::Cuda(_) => false,
-    }
 }
 
 #[cfg(test)]

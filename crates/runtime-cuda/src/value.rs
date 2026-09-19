@@ -1,14 +1,15 @@
 use crate::buffer::CudaBuffer;
 use crate::device::{CUDA_TOP_K_BLOCKS, CUDA_TOP_K_LIMIT};
 use crate::CudaDevice;
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use effect_torch_graph::{Device, LeafValue};
-use effect_torch_runtime::{DType, GgmlKQuant, MAX_SAMPLING_VOCABULARY};
-use half::bf16;
+use effect_torch_runtime::{
+    DType, LayoutConstraintSpec, PackedFormat, StorageLayout, StorageMetadata,
+    StorageRepresentation, ValueSpec, MAX_SAMPLING_VOCABULARY,
+};
+use half::{bf16, f16};
 use std::any::Any;
-use std::sync::{Arc, Mutex};
-
-type Bf16Weight = (GgmlKQuant, u32, u32, Arc<CudaSlice<bf16>>);
+use std::sync::Arc;
 
 pub(crate) fn element_count(shape: &[usize]) -> Result<usize, String> {
     if shape.contains(&0) {
@@ -21,374 +22,273 @@ pub(crate) fn element_count(shape: &[usize]) -> Result<usize, String> {
     })
 }
 
-/// A contiguous device allocation and its logical metadata.
+/// Validates exact canonical allocation geometry before upload or publication.
+pub(crate) fn validate_storage_bytes(spec: ValueSpec<'_>, bytes: usize) -> Result<(), String> {
+    spec.validate()?;
+    match spec.storage.layout_constraint {
+        LayoutConstraintSpec::Canonical | LayoutConstraintSpec::Unconstrained => {}
+        _ => return Err("CUDA values require canonical contiguous storage".to_string()),
+    }
+    let expected = spec.canonical_geometry()?.byte_len;
+    if bytes != expected {
+        return Err(format!(
+            "CUDA storage requires {expected} bytes, received {bytes}"
+        ));
+    }
+    Ok(())
+}
+
+// Round the complete binary64 significand once. The half crate can discard
+// sticky bits, or convert through F32 on some hosts, before its final rounding.
+fn f64_to_half_bits(value: f64, fraction_bits: u32, exponent_bias: i32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let infinity = ((2 * exponent_bias + 1) as u16) << fraction_bits;
+    if exponent == 0x7ff {
+        let payload = if fraction == 0 {
+            0
+        } else {
+            (fraction >> (52 - fraction_bits)) as u16 | (1 << (fraction_bits - 1))
+        };
+        return sign | infinity | payload;
+    }
+    let exponent = exponent - 1023;
+    let minimum_normal = 1 - exponent_bias;
+    let minimum_subnormal = minimum_normal - fraction_bits as i32;
+    if exponent < minimum_subnormal - 1 {
+        return sign;
+    }
+    if exponent > exponent_bias {
+        return sign | infinity;
+    }
+    let significand = fraction | (1u64 << 52);
+    let shift = if exponent < minimum_normal {
+        (52 + minimum_subnormal - exponent) as u32
+    } else {
+        52 - fraction_bits
+    };
+    let retained = significand >> shift;
+    let remainder = significand & ((1u64 << shift) - 1);
+    let midpoint = 1u64 << (shift - 1);
+    let rounded =
+        retained + u64::from(remainder > midpoint || (remainder == midpoint && retained & 1 != 0));
+    let encoded = if exponent < minimum_normal {
+        rounded as u16
+    } else {
+        (((exponent + exponent_bias) as u16) << fraction_bits) + rounded as u16
+            - (1 << fraction_bits)
+    };
+    sign | encoded
+}
+
+pub(crate) fn dense_bytes_from_host(values: &[f64], dtype: DType) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for &value in values {
+        match dtype {
+            DType::F64 => bytes.extend_from_slice(&value.to_le_bytes()),
+            DType::F32 => bytes.extend_from_slice(&(value as f32).to_le_bytes()),
+            DType::F16 => bytes.extend_from_slice(&f64_to_half_bits(value, 10, 15).to_le_bytes()),
+            DType::BF16 => bytes.extend_from_slice(&f64_to_half_bits(value, 7, 127).to_le_bytes()),
+            DType::I64 => bytes.extend_from_slice(&(value as i64).to_le_bytes()),
+            DType::U32 => bytes.extend_from_slice(&(value as u32).to_le_bytes()),
+            DType::U8 => bytes.push(value as u8),
+        }
+    }
+    bytes
+}
+
+/// Rust element types with exact dense CUDA storage.
+pub(crate) trait CudaElement: Send + Sync + 'static {
+    const DTYPE: DType;
+}
+
+impl CudaElement for f64 {
+    const DTYPE: DType = DType::F64;
+}
+impl CudaElement for f32 {
+    const DTYPE: DType = DType::F32;
+}
+impl CudaElement for f16 {
+    const DTYPE: DType = DType::F16;
+}
+impl CudaElement for bf16 {
+    const DTYPE: DType = DType::BF16;
+}
+impl CudaElement for i64 {
+    const DTYPE: DType = DType::I64;
+}
+impl CudaElement for u32 {
+    const DTYPE: DType = DType::U32;
+}
+impl CudaElement for u8 {
+    const DTYPE: DType = DType::U8;
+}
+
+/// A contiguous allocation with exact dtype widths and logical representation metadata.
 #[derive(Clone)]
 pub struct CudaValue {
     pub(crate) device: Arc<CudaDevice>,
     pub(crate) buffer: Arc<CudaBuffer<u8>>,
-    packed_buffer: Option<Arc<CudaBuffer<u8>>>,
-    bf16_weight: Option<Arc<Mutex<Option<Bf16Weight>>>>,
-    i64_buffer: Option<Arc<CudaBuffer<i64>>>,
     shape: Arc<[usize]>,
     dtype: DType,
+    storage: StorageMetadata,
 }
 
 impl CudaValue {
+    pub(crate) fn from_dense_bytes(
+        device: Arc<CudaDevice>,
+        shape: Vec<usize>,
+        dtype: DType,
+        bytes: &[u8],
+    ) -> Result<Self, String> {
+        let spec = ValueSpec::dense(dtype, &shape);
+        validate_storage_bytes(spec, bytes.len())?;
+        let buffer = CudaBuffer::from_slice(
+            device
+                .stream
+                .clone_htod(bytes)
+                .map_err(|error| error.to_string())?,
+        );
+        Self::from_planned_buffer(device, spec, buffer)
+    }
+
+    pub(crate) fn from_packed_bytes(
+        device: Arc<CudaDevice>,
+        logical_shape: Vec<usize>,
+        format: PackedFormat,
+        bytes: &[u8],
+    ) -> Result<Self, String> {
+        let storage = StorageMetadata {
+            representation: StorageRepresentation::Packed(format),
+            layout: StorageLayout::Canonical,
+        };
+        let spec = ValueSpec {
+            semantic_dtype: DType::F32,
+            logical_shape: &logical_shape,
+            storage: storage.as_spec(),
+        };
+        validate_storage_bytes(spec, bytes.len())?;
+        let buffer = CudaBuffer::from_slice(
+            device
+                .stream
+                .clone_htod(bytes)
+                .map_err(|error| error.to_string())?,
+        );
+        Self::from_planned_buffer(device, spec, buffer)
+    }
+
+    pub(crate) fn from_planned_buffer(
+        device: Arc<CudaDevice>,
+        spec: ValueSpec<'_>,
+        buffer: CudaBuffer<u8>,
+    ) -> Result<Self, String> {
+        validate_storage_bytes(spec, buffer.len())?;
+        let alignment = spec.canonical_geometry()?.physical_dtype.size_in_bytes() as u64;
+        if buffer.address() % alignment != 0 {
+            return Err(format!(
+                "CUDA storage pointer is not aligned to {alignment} bytes"
+            ));
+        }
+        Ok(Self {
+            device,
+            buffer: Arc::new(buffer),
+            shape: spec.logical_shape.into(),
+            dtype: spec.semantic_dtype,
+            storage: StorageMetadata {
+                representation: spec.storage.representation,
+                layout: StorageLayout::Canonical,
+            },
+        })
+    }
+
+    /// Explicit numerical conversion from host doubles, never used by raw archive I/O.
     pub(crate) fn from_host(
         device: Arc<CudaDevice>,
         shape: Vec<usize>,
         dtype: DType,
         values: &[f64],
     ) -> Result<Self, String> {
-        let expected = element_count(&shape)?;
-        if values.len() != expected {
-            return Err(format!(
-                "CUDA host value count {} does not match shape element count {expected}",
-                values.len()
-            ));
+        if values.len() != element_count(&shape)? {
+            return Err("CUDA host value count does not match shape".to_string());
         }
-        let buffer = if dtype == DType::F32 {
-            let values = values.iter().map(|value| *value as f32).collect::<Vec<_>>();
-            let buffer = CudaBuffer::from_slice(
-                device
-                    .stream
-                    .clone_htod(&values)
-                    .map_err(|error| error.to_string())?,
-            );
-            buffer.cast::<u8>(values.len() * std::mem::size_of::<f32>())?
-        } else {
-            let buffer = CudaBuffer::from_slice(
-                device
-                    .stream
-                    .clone_htod(values)
-                    .map_err(|error| error.to_string())?,
-            );
-            buffer.cast::<u8>(values.len() * std::mem::size_of::<f64>())?
-        };
-        let i64_buffer = if dtype == DType::I64 {
-            Some(Arc::new(
-                device
-                    .stream
-                    .clone_htod(&values.iter().map(|value| *value as i64).collect::<Vec<_>>())
-                    .map_err(|error| error.to_string())?,
-            ))
-        } else {
-            None
-        };
-        Ok(Self {
-            device,
-            buffer: Arc::new(buffer),
-            packed_buffer: None,
-            bf16_weight: None,
-            i64_buffer: i64_buffer.map(|buffer| Arc::new(CudaBuffer::from_arc_slice(buffer))),
-            shape: shape.into(),
-            dtype,
-        })
+        Self::from_dense_bytes(device, shape, dtype, &dense_bytes_from_host(values, dtype))
     }
 
-    pub(crate) fn from_f32_host(
-        device: Arc<CudaDevice>,
-        shape: Vec<usize>,
-        values: &[f32],
-    ) -> Result<Self, String> {
-        let expected = element_count(&shape)?;
-        if values.len() != expected {
+    pub(crate) fn write_storage_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        self.require_dense()?;
+        let expected = self.storage_bytes();
+        if bytes.len() != expected {
             return Err(format!(
-                "CUDA f32 value count {} does not match shape element count {expected}",
-                values.len()
+                "CUDA storage requires {expected} bytes, received {}",
+                bytes.len()
             ));
         }
-        let buffer = CudaBuffer::from_slice(
-            device
-                .stream
-                .clone_htod(values)
-                .map_err(|error| error.to_string())?,
-        );
-        Ok(Self {
-            device,
-            buffer: Arc::new(buffer.cast::<u8>(values.len() * std::mem::size_of::<f32>())?),
-            packed_buffer: None,
-            bf16_weight: None,
-            i64_buffer: None,
-            shape: shape.into(),
-            dtype: DType::F32,
-        })
-    }
-
-    pub(crate) fn from_packed_host(
-        device: Arc<CudaDevice>,
-        shape: Vec<usize>,
-        values: &[u8],
-    ) -> Result<Self, String> {
-        let expected = element_count(&shape)?;
-        if values.len() != expected {
-            return Err(format!(
-                "CUDA packed byte count {} does not match shape element count {expected}",
-                values.len()
-            ));
-        }
-        let buffer = device
-            .stream
-            .clone_htod(values)
-            .map_err(|error| error.to_string())?;
-        let dense = CudaBuffer::from_slice(buffer).cast::<u8>(values.len())?;
-        Ok(Self {
-            device,
-            buffer: Arc::new(dense.clone()),
-            packed_buffer: Some(Arc::new(dense)),
-            bf16_weight: Some(Arc::new(Mutex::new(None))),
-            i64_buffer: None,
-            shape: shape.into(),
-            dtype: DType::U8,
-        })
-    }
-
-    pub(crate) fn from_i64_host(
-        device: Arc<CudaDevice>,
-        shape: Vec<usize>,
-        values: &[i64],
-    ) -> Result<Self, String> {
-        let expected = element_count(&shape)?;
-        if values.len() != expected {
-            return Err(format!(
-                "CUDA i64 value count {} does not match shape element count {expected}",
-                values.len()
-            ));
-        }
-        let buffer = CudaBuffer::from_slice(
-            device
-                .stream
-                .clone_htod(&values.iter().map(|value| *value as f64).collect::<Vec<_>>())
-                .map_err(|error| error.to_string())?,
-        );
-        let i64_buffer = device
-            .stream
-            .clone_htod(values)
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
-            device,
-            buffer: Arc::new(buffer.cast::<u8>(values.len() * std::mem::size_of::<f64>())?),
-            packed_buffer: None,
-            bf16_weight: None,
-            i64_buffer: Some(Arc::new(CudaBuffer::from_slice(i64_buffer))),
-            shape: shape.into(),
-            dtype: DType::I64,
-        })
-    }
-
-    pub(crate) fn write_host(&self, values: &[f64]) -> Result<(), String> {
-        let expected = element_count(&self.shape)?;
-        if values.len() != expected {
-            return Err(format!(
-                "CUDA host value count {} does not match shape element count {expected}",
-                values.len()
-            ));
-        }
-        if self.dtype == DType::F32 {
-            let values = values.iter().map(|value| *value as f32).collect::<Vec<_>>();
-            let mut buffer = self.buffer.cast::<f32>(expected)?;
-            self.device
-                .stream
-                .memcpy_htod(&values, &mut buffer)
-                .map_err(|error| error.to_string())
-        } else {
-            let mut buffer = self.buffer.cast::<f64>(expected)?;
-            self.device
-                .stream
-                .memcpy_htod(values, &mut buffer)
-                .map_err(|error| error.to_string())
-        }
-    }
-
-    pub(crate) fn write_i64_host(&self, values: &[i64]) -> Result<(), String> {
-        let expected = element_count(&self.shape)?;
-        if values.len() != expected {
-            return Err(format!(
-                "CUDA i64 value count {} does not match shape element count {expected}",
-                values.len()
-            ));
-        }
-        let mut buffer = self.buffer.cast::<f64>(expected)?;
+        let mut buffer = self.buffer.as_ref().clone();
         self.device
             .stream
-            .memcpy_htod(
-                &values.iter().map(|value| *value as f64).collect::<Vec<_>>(),
-                &mut buffer,
-            )
-            .map_err(|error| error.to_string())?;
-        let mut sidecar = self
-            .i64_buffer
-            .as_ref()
-            .ok_or_else(|| "CUDA value has no exact i64 sidecar".to_string())?
-            .as_ref()
-            .clone();
-        self.device
-            .stream
-            .memcpy_htod(values, &mut sidecar)
+            .memcpy_htod(bytes, &mut buffer)
             .map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn from_buffer(
-        device: Arc<CudaDevice>,
-        shape: Vec<usize>,
-        dtype: DType,
-        buffer: CudaSlice<f64>,
-    ) -> Result<Self, String> {
-        let len = buffer.len();
-        let buffer = CudaBuffer::from_slice(buffer);
-        Ok(Self {
-            device,
-            buffer: Arc::new(buffer.cast::<u8>(len * std::mem::size_of::<f64>())?),
-            packed_buffer: None,
-            bf16_weight: None,
-            i64_buffer: None,
-            shape: shape.into(),
-            dtype,
-        })
-    }
-
-    pub(crate) fn from_f32_buffer(
-        device: Arc<CudaDevice>,
-        shape: Vec<usize>,
-        buffer: CudaSlice<f32>,
-    ) -> Result<Self, String> {
-        let len = buffer.len();
-        let buffer = CudaBuffer::from_slice(buffer);
-        Ok(Self {
-            device,
-            buffer: Arc::new(buffer.cast::<u8>(len * std::mem::size_of::<f32>())?),
-            packed_buffer: None,
-            bf16_weight: None,
-            i64_buffer: None,
-            shape: shape.into(),
-            dtype: DType::F32,
-        })
-    }
-
-    pub(crate) fn from_planned_buffers(
-        device: Arc<CudaDevice>,
-        shape: Vec<usize>,
-        dtype: DType,
-        buffer: CudaBuffer<u8>,
-        i64_buffer: Option<CudaBuffer<i64>>,
-    ) -> Self {
-        Self {
-            device,
-            buffer: Arc::new(buffer),
-            packed_buffer: None,
-            bf16_weight: None,
-            i64_buffer: i64_buffer.map(Arc::new),
-            shape: shape.into(),
-            dtype,
-        }
     }
 
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
-
     pub fn ordinal(&self) -> u32 {
         self.device.ordinal
     }
-
     pub fn dtype(&self) -> DType {
         self.dtype
     }
-
-    pub(crate) fn storage_bytes(&self) -> Result<usize, String> {
-        if let Some(packed) = &self.packed_buffer {
-            return Ok(packed.len());
-        }
-        let dense = self.buffer.len();
-        let exact_i64 = self
-            .i64_buffer
-            .as_ref()
-            .map_or(0, |buffer| buffer.len())
-            .checked_mul(std::mem::size_of::<i64>())
-            .ok_or_else(|| "CUDA value storage byte size overflowed usize".to_string())?;
-        dense
-            .checked_add(exact_i64)
-            .ok_or_else(|| "CUDA value storage byte size overflowed usize".to_string())
-    }
-
-    pub(crate) fn with_shape(&self, shape: Vec<usize>) -> Self {
-        Self {
-            device: self.device.clone(),
-            buffer: self.buffer.clone(),
-            packed_buffer: self.packed_buffer.clone(),
-            bf16_weight: self.bf16_weight.clone(),
-            i64_buffer: self.i64_buffer.clone(),
-            shape: shape.into(),
-            dtype: self.dtype,
+    pub fn spec(&self) -> ValueSpec<'_> {
+        ValueSpec {
+            semantic_dtype: self.dtype,
+            logical_shape: &self.shape,
+            storage: self.storage.as_spec(),
         }
     }
-
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.buffer.len()
+    }
     pub(crate) fn storage_address(&self) -> u64 {
         self.buffer.address()
     }
 
-    pub(crate) fn packed_buffer(&self) -> Result<&CudaBuffer<u8>, String> {
-        self.packed_buffer
-            .as_deref()
-            .ok_or_else(|| "CUDA value does not have packed byte storage".to_string())
+    pub(crate) fn reshape_dense(&self, shape: Vec<usize>) -> Result<Self, String> {
+        self.require_dense()?;
+        validate_storage_bytes(ValueSpec::dense(self.dtype, &shape), self.storage_bytes())?;
+        let mut reshaped = self.clone();
+        reshaped.shape = shape.into();
+        Ok(reshaped)
     }
 
-    pub(crate) fn bf16_weight(
-        &self,
-        codec: GgmlKQuant,
-        rows: u32,
-        columns: u32,
-    ) -> Result<Arc<CudaSlice<bf16>>, String> {
-        let cache = self
-            .bf16_weight
-            .as_ref()
-            .ok_or_else(|| "CUDA value does not have a BF16 weight cache".to_string())?;
-        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some((cached_codec, cached_rows, cached_columns, weight)) = &*cache {
-            if (*cached_codec, *cached_rows, *cached_columns) != (codec, rows, columns) {
-                return Err("CUDA packed weight was reused with incompatible metadata".to_string());
-            }
-            return Ok(Arc::clone(weight));
+    fn require_dense(&self) -> Result<(), String> {
+        if self.storage.representation != StorageRepresentation::Dense {
+            return Err("CUDA packed values require representation-aware operations".to_string());
         }
-        let weight = Arc::new(self.device.dequantize_weight_bf16(
-            self.packed_buffer()?,
-            codec,
-            rows,
-            columns,
-        )?);
-        *cache = Some((codec, rows, columns, Arc::clone(&weight)));
-        Ok(weight)
+        Ok(())
     }
 
-    pub(crate) fn f32_buffer(&self) -> Result<CudaBuffer<f32>, String> {
-        if self.dtype != DType::F32 {
-            return Err(format!("CUDA value is {}, not f32", self.dtype.name()));
-        }
-        self.buffer.cast(element_count(&self.shape)?)
-    }
-
-    pub(crate) fn f64_buffer(&self) -> Result<CudaBuffer<f64>, String> {
-        if self.dtype == DType::F32 || self.dtype == DType::U8 {
+    fn require_dtype(&self, dtype: DType) -> Result<(), String> {
+        self.require_dense()?;
+        if self.dtype != dtype {
             return Err(format!(
-                "CUDA value is {}, not f64-backed",
-                self.dtype.name()
+                "CUDA typed view requires {dtype}, received {}",
+                self.dtype
             ));
         }
-        self.buffer.cast(element_count(&self.shape)?)
+        Ok(())
     }
 
-    pub(crate) fn i64_buffer(&self) -> Result<&CudaBuffer<i64>, String> {
-        self.i64_buffer
-            .as_deref()
-            .ok_or_else(|| "CUDA value does not have i64 storage".to_string())
-    }
-
-    pub(crate) fn has_i64_buffer(&self) -> bool {
-        self.i64_buffer.is_some()
+    pub(crate) fn typed_buffer<T: CudaElement>(&self) -> Result<CudaBuffer<T>, String> {
+        self.require_dtype(T::DTYPE)?;
+        self.buffer
+            .cast(self.storage_bytes() / std::mem::size_of::<T>())
     }
 
     pub(crate) fn greedy_argmax(&self) -> Result<u32, String> {
-        let logits = self.f32_buffer()?;
+        let logits = self.typed_buffer::<f32>()?;
         let len = element_count(&self.shape)?;
         let len = u32::try_from(len)
             .map_err(|_| "CUDA greedy argmax input exceeds u32 indexing".to_string())?;
@@ -427,7 +327,7 @@ impl CudaValue {
     }
 
     pub(crate) fn topk(&self, k: usize) -> Result<(Vec<f64>, Vec<u32>), String> {
-        let logits = self.f32_buffer()?;
+        let logits = self.typed_buffer::<f32>()?;
         let len = element_count(&self.shape)?;
         if len == 0 {
             return Err("sample: logits must be non-empty".to_string());
@@ -472,11 +372,11 @@ impl CudaValue {
         let output_count = CUDA_TOP_K_BLOCKS * CUDA_TOP_K_LIMIT;
         let invalid = result[2 * output_count..]
             .iter()
-            .copied()
-            .filter(|index| *index >= 0.0)
-            .min_by(f32::total_cmp);
+            .map(|value| value.to_bits())
+            .filter(|index| *index != u32::MAX)
+            .min();
         if let Some(invalid) = invalid {
-            return Err(format!("sample: logit {} is not finite", invalid as u32));
+            return Err(format!("sample: logit {invalid} is not finite"));
         }
         let k = k as usize;
         let mut values = Vec::with_capacity(CUDA_TOP_K_BLOCKS * k);
@@ -487,46 +387,52 @@ impl CudaValue {
             tokens.extend(
                 result[output_count + offset..output_count + offset + k]
                     .iter()
-                    .map(|token| *token as u32),
+                    .map(|token| token.to_bits()),
             );
         }
         Ok((values, tokens))
     }
 
-    pub fn readback_i64(&self) -> Result<Vec<i64>, String> {
-        if let Some(buffer) = &self.i64_buffer {
-            return self
-                .device
-                .stream
-                .clone_dtoh(buffer.as_ref())
-                .map_err(|error| error.to_string());
-        }
-        self.readback()
-            .map(|values| values.into_iter().map(|value| value as i64).collect())
-    }
-
-    pub fn readback(&self) -> Result<Vec<f64>, String> {
-        if let Some(buffer) = &self.packed_buffer {
-            return self
-                .device
-                .stream
-                .clone_dtoh(buffer.as_ref())
-                .map(|values| values.into_iter().map(f64::from).collect())
-                .map_err(|error| error.to_string());
-        }
-        let len = element_count(&self.shape)?;
-        if self.dtype == DType::F32 {
-            return self
-                .device
-                .stream
-                .clone_dtoh(&self.buffer.cast::<f32>(len)?)
-                .map(|values| values.into_iter().map(f64::from).collect())
-                .map_err(|error| error.to_string());
-        }
+    pub fn read_storage_bytes(&self) -> Result<Vec<u8>, String> {
         self.device
             .stream
-            .clone_dtoh(&self.buffer.cast::<f64>(len)?)
+            .clone_dtoh(self.buffer.as_ref())
             .map_err(|error| error.to_string())
+    }
+
+    pub fn readback_i64(&self) -> Result<Vec<i64>, String> {
+        self.device
+            .stream
+            .clone_dtoh(&self.typed_buffer::<i64>()?)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Numerical host readback. I64 callers needing exact values use readback_i64.
+    pub fn readback(&self) -> Result<Vec<f64>, String> {
+        self.require_dense()?;
+        let bytes = self.read_storage_bytes()?;
+        Ok(bytes
+            .chunks_exact(self.dtype.size_in_bytes())
+            .map(|chunk| match self.dtype {
+                DType::F64 => f64::from_le_bytes(chunk.try_into().expect("validated f64 bytes")),
+                DType::F32 => f64::from(f32::from_le_bytes(
+                    chunk.try_into().expect("validated f32 bytes"),
+                )),
+                DType::F16 => {
+                    f16::from_le_bytes(chunk.try_into().expect("validated f16 bytes")).to_f64()
+                }
+                DType::BF16 => {
+                    bf16::from_le_bytes(chunk.try_into().expect("validated bf16 bytes")).to_f64()
+                }
+                DType::I64 => {
+                    i64::from_le_bytes(chunk.try_into().expect("validated i64 bytes")) as f64
+                }
+                DType::U32 => f64::from(u32::from_le_bytes(
+                    chunk.try_into().expect("validated u32 bytes"),
+                )),
+                DType::U8 => f64::from(chunk[0]),
+            })
+            .collect())
     }
 }
 
@@ -534,31 +440,20 @@ impl LeafValue for CudaValue {
     fn shape(&self) -> Vec<usize> {
         self.shape.to_vec()
     }
-
     fn dtype(&self) -> DType {
         self.dtype
     }
-
     fn device(&self) -> Device {
         Device::Cuda(self.device.ordinal)
     }
-
+    fn storage(&self) -> StorageMetadata {
+        self.storage.clone()
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::element_count;
-
-    #[test]
-    fn zero_extent_short_circuits_overflow() {
-        assert_eq!(element_count(&[usize::MAX, usize::MAX, 0]), Ok(0));
-    }
-
-    #[test]
-    fn rejects_nonzero_shape_overflow() {
-        assert!(element_count(&[usize::MAX, 2]).is_err());
-    }
-}
+#[path = "value_storage_tests.rs"]
+mod tests;

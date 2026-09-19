@@ -35,11 +35,12 @@ pub use gguf::{inspect_gguf, load_gguf};
 
 use self::err::to_napi_err;
 use self::value::Value;
+use crate::capabilities::CpuDTypeCapabilities;
 use crate::{composed, executable, pool, CpuBuffer, CpuDestination, Elem, Tensor};
 use effect_torch_compiler::{
     specialize_decode_layout_outputs_with_attention, CompileOptions, CurrentBlockAttention,
     DecodeGeometry, DecodeLayout, DecodeOutputSelection, InferenceOptions, PreparedProgram,
-    ProgramRequest, ProgramSlot, StateCursorSlot,
+    ProgramRequest, ProgramSlot, StateCursorSlot, TargetDTypeCapabilities, TargetFingerprint,
 };
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
 use effect_torch_graph::{AttentionWindow, Device, KvAttentionMode, PositionOffset, RotaryLayout};
@@ -271,6 +272,41 @@ pub struct NativeSamplingOptions {
     pub counter: f64,
 }
 
+#[napi(object)]
+pub struct NativeTensorStorage {
+    pub representation: String,
+    pub format: Option<String>,
+}
+
+impl NativeTensorStorage {
+    fn from_metadata(storage: effect_torch_runtime::StorageMetadata) -> Self {
+        use effect_torch_runtime::StorageRepresentation;
+        match storage.representation {
+            StorageRepresentation::Dense => Self {
+                representation: "dense".into(),
+                format: None,
+            },
+            StorageRepresentation::Packed(format) => Self {
+                representation: "packed".into(),
+                format: Some(format.name().into()),
+            },
+        }
+    }
+
+    fn metadata(self) -> Result<effect_torch_runtime::StorageMetadata> {
+        match (self.representation.as_str(), self.format.as_deref()) {
+            ("dense", None) => Ok(effect_torch_runtime::StorageMetadata::dense()),
+            ("packed", Some(format)) => Ok(effect_torch_runtime::StorageMetadata::packed(
+                ggml_k_quant(format)?,
+            )),
+            _ => Err(Error::new(
+                Status::InvalidArg,
+                "invalid tensor storage representation",
+            )),
+        }
+    }
+}
+
 fn non_negative_safe_integer(value: f64, name: &str) -> Result<u64> {
     const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE_INTEGER {
@@ -388,7 +424,24 @@ pub struct NativeMemoryDiagnostics {
 }
 
 #[napi(object)]
+pub struct NativeDTypeLegalizationDiagnostics {
+    pub target_backend: String,
+    pub target_architecture: String,
+    pub lowering_abi_revision: f64,
+    pub policy_revision: f64,
+    pub capability_queries: f64,
+    pub native_lowering_units: f64,
+    pub legalized_lowering_units: f64,
+    pub kernel_local_legalizations: f64,
+    pub materialized_conversions: f64,
+    pub materialized_conversion_bytes: f64,
+    pub decompositions: f64,
+    pub rejected_region_candidates: f64,
+}
+
+#[napi(object)]
 pub struct NativeExecutableDiagnostics {
+    pub legalization: NativeDTypeLegalizationDiagnostics,
     pub semantic_nodes_before_optimization: f64,
     pub semantic_nodes_after_optimization: f64,
     pub instructions: Vec<NativeInstructionDiagnostics>,
@@ -403,7 +456,22 @@ fn executable_diagnostics(
     diagnostics: &effect_torch_runtime::ExecutableDiagnostics,
 ) -> NativeExecutableDiagnostics {
     let memory = &diagnostics.memory;
+    let legalization = &diagnostics.legalization;
     NativeExecutableDiagnostics {
+        legalization: NativeDTypeLegalizationDiagnostics {
+            target_backend: legalization.target_backend.clone(),
+            target_architecture: legalization.target_architecture.clone(),
+            lowering_abi_revision: legalization.lowering_abi_revision as f64,
+            policy_revision: legalization.policy_revision as f64,
+            capability_queries: legalization.capability_queries as f64,
+            native_lowering_units: legalization.native_lowering_units as f64,
+            legalized_lowering_units: legalization.legalized_lowering_units as f64,
+            kernel_local_legalizations: legalization.kernel_local_legalizations as f64,
+            materialized_conversions: legalization.materialized_conversions as f64,
+            materialized_conversion_bytes: legalization.materialized_conversion_bytes as f64,
+            decompositions: legalization.decompositions as f64,
+            rejected_region_candidates: legalization.rejected_region_candidates as f64,
+        },
         semantic_nodes_before_optimization: diagnostics.semantic_nodes_before_optimization as f64,
         semantic_nodes_after_optimization: diagnostics.semantic_nodes_after_optimization as f64,
         instructions: diagnostics
@@ -562,6 +630,13 @@ impl NativeTensor {
     }
 
     #[napi(getter)]
+    pub fn storage(&self) -> Result<NativeTensorStorage> {
+        Ok(NativeTensorStorage::from_metadata(
+            self.value_cloned()?.storage(),
+        ))
+    }
+
+    #[napi(getter)]
     pub fn device(&self) -> Result<String> {
         self.value_cloned()?;
         Ok("cpu".to_string())
@@ -663,6 +738,7 @@ fn sample_blocking(
 }
 
 fn readback_blocking(value: &Value) -> Result<Readback> {
+    value.require_dense().map_err(to_napi_err)?;
     let tensor = value.tensor();
     let element_size = tensor.dtype().size_in_bytes();
     let base = match &tensor.buffer {
@@ -930,6 +1006,11 @@ impl LazyTensor {
         self.node.dtype.name().to_string()
     }
 
+    #[napi(getter)]
+    pub fn storage(&self) -> NativeTensorStorage {
+        NativeTensorStorage::from_metadata(self.node.storage.clone())
+    }
+
     #[napi]
     pub fn metadata(&self) -> (Vec<u32>, String) {
         (self.shape(), self.dtype())
@@ -1053,8 +1134,17 @@ impl LazyTensor {
     }
 
     #[napi(factory)]
-    pub fn input(slot: u32, shape: Vec<u32>, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn input(
+        slot: u32,
+        shape: Vec<u32>,
+        dtype: Option<NativeDType>,
+        storage: Option<NativeTensorStorage>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Input {
+            storage: storage
+                .map(NativeTensorStorage::metadata)
+                .transpose()?
+                .unwrap_or_else(effect_torch_runtime::StorageMetadata::dense),
             slot,
             shape: shape
                 .into_iter()
@@ -1437,20 +1527,11 @@ impl LazyTensor {
     }
 
     #[napi]
-    pub fn quantized_linear(
-        &self,
-        weight: &LazyTensor,
-        bias: Option<&LazyTensor>,
-        encoding: String,
-        rows: u32,
-        columns: u32,
-    ) -> Result<Self> {
+    pub fn quantized_linear(&self, weight: &LazyTensor, bias: Option<&LazyTensor>) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::QuantizedLinear {
             x: self.node.clone(),
             weight: weight.node.clone(),
             bias: bias.map(|value| value.node.clone()),
-            codec: ggml_k_quant(&encoding)?,
-            weight_shape: [rows as usize, columns as usize],
         }))
     }
 
@@ -1458,16 +1539,11 @@ impl LazyTensor {
     pub fn quantized_embedding(
         &self,
         weight: &LazyTensor,
-        encoding: String,
-        rows: u32,
-        columns: u32,
         padding_index: Option<u32>,
     ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::QuantizedEmbedding {
             indexes: self.node.clone(),
             weight: weight.node.clone(),
-            codec: ggml_k_quant(&encoding)?,
-            weight_shape: [rows as usize, columns as usize],
             padding_index: padding_index.map(|value| value as usize),
         }))
     }
@@ -1884,6 +1960,7 @@ struct ProgramInner {
 
 #[derive(Clone)]
 struct GeneratedBindingSignature {
+    storage: effect_torch_runtime::StorageMetadata,
     shape: Vec<usize>,
     dtype: DType,
     layout: Layout,
@@ -1899,21 +1976,29 @@ struct CachedProgram {
 
 #[derive(Default)]
 struct ProgramCache {
-    entries: HashMap<String, CachedProgram>,
-    order: VecDeque<String>,
+    entries: HashMap<ProgramCacheKey, CachedProgram>,
+    order: VecDeque<ProgramCacheKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProgramCacheKey {
+    semantic_program: String,
+    options: CompileOptions,
+    target: TargetFingerprint,
+    policy_revision: u64,
 }
 
 impl ProgramCache {
-    fn get(&mut self, key: &str) -> Option<CachedProgram> {
+    fn get(&mut self, key: &ProgramCacheKey) -> Option<CachedProgram> {
         let entry = self.entries.get(key)?.clone();
         if let Some(index) = self.order.iter().position(|existing| existing == key) {
             self.order.remove(index);
         }
-        self.order.push_back(key.to_string());
+        self.order.push_back(key.clone());
         Some(entry)
     }
 
-    fn insert(&mut self, key: String, entry: CachedProgram) {
+    fn insert(&mut self, key: ProgramCacheKey, entry: CachedProgram) {
         const CAPACITY: usize = 64;
         if self.entries.contains_key(&key) {
             self.order.retain(|existing| existing != &key);
@@ -1951,6 +2036,7 @@ fn generated_signatures(values: &[Value]) -> Vec<GeneratedBindingSignature> {
     values
         .iter()
         .map(|value| GeneratedBindingSignature {
+            storage: value.storage(),
             shape: value.shape().to_vec(),
             dtype: value.dtype(),
             layout: value.tensor().layout.clone(),
@@ -1963,6 +2049,7 @@ fn generated_match(values: &[Value], expected: &[GeneratedBindingSignature]) -> 
         && values.iter().zip(expected).all(|(value, expected)| {
             value.shape() == expected.shape
                 && value.dtype() == expected.dtype
+                && value.storage() == expected.storage
                 && value.tensor().layout == expected.layout
         })
 }
@@ -2186,7 +2273,7 @@ impl Executable {
             signature
                 .validate_binding_metadata(
                     index,
-                    value.dtype(),
+                    value.value_spec(),
                     value.tensor().placement(),
                     &value.tensor().layout,
                 )
@@ -2332,6 +2419,7 @@ pub fn compile(
                 .packed_rows_per_sequence
                 .map_or(state.batch, |rows| state.batch * rows),
         });
+    let capabilities = CpuDTypeCapabilities::default();
     let effective_cache_key = cache_key
         .filter(|_| {
             std::env::var_os("EFFECT_TORCH_NO_EXECUTABLE_CACHE").is_none()
@@ -2341,14 +2429,23 @@ pub fn compile(
                     .as_ref()
                     .is_some_and(|inference| inference.constant_weights)
         })
-        .map(|key| format!("{key}|{:?}", program.options));
-    if let Some(key) = effective_cache_key.as_deref() {
+        .map(|semantic_program| ProgramCacheKey {
+            semantic_program,
+            options: program.options.clone(),
+            target: capabilities.fingerprint().clone(),
+            policy_revision: capabilities.policy_revision(),
+        });
+    if let Some(key) = effective_cache_key.as_ref() {
         let cached = program_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(key);
         if let Some(cached) = cached {
-            if cached.executable.signature == program.signature {
+            if cached.executable.signature == program.signature
+                && cached.executable.target == key.target
+                && cached.executable.policy_revision == key.policy_revision
+                && cached.executable.options == key.options
+            {
                 if let Some(current) = (generated_values.len() == cached.generated_order.len())
                     .then(|| {
                         ordered_generated_bindings(
@@ -2495,18 +2592,77 @@ pub struct NativeSafetensorsArchive {
     pub metadata: HashMap<String, String>,
 }
 
-/// Loads a safetensors archive, rejecting unsupported dtypes and malformed
-/// byte lengths.
+/// One tensor descriptor from a safetensors inspection.
+#[napi(object, object_from_js = false)]
+pub struct NativeSafetensorsTensorInfo {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u32>,
+    pub byte_length: f64,
+}
+
+/// A header-only safetensors inspection with merged archive metadata.
+#[napi(object, object_from_js = false)]
+pub struct NativeSafetensorsInspection {
+    pub entries: Vec<NativeSafetensorsTensorInfo>,
+    pub metadata: HashMap<String, String>,
+}
+
+fn native_safetensors_inspection(
+    inspection: effect_torch_napi::safetensors::Inspection,
+) -> Result<NativeSafetensorsInspection> {
+    let mut entries = Vec::with_capacity(inspection.entries.len());
+    for meta in inspection.entries {
+        entries.push(NativeSafetensorsTensorInfo {
+            name: meta.name,
+            dtype: effect_torch_napi::safetensors::dtype_name(meta.dtype),
+            shape: meta.shape,
+            byte_length: effect_torch_napi::safetensors::byte_length_f64(meta.byte_length)
+                .map_err(effect_torch_napi::safetensors::Error::into_napi)?,
+        });
+    }
+    Ok(NativeSafetensorsInspection {
+        entries,
+        metadata: inspection.metadata,
+    })
+}
+
+/// Reads a standalone safetensors header or a Hugging Face index and every
+/// shard header it references without reading or allocating any payload.
+#[napi]
+pub async fn inspect_safetensors(
+    path: String,
+    token: Option<&CancellationToken>,
+) -> Result<NativeSafetensorsInspection> {
+    run_compute(token, move |cancelled, _state| {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Error::new(Status::Cancelled, "operation aborted"));
+        }
+        let inspection =
+            effect_torch_napi::safetensors::inspect(&path, &|| cancelled.load(Ordering::Acquire))
+                .map_err(effect_torch_napi::safetensors::Error::into_napi)?;
+        native_safetensors_inspection(inspection)
+    })
+    .await
+}
+
+/// Loads a safetensors archive. Optional `names` selects unique tensors;
+/// omission loads every tensor and an empty array loads none. Selected payloads
+/// are read without materializing the rest of the file.
 #[napi]
 pub async fn load_tensors(
     path: String,
     token: Option<&CancellationToken>,
+    names: Option<Vec<String>>,
 ) -> Result<NativeSafetensorsArchive> {
     run_compute(token, move |cancelled, _state| {
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::new(Status::Cancelled, "operation aborted"));
         }
-        let archive = safetensors::load(&path).map_err(to_napi_err)?;
+        let archive = safetensors::load(&path, names.as_deref(), &|| {
+            cancelled.load(Ordering::Acquire)
+        })
+        .map_err(effect_torch_napi::safetensors::Error::into_napi)?;
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::new(Status::Cancelled, "operation aborted"));
         }
@@ -2555,12 +2711,12 @@ fn capture_recurrent_snapshot(state: &SeqState) -> Option<RecurrentSnapshot> {
     let kda = state
         .kda_states
         .iter()
-        .map(|tensor| Value(tensor.clone()).to_f32_vec().ok())
+        .map(|tensor| Value::dense(tensor.clone()).to_f32_vec().ok())
         .collect::<Option<Vec<_>>>()?;
     let conv = state
         .conv_states
         .iter()
-        .map(|tensor| Value(tensor.clone()).to_f32_vec().ok())
+        .map(|tensor| Value::dense(tensor.clone()).to_f32_vec().ok())
         .collect::<Option<Vec<_>>>()?;
     Some(RecurrentSnapshot { kda, conv })
 }
@@ -3711,6 +3867,10 @@ fn kv_attention_into(
         ));
     }
     let layer_index = layer as usize;
+    let scale = scale as f32;
+    let query_values: &[f32] = f32::storage_of(&q.tensor().buffer)
+        .ok_or_else(|| "kv attention: expected f32 query storage".to_string())?;
+    let query_stride = q.tensor().layout.strides()[rank - 1];
     output.write::<f32, _>("kv attention output", &dimensions, |out| -> err::Res<()> {
         out.fill(0.0);
         for batch_index in 0..batch {
@@ -3860,60 +4020,43 @@ fn kv_attention_into(
                                 end.saturating_sub(window).max(start)
                             }
                         });
-                        let mut maximum = f64::NEG_INFINITY;
+                        // Resolve the row once. The inner dot products reuse its
+                        // base and column stride without rescanning the layout.
+                        let query_base = crate::tensor::source_index(
+                            &q.tensor().layout,
+                            ((batch_index * query_heads + head) * tokens + query) * width,
+                        );
+                        let mut maximum = f32::NEG_INFINITY;
                         for position in begin..end {
-                            let mut score = 0.0f64;
+                            let mut score = 0.0f32;
                             for column in 0..width {
-                                let q_index = ((batch_index * query_heads + head) * tokens + query)
-                                    * width
-                                    + column;
-                                score += tensor_element::<f32>(
-                                    q.tensor(),
-                                    q_index,
-                                    "kv attention query",
-                                )? as f64
-                                    * cached(keys, key_scales, position, kv_head, column) as f64;
+                                score += query_values[query_base + column * query_stride]
+                                    * cached(keys, key_scales, position, kv_head, column);
                             }
                             maximum = maximum.max(score * scale);
                         }
-                        let mut denominator = 0.0f64;
+                        let mut denominator = 0.0f32;
                         for position in begin..end {
-                            let mut score = 0.0f64;
+                            let mut score = 0.0f32;
                             for column in 0..width {
-                                let q_index = ((batch_index * query_heads + head) * tokens + query)
-                                    * width
-                                    + column;
-                                score += tensor_element::<f32>(
-                                    q.tensor(),
-                                    q_index,
-                                    "kv attention query",
-                                )? as f64
-                                    * cached(keys, key_scales, position, kv_head, column) as f64;
+                                score += query_values[query_base + column * query_stride]
+                                    * cached(keys, key_scales, position, kv_head, column);
                             }
                             denominator += (score * scale - maximum).exp();
                         }
                         for column in 0..width {
-                            let mut result = 0.0f64;
+                            let mut result = 0.0f32;
                             for position in begin..end {
-                                let mut score = 0.0f64;
+                                let mut score = 0.0f32;
                                 for depth in 0..width {
-                                    let q_index = ((batch_index * query_heads + head) * tokens
-                                        + query)
-                                        * width
-                                        + depth;
-                                    score += tensor_element::<f32>(
-                                        q.tensor(),
-                                        q_index,
-                                        "kv attention query",
-                                    )? as f64
-                                        * cached(keys, key_scales, position, kv_head, depth) as f64;
+                                    score += query_values[query_base + depth * query_stride]
+                                        * cached(keys, key_scales, position, kv_head, depth);
                                 }
                                 result += (score * scale - maximum).exp()
-                                    * cached(values, value_scales, position, kv_head, column)
-                                        as f64;
+                                    * cached(values, value_scales, position, kv_head, column);
                             }
                             out[((batch_index * query_heads + head) * tokens + query) * width
-                                + column] = (result / denominator) as f32;
+                                + column] = result / denominator;
                         }
                     }
                 }
@@ -4675,7 +4818,7 @@ fn speculative_token_input(
             ))
         }
     };
-    Ok(Value(tensor))
+    Ok(Value::dense(tensor))
 }
 
 fn clone_speculative_state(
@@ -6481,20 +6624,6 @@ fn inference_error(phase: &str, message: impl std::fmt::Display) -> Error {
 #[derive(Clone, Copy)]
 pub struct NativeU64(u64);
 
-unsafe extern "C" {
-    fn napi_get_value_bigint_uint64(
-        env: sys::napi_env,
-        value: sys::napi_value,
-        result: *mut u64,
-        lossless: *mut bool,
-    ) -> sys::napi_status;
-    fn napi_create_bigint_uint64(
-        env: sys::napi_env,
-        value: u64,
-        result: *mut sys::napi_value,
-    ) -> sys::napi_status;
-}
-
 impl TypeName for NativeU64 {
     fn type_name() -> &'static str {
         "BigInt"
@@ -6512,7 +6641,7 @@ impl FromNapiValue for NativeU64 {
         let mut result = 0u64;
         let mut lossless = false;
         napi::check_status!(unsafe {
-            napi_get_value_bigint_uint64(env, value, &mut result, &mut lossless)
+            sys::napi_get_value_bigint_uint64(env, value, &mut result, &mut lossless)
         })?;
         if !lossless {
             return Err(Error::new(
@@ -6527,7 +6656,7 @@ impl FromNapiValue for NativeU64 {
 impl ToNapiValue for NativeU64 {
     unsafe fn to_napi_value(env: sys::napi_env, value: Self) -> Result<sys::napi_value> {
         let mut result = std::ptr::null_mut();
-        napi::check_status!(unsafe { napi_create_bigint_uint64(env, value.0, &mut result) })?;
+        napi::check_status!(unsafe { sys::napi_create_bigint_uint64(env, value.0, &mut result) })?;
         Ok(result)
     }
 }
@@ -6916,7 +7045,7 @@ fn routed_target_row(value: &Value, physical_lane: usize) -> std::result::Result
             layout.shape()
         ));
     }
-    Ok(Value(value.tensor().view(layout.narrow(
+    Ok(Value::dense(value.tensor().view(layout.narrow(
         0,
         physical_lane,
         1,
@@ -8249,8 +8378,8 @@ fn prompt_tokens(prompt: &NativeTensor, dtype: DType) -> Result<Vec<u32>> {
 
 fn token_value(dtype: DType, values: Vec<u32>, shape: Vec<usize>) -> Value {
     match dtype {
-        DType::U32 => Value(Tensor::from_vec(values, shape)),
-        DType::I64 => Value(Tensor::from_vec(
+        DType::U32 => Value::dense(Tensor::from_vec(values, shape)),
+        DType::I64 => Value::dense(Tensor::from_vec(
             values.into_iter().map(i64::from).collect(),
             shape,
         )),
@@ -10204,8 +10333,37 @@ impl NativeInferenceSession {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cache_identity_includes_structural_target_and_policy() {
+        let capabilities = CpuDTypeCapabilities::default();
+        let key = ProgramCacheKey {
+            semantic_program: "same-program".into(),
+            options: CompileOptions::default(),
+            target: capabilities.fingerprint().clone(),
+            policy_revision: capabilities.policy_revision(),
+        };
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(key.clone(), true);
+        assert_eq!(cache.get(&key), Some(&true));
+        let mut different = key.clone();
+        different.target.lowering_abi_revision += 1;
+        assert_eq!(cache.get(&different), None);
+        different = key.clone();
+        different.target.features = vec!["different-library-path".to_string()].into_boxed_slice();
+        assert_eq!(cache.get(&different), None);
+        different = key.clone();
+        different.policy_revision += 1;
+        assert_eq!(cache.get(&different), None);
+        different = key;
+        different.options.optimize = false;
+        assert_eq!(cache.get(&different), None);
+    }
+
     fn leaf(tensor: Tensor) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(tensor))))).unwrap()
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
+            tensor,
+        )))))
+        .unwrap()
     }
 
     fn sampling_options() -> SamplingOptions {
@@ -10221,6 +10379,7 @@ mod tests {
     fn stateless_input_executable(shape: &[usize]) -> Executable {
         let root = LazyTensor {
             node: Node::new(NodeKind::Input {
+                storage: effect_torch_runtime::StorageMetadata::dense(),
                 slot: 0,
                 shape: shape.to_vec(),
                 dtype: DType::F32,
@@ -10266,7 +10425,7 @@ mod tests {
 
     #[test]
     fn target_hidden_row_selection_is_a_direct_value_view() {
-        let source = Value(Tensor::from_vec(
+        let source = Value::dense(Tensor::from_vec(
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
             vec![3, 2],
         ));
@@ -10310,8 +10469,8 @@ mod tests {
             verify_taps: Vec::new(),
         };
         let target = vec![
-            Value(Tensor::from_vec(vec![0.0f32], vec![1])),
-            Value(Tensor::from_vec(vec![7.0f32, 11.0], vec![2])),
+            Value::dense(Tensor::from_vec(vec![0.0f32], vec![1])),
+            Value::dense(Tensor::from_vec(vec![7.0f32, 11.0], vec![2])),
         ];
 
         let outputs =
@@ -10332,7 +10491,7 @@ mod tests {
         )
         .view(Layout::new(vec![3], vec![2], 1));
         assert_eq!(
-            sample_blocking(&Value(tensor), sampling_options(), || false).unwrap(),
+            sample_blocking(&Value::dense(tensor), sampling_options(), || false).unwrap(),
             1
         );
     }
@@ -10347,22 +10506,22 @@ mod tests {
 
     #[test]
     fn sampling_rejects_invalid_tensor_inputs_and_reports_cancellation() {
-        let integer = Value(Tensor::from_vec(vec![1u32, 2, 3], vec![3]));
+        let integer = Value::dense(Tensor::from_vec(vec![1u32, 2, 3], vec![3]));
         let error = sample_blocking(&integer, sampling_options(), || false).unwrap_err();
         assert_eq!(error.status, Status::InvalidArg);
         assert!(error.reason.contains("floating-point dtype"));
 
-        let matrix = Value(Tensor::from_vec(vec![1.0f32, 2.0], vec![1, 2]));
+        let matrix = Value::dense(Tensor::from_vec(vec![1.0f32, 2.0], vec![1, 2]));
         let error = sample_blocking(&matrix, sampling_options(), || false).unwrap_err();
         assert_eq!(error.status, Status::InvalidArg);
         assert!(error.reason.contains("rank 1"));
 
-        let empty = Value(Tensor::from_vec(Vec::<f32>::new(), vec![0]));
+        let empty = Value::dense(Tensor::from_vec(Vec::<f32>::new(), vec![0]));
         let error = sample_blocking(&empty, sampling_options(), || false).unwrap_err();
         assert_eq!(error.status, Status::InvalidArg);
         assert!(error.reason.contains("non-empty"));
 
-        let logits = Value(Tensor::from_vec(vec![1.0f32, 2.0], vec![2]));
+        let logits = Value::dense(Tensor::from_vec(vec![1.0f32, 2.0], vec![2]));
         let error = sample_blocking(&logits, sampling_options(), || true).unwrap_err();
         assert_eq!(error.status, Status::Cancelled);
         assert_eq!(error.reason, "operation aborted");
@@ -10388,6 +10547,7 @@ mod tests {
             [
                 "graph_index",
                 "optimization",
+                "target_legalization",
                 "lowering",
                 "lowered_program_validation",
                 "memory_planning",
@@ -10601,11 +10761,11 @@ mod tests {
 
     #[test]
     fn recurrent_state_slices_share_transaction_storage_without_backend_allocation() {
-        let kda = Value(Tensor::from_vec(
+        let kda = Value::dense(Tensor::from_vec(
             (0..24).map(|value| value as f32).collect(),
             vec![4, 2, 3],
         ));
-        let conv = Value(Tensor::from_vec(
+        let conv = Value::dense(Tensor::from_vec(
             (0..12).map(|value| value as f32).collect(),
             vec![2, 2, 3],
         ));
@@ -10621,13 +10781,13 @@ mod tests {
         assert_eq!(kda_slices[0].shape(), &[2, 2, 3]);
         assert_eq!(kda_slices[1].shape(), &[2, 2, 3]);
         assert_eq!(
-            Value(kda_slices[1].clone()).to_f32_vec().unwrap(),
+            Value::dense(kda_slices[1].clone()).to_f32_vec().unwrap(),
             (12..24).map(|value| value as f32).collect::<Vec<_>>()
         );
         assert_eq!(conv_slices[0].shape(), &[2, 3]);
         assert_eq!(conv_slices[1].shape(), &[2, 3]);
         assert_eq!(
-            Value(conv_slices[1].clone()).to_f32_vec().unwrap(),
+            Value::dense(conv_slices[1].clone()).to_f32_vec().unwrap(),
             (6..12).map(|value| value as f32).collect::<Vec<_>>()
         );
     }
@@ -10859,9 +11019,9 @@ mod tests {
             conv: ConvGeometry::default(),
             transaction: Mutex::new(None),
         };
-        let q = Value(Tensor::from_vec(vec![1.0f32, 1.0, 99.0], vec![3, 1, 1, 1]));
-        let k = Value(Tensor::from_vec(vec![1.0f32, 2.0, 99.0], vec![3, 1, 1, 1]));
-        let v = Value(Tensor::from_vec(
+        let q = Value::dense(Tensor::from_vec(vec![1.0f32, 1.0, 99.0], vec![3, 1, 1, 1]));
+        let k = Value::dense(Tensor::from_vec(vec![1.0f32, 2.0, 99.0], vec![3, 1, 1, 1]));
+        let v = Value::dense(Tensor::from_vec(
             vec![10.0f32, 20.0, 99.0],
             vec![3, 1, 1, 1],
         ));
@@ -10885,11 +11045,89 @@ mod tests {
 
         assert_eq!(pool.k[0].read_rows_f32(&[0, 1]), [1.0, 2.0]);
         assert_eq!(pool.v[0].read_rows_f32(&[0, 1]), [10.0, 20.0]);
-        let output = Value(actual).to_f32_vec().unwrap();
+        let output = Value::dense(actual).to_f32_vec().unwrap();
         assert_eq!(output[0], 10.0);
         assert!(output[1] > 10.0 && output[1] < 20.0);
         assert_eq!(output[2], 0.0);
         assert_eq!(state.lock().unwrap().advance, 2);
+    }
+
+    #[test]
+    fn kv_attention_accumulates_scores_and_values_in_f32() {
+        for (width, tokens, queries, keys, values, expected) in [
+            (
+                3,
+                2,
+                vec![16777216., 1., -16777216., 16777216., 1., -16777216.],
+                vec![1., 1., 1., 0., 0., 0.],
+                vec![1., 0., 0., 0., 0., 0.],
+                vec![1., 0., 0., 0.5, 0., 0.],
+            ),
+            (
+                1,
+                3,
+                vec![0.; 3],
+                vec![0.; 3],
+                vec![16777216., 1., -16777216.],
+                vec![16777216., 8388608., 0.],
+            ),
+        ] {
+            let pool = Arc::new(PoolInner {
+                k: vec![pool::Slab::new(4, width, DType::F32)],
+                v: vec![pool::Slab::new(4, width, DType::F32)],
+                scales: Vec::new(),
+                kv_dtype: DType::F32,
+                kv_heads: 1,
+                head_dim: width,
+                block_size: 4,
+                max_tokens: 4,
+                kda: KdaGeometry::default(),
+                conv: ConvGeometry::default(),
+                blocks: Mutex::new(BlockStore::new(1)),
+            });
+            let state = Arc::new(Mutex::new(SeqState {
+                blocks: Vec::new(),
+                head: 0,
+                cursor: 0,
+                advance: tokens,
+                last_hash: HASH_SEED,
+                pending: Vec::new(),
+                kda_states: Vec::new(),
+                conv_states: Vec::new(),
+            }));
+            let context = KvContext {
+                pool,
+                slots: vec![Some(state)],
+                advances: vec![tokens],
+                packed: None,
+                window: None,
+                kda: KdaGeometry::default(),
+                conv: ConvGeometry::default(),
+                transaction: Mutex::new(None),
+            };
+            let shape = vec![1, 1, tokens, width];
+            let q = Value::dense(Tensor::from_vec::<f32>(queries, shape.clone()));
+            let k = Value::dense(Tensor::from_vec::<f32>(keys, shape.clone()));
+            let v = Value::dense(Tensor::from_vec::<f32>(values, shape.clone()));
+            let mut out = Tensor::empty(&shape, DType::F32);
+            {
+                let _guard = crate::ExecutableAllocationGuard::enter();
+                kv_attention_into(
+                    &context,
+                    0,
+                    &q,
+                    &k,
+                    &v,
+                    1.,
+                    None,
+                    KvAttentionMode::Causal,
+                    &mut out.destination().unwrap(),
+                    &mut [usize::MAX],
+                )
+                .unwrap();
+            }
+            assert_eq!(Value::dense(out).to_f32_vec().unwrap(), expected);
+        }
     }
 
     #[test]
@@ -10927,20 +11165,20 @@ mod tests {
             conv: ConvGeometry::default(),
             transaction: Mutex::new(None),
         };
-        let q = Value(Tensor::from_vec(
+        let q = Value::dense(Tensor::from_vec(
             (0..48).map(|value| value as f32).collect(),
             vec![1, 4, 3, 4],
         ));
-        let k = Value(Tensor::from_vec(
+        let k = Value::dense(Tensor::from_vec(
             (24..48).map(|value| value as f32 * 0.01).collect(),
             vec![1, 2, 3, 4],
         ));
-        let v = Value(Tensor::from_vec(
+        let v = Value::dense(Tensor::from_vec(
             (48..72).map(|value| value as f32 * 0.01).collect(),
             vec![1, 2, 3, 4],
         ));
         let repeat_heads = |tensor: &Tensor| {
-            let values = Value(tensor.clone()).to_f32_vec().unwrap();
+            let values = Value::dense(tensor.clone()).to_f32_vec().unwrap();
             let per_head = 3 * 4;
             let mut repeated = Vec::new();
             for head in 0..2 {
@@ -10950,7 +11188,7 @@ mod tests {
             }
             Tensor::from_vec(repeated, vec![1, 4, 3, 4])
         };
-        let expected = Value(composed::sdpa_forward(
+        let expected = Value::dense(composed::sdpa_forward(
             q.tensor(),
             &repeat_heads(k.tensor()),
             &repeat_heads(v.tensor()),
@@ -10979,10 +11217,39 @@ mod tests {
             .unwrap();
         }
         drop(destination);
-        let actual = Value(actual).to_f32_vec().unwrap();
+        let actual = Value::dense(actual).to_f32_vec().unwrap();
         assert_close(&actual, &expected, 1e-6, "kv attention");
 
-        let expected_block = Value(composed::sdpa_forward(
+        // Nonzero offset and column stride exercise the cached query row index.
+        let mut padded = vec![0f32; 97];
+        for index in 0..48 {
+            padded[1 + index * 2] = index as f32;
+        }
+        let strided_q = Value::dense(Tensor::from_vec(padded, vec![97]).view(Layout::new(
+            vec![1, 4, 3, 4],
+            vec![96, 24, 8, 2],
+            1,
+        )));
+        let mut strided = Tensor::zeros(&q.shape(), DType::F32);
+        {
+            let _guard = crate::ExecutableAllocationGuard::enter();
+            kv_attention_into(
+                &context,
+                0,
+                &strided_q,
+                &k,
+                &v,
+                0.5,
+                None,
+                KvAttentionMode::Causal,
+                &mut strided.destination().unwrap(),
+                &mut eviction_starts,
+            )
+            .unwrap();
+        }
+        assert_eq!(Value::dense(strided).to_f32_vec().unwrap(), actual);
+
+        let expected_block = Value::dense(composed::sdpa_forward(
             q.tensor(),
             &repeat_heads(k.tensor()),
             &repeat_heads(v.tensor()),
@@ -11007,7 +11274,7 @@ mod tests {
         )
         .unwrap();
         drop(block_destination);
-        let block = Value(block).to_f32_vec().unwrap();
+        let block = Value::dense(block).to_f32_vec().unwrap();
         assert_close(&block, &expected_block, 1e-6, "block kv attention");
         assert_ne!(block, actual);
         assert_eq!(state.lock().unwrap().advance, 3);
@@ -11100,7 +11367,7 @@ mod tests {
             transaction: Mutex::new(None),
         });
         let leaf = |values: Vec<f32>, shape: Vec<usize>| {
-            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::from_vec(values, shape),
             )))))
             .unwrap()
@@ -11162,14 +11429,14 @@ mod tests {
         .unwrap();
         assert_close(
             &outputs[0].to_f32_vec().unwrap(),
-            &Value(expected_output).to_f32_vec().unwrap(),
+            &Value::dense(expected_output).to_f32_vec().unwrap(),
             1e-6,
             "compiled KDA output",
         );
         let committed = state.lock().unwrap().kda_states[0].clone();
         assert_close(
-            &Value(committed).to_f32_vec().unwrap(),
-            &Value(expected_state).to_f32_vec().unwrap(),
+            &Value::dense(committed).to_f32_vec().unwrap(),
+            &Value::dense(expected_state).to_f32_vec().unwrap(),
             1e-6,
             "compiled KDA state",
         );
@@ -11211,7 +11478,7 @@ mod tests {
 
     fn compile_last_token_row() -> executable::CpuCompilation {
         let logits = Node::new(NodeKind::LastTokenRow {
-            a: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            a: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::from_vec((0..12).map(|value| value as f32).collect(), vec![1, 3, 4]),
             )))))
             .unwrap(),
@@ -11339,7 +11606,7 @@ mod tests {
     #[test]
     fn last_token_row_compile_flag_rewrites_decode_outputs() {
         let root = LazyTensor {
-            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::from_vec((0..24).map(|value| value as f32).collect(), vec![1, 3, 8]),
             )))))
             .unwrap(),
@@ -11364,13 +11631,13 @@ mod tests {
     #[test]
     fn per_root_decode_outputs_split_logits_and_batch_hidden_rows() {
         let logits = LazyTensor {
-            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::zeros(&[2, 3, 8], DType::F32),
             )))))
             .unwrap(),
         };
         let hidden = LazyTensor {
-            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::zeros(&[2, 3, 6], DType::F32),
             )))))
             .unwrap(),
@@ -11405,7 +11672,7 @@ mod tests {
     #[test]
     fn packed_compile_preserves_all_graph_rows_and_rejects_malformed_layouts() {
         let root = LazyTensor {
-            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::zeros(&[6, 1, 8], DType::F32),
             )))))
             .unwrap(),
@@ -11474,8 +11741,8 @@ mod tests {
             },
             transaction: Mutex::new(None),
         });
-        let x_value = Value(Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]));
-        let weight_value = Value(Tensor::from_vec(
+        let x_value = Value::dense(Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]));
+        let weight_value = Value::dense(Tensor::from_vec(
             vec![0.5, 1.0, -0.5, 0.25, 0.75, 1.25],
             vec![2, 3],
         ));
@@ -11515,7 +11782,7 @@ mod tests {
         );
         let committed = state.lock().unwrap().conv_states[0].clone();
         assert_close(
-            &Value(committed).to_f32_vec().unwrap(),
+            &Value::dense(committed).to_f32_vec().unwrap(),
             &[1.0, 2.0, 3.0, 4.0],
             1e-6,
             "compiled convolution state",
@@ -11939,11 +12206,15 @@ mod tests {
         let mut state = hybrid_state(0.0, 0.0);
         assert!(restore_recurrent_snapshot(&mut state, &snapshot));
         assert_eq!(
-            Value(state.kda_states[0].clone()).to_f32_vec().unwrap(),
+            Value::dense(state.kda_states[0].clone())
+                .to_f32_vec()
+                .unwrap(),
             vec![3.0; 4]
         );
         assert_eq!(
-            Value(state.conv_states[0].clone()).to_f32_vec().unwrap(),
+            Value::dense(state.conv_states[0].clone())
+                .to_f32_vec()
+                .unwrap(),
             vec![4.0; 4]
         );
 
@@ -11959,7 +12230,7 @@ mod tests {
         assert!(!restore_recurrent_snapshot(&mut mismatched, &snapshot));
         assert!(mismatched.kda_states.is_empty());
         assert_eq!(
-            Value(mismatched.conv_states[0].clone())
+            Value::dense(mismatched.conv_states[0].clone())
                 .to_f32_vec()
                 .unwrap(),
             vec![0.0; 4]
@@ -12023,11 +12294,15 @@ mod tests {
         assert_eq!(state.last_hash, h2);
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(
-            Value(state.kda_states[0].clone()).to_f32_vec().unwrap(),
+            Value::dense(state.kda_states[0].clone())
+                .to_f32_vec()
+                .unwrap(),
             vec![5.0; 4]
         );
         assert_eq!(
-            Value(state.conv_states[0].clone()).to_f32_vec().unwrap(),
+            Value::dense(state.conv_states[0].clone())
+                .to_f32_vec()
+                .unwrap(),
             vec![6.0; 4]
         );
         drop(state);

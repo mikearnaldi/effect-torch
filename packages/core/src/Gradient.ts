@@ -47,39 +47,6 @@ const fromBackend = <A>(
     Effect.mapError((error) => new Tensor.TensorError({ op, message: error.message, backend: error }))
   )
 
-const validateResult = (
-  op: string,
-  runtime: Runtime.RuntimeService,
-  value: Runtime.LazyTensorHandle,
-  expected: {
-    readonly shape: ReadonlyArray<number>
-    readonly dtype: Tensor.DType
-    readonly placement: Runtime.Placement
-  }
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> => {
-  const candidate = value
-  const placement = candidate.placement
-  if (
-    candidate._tag !== "LazyTensor" || candidate.dtype !== expected.dtype || !Array.isArray(candidate.shape) ||
-    candidate.shape.length !== expected.shape.length ||
-    !candidate.shape.every((dimension, index) => dimension === expected.shape[index]) ||
-    placement === undefined || candidate.device !== placement.deviceType || placement.id !== expected.placement.id ||
-    placement.deviceType !== expected.placement.deviceType ||
-    placement.description !== expected.placement.description ||
-    placement.ordinal !== expected.placement.ordinal || placement.memorySpace !== expected.placement.memorySpace ||
-    placement.id !== runtime.placement.id || placement.deviceType !== runtime.placement.deviceType
-  ) {
-    return new Tensor.TensorError({
-      op,
-      message:
-        `${op}: backend returned invalid lazy tensor metadata; expected ${expected.dtype} [${expected.shape}], got ${
-          String(candidate.dtype)
-        } [${Array.isArray(candidate.shape) ? candidate.shape : "invalid shape"}]`
-    })
-  }
-  return Effect.succeed(value)
-}
-
 /**
  * Computes the gradients of a scalar loss with respect to the given tensors.
  * The loss is an ordinary lazy graph value. The backward transform runs
@@ -141,7 +108,7 @@ export const grad = (
         message: `grad: backend returned ${grads.length} tensors for ${wrt.length} targets`
       })
     }
-    return yield* Effect.forEach(grads, (value, index) => validateResult("grad", runtime, value, wrt[index]))
+    return Array.from(grads)
   })
 
 /**
@@ -158,11 +125,10 @@ export const stopGradient = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const handle = yield* fromBackend(
+    return yield* fromBackend(
       "stopGradient",
       runtime.node({ op: "stopGradient", inputs: [self] })
     )
-    return yield* validateResult("stopGradient", runtime, handle, self)
   })
 
 /**
@@ -183,8 +149,7 @@ export const checkpoint = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const handle = yield* fromBackend("checkpoint", runtime.node({ op: "checkpoint", inputs: [self] }))
-    return yield* validateResult("checkpoint", runtime, handle, self)
+    return yield* fromBackend("checkpoint", runtime.node({ op: "checkpoint", inputs: [self] }))
   })
 
 const checkSameShapeDtype = (
@@ -290,7 +255,7 @@ export const vmap = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const { dim, outShape } = yield* Effect.try({
+    const dim = yield* Effect.try({
       try: () => {
         const dim = options.dim ?? 0
         if (batchedX.shape.length !== x.shape.length + 1 || dim < 0 || dim >= batchedX.shape.length) {
@@ -309,9 +274,7 @@ export const vmap = (
         if (batchedX.dtype !== x.dtype) {
           throw new Error(`vmap: dtype mismatch, got ${batchedX.dtype} and ${x.dtype}`)
         }
-        const outShape = [...y.shape]
-        outShape.splice(Math.min(dim, outShape.length), 0, batchedX.shape[dim])
-        return { dim, outShape }
+        return dim
       },
       catch: (error) =>
         new Tensor.TensorError({
@@ -319,7 +282,7 @@ export const vmap = (
           message: error instanceof Error ? error.message : String(error)
         })
     })
-    const handle = yield* fromBackend(
+    return yield* fromBackend(
       "vmap",
       runtime.node({
         op: "vmap",
@@ -327,9 +290,4 @@ export const vmap = (
         attributes: { dim }
       })
     )
-    return yield* validateResult("vmap", runtime, handle, {
-      shape: outShape,
-      dtype: y.dtype,
-      placement: y.placement
-    })
   })

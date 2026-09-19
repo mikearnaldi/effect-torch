@@ -49,8 +49,8 @@ export type TensorStorageEncoding = "Q2_K" | "Q3_K" | "Q4_K" | "Q5_K" | "Q6_K"
 
 /**
  * Physical storage metadata for a logically `f32` encoded tensor. The logical
- * shape remains on {@link TensorHandle}; `physicalShape` describes the packed
- * `u8` buffer exposed by readback and binding validation. GGML K-quant rows
+ * shape remains on {@link TensorHandle}; `physicalShape` is derived from the
+ * format and checked during handle creation and binding validation. GGML K-quant rows
  * flatten all logical leading dimensions, encode the final dimension in
  * 256-element blocks, and use physical shape `[rows, rowBytes]`.
  *
@@ -63,10 +63,66 @@ export type TensorStorageEncoding = "Q2_K" | "Q3_K" | "Q4_K" | "Q5_K" | "Q6_K"
 export interface EncodedTensorStorage {
   /** Packed encoding used for each logical row. */
   readonly encoding: TensorStorageEncoding
-  /** Shape of the packed byte buffer, independent of the logical shape. */
+  /** Derived shape of the canonical packed byte buffer. */
   readonly physicalShape: ReadonlyArray<number>
   /** Physical packed elements are always bytes. */
   readonly physicalDtype: "u8"
+}
+
+/**
+ * Recognizes the closed set of supported packed formats. Unknown names never
+ * inherit another format's block geometry.
+ *
+ * @since 0.1.0
+ * @category guards
+ */
+export const isTensorStorageEncoding = (value: unknown): value is TensorStorageEncoding =>
+  value === "Q2_K" || value === "Q3_K" || value === "Q4_K" || value === "Q5_K" || value === "Q6_K"
+
+/**
+ * Canonical GGML K-quant byte geometry derived from a logical shape. Invalid
+ * formats, partial blocks, and sizes outside the safe integer range fail.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export const encodedStorageGeometry = (
+  encoding: TensorStorageEncoding,
+  logicalShape: ReadonlyArray<number>
+): { readonly physicalShape: readonly [rows: number, rowBytes: number]; readonly byteLength: number } | undefined => {
+  if (
+    !isTensorStorageEncoding(encoding) || logicalShape.length === 0 ||
+    !logicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0)
+  ) return undefined
+  const blockBytes = { Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210 }[encoding]
+  const columns = logicalShape[logicalShape.length - 1]!
+  if (columns % 256 !== 0) return undefined
+  const rowBytes = columns / 256 * blockBytes
+  if (!Number.isSafeInteger(rowBytes)) return undefined
+  let rows = 1
+  for (let index = 0; index < logicalShape.length - 1; index++) {
+    rows *= logicalShape[index]!
+    if (!Number.isSafeInteger(rows)) return undefined
+  }
+  const byteLength = rows * rowBytes
+  if (!Number.isSafeInteger(byteLength) || !Number.isSafeInteger(rows * columns)) return undefined
+  return { physicalShape: [rows, rowBytes], byteLength }
+}
+
+/**
+ * Validates packed storage against its logical shape and canonical format.
+ *
+ * @since 0.1.0
+ * @category guards
+ */
+export const validEncodedStorage = (
+  logicalShape: ReadonlyArray<number>,
+  storage: EncodedTensorStorage
+): boolean => {
+  const geometry = encodedStorageGeometry(storage.encoding, logicalShape)
+  return geometry !== undefined && storage.physicalDtype === "u8" && Array.isArray(storage.physicalShape) &&
+    storage.physicalShape.length === 2 &&
+    storage.physicalShape.every((dimension, index) => dimension === geometry.physicalShape[index])
 }
 
 /**
@@ -110,7 +166,7 @@ export interface Placement {
  * @category models
  */
 export interface Capabilities {
-  /** Element data types accepted by this runtime. */
+  /** Dtypes accepted for storage and tensor boundaries; individual operations may need legalization. */
   readonly dtypes: ReadonlyArray<DType>
   /** Optional backend features advertised as stable string identifiers. */
   readonly features: ReadonlyArray<string>
@@ -185,6 +241,9 @@ declare const InferenceSequenceHandleTypeId: unique symbol
  * provide no runtime security. Every runtime method must also validate the
  * handle's registered owner, kind, and liveness rather than trusting `_tag`,
  * placement, or other public fields.
+ * Runtime implementations validate native metadata before creating handles.
+ * Core consumers trust these handles and validate operation arguments and
+ * archive/model compatibility.
  *
  * @since 0.1.0
  * @category models
@@ -389,8 +448,9 @@ export interface ExecutableCompilePhaseDiagnostics {
 }
 
 /**
- * Static logical byte totals derived from an executable's immutable memory
- * plan. These are not current allocation, allocator capacity, or process RSS.
+ * Static byte totals derived from an executable's immutable memory plan.
+ * Output and workspace segments include their planned alignment and padding.
+ * These are not current allocator usage or process RSS.
  *
  * @since 0.1.0
  * @category models
@@ -402,7 +462,7 @@ export interface ExecutableMemoryDiagnostics {
   readonly persistentBytes: number
   /** Compatible persistent state footprint used by a stateful executable. */
   readonly stateBytes: number
-  /** Logical escaping-output storage required by one invocation. */
+  /** Planned escaping-output segment capacity required by one invocation. */
   readonly outputBytes: number
   /** Reusable per-invocation workspace and staging capacity. */
   readonly workspaceBytes: number
@@ -412,6 +472,29 @@ export interface ExecutableMemoryDiagnostics {
   readonly peakLiveBytes: number
   /** Planned segment capacity beyond peak logical liveness. */
   readonly packingOverheadBytes: number
+}
+
+/**
+ * Target and strategy summary from the immutable dtype legalization plan.
+ * Conversion bytes count planned materialized values, rather than live memory
+ * or process allocation totals.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ExecutableDTypeLegalizationDiagnostics {
+  readonly targetBackend: string
+  readonly targetArchitecture: string
+  readonly loweringAbiRevision: number
+  readonly policyRevision: number
+  readonly capabilityQueries: number
+  readonly nativeLoweringUnits: number
+  readonly legalizedLoweringUnits: number
+  readonly kernelLocalLegalizations: number
+  readonly materializedConversions: number
+  readonly materializedConversionBytes: number
+  readonly decompositions: number
+  readonly rejectedRegionCandidates: number
 }
 
 /**
@@ -442,6 +525,8 @@ export interface ExecutableDiagnostics {
   readonly synchronizationCount: number
   /** Static logical memory-plan totals. */
   readonly memory: ExecutableMemoryDiagnostics
+  /** Target dtype decisions; third-party runtimes may omit this summary. */
+  readonly legalization?: ExecutableDTypeLegalizationDiagnostics | undefined
   /** Ordered compiler timings; third-party runtimes may omit or extend them. */
   readonly compilePhases?: ReadonlyArray<ExecutableCompilePhaseDiagnostics>
 }
@@ -875,17 +960,11 @@ export interface NodeOperationMap {
     readonly inputs:
       | readonly [self: TensorHandle, weight: TensorHandle]
       | readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
-    readonly attributes: {
-      readonly encoding: TensorStorageEncoding
-      readonly logicalShape: readonly [rows: number, columns: number]
-    }
   }
   /** Selects and decodes rows from a packed embedding table. */
   readonly quantizedEmbedding: {
     readonly inputs: readonly [indexes: TensorHandle, weight: TensorHandle]
     readonly attributes: {
-      readonly encoding: TensorStorageEncoding
-      readonly logicalShape: readonly [rows: number, columns: number]
       readonly paddingIndex?: number | undefined
     }
   }
@@ -1070,6 +1149,47 @@ export interface PathSafetensorsLoadArchive {
 }
 
 /**
+ * Selection for a direct safetensors read.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface PathSafetensorsLoadOptions {
+  /** Unique tensor names to load. Omit for all tensors; an empty array loads none. */
+  readonly names?: ReadonlyArray<string>
+}
+
+/**
+ * Dense tensor geometry read from an archive header without loading its data.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface PathSafetensorsTensorInfo {
+  /** Archive entry name. */
+  readonly name: string
+  /** Stored scalar dtype. Inspection does not imply execution support. */
+  readonly dtype: DType
+  /** Logical row-major dimensions. */
+  readonly shape: ReadonlyArray<number>
+  /** Exact stored payload length in bytes. */
+  readonly byteLength: number
+}
+
+/**
+ * Archive headers, with no tensor handles or device allocations.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface PathSafetensorsInspection {
+  /** Descriptors sorted by tensor name. */
+  readonly entries: ReadonlyArray<PathSafetensorsTensorInfo>
+  /** Archive-level string metadata. */
+  readonly metadata: Readonly<Record<string, string>>
+}
+
+/**
  * Optional runtime extension for direct path-based safetensors I/O. Extension
  * methods are part of the same ownership domain as their parent runtime and
  * must apply the same native handle owner/liveness checks as common methods.
@@ -1088,7 +1208,12 @@ export interface PathSafetensors {
    * every distinct returned handle transfers to the caller. On failure or
    * interruption, the implementation releases all partial and late results.
    */
-  readonly load: (path: string) => Effect.Effect<PathSafetensorsLoadArchive, BackendError>
+  readonly load: (
+    path: string,
+    options?: PathSafetensorsLoadOptions
+  ) => Effect.Effect<PathSafetensorsLoadArchive, BackendError>
+  /** Reads and validates standalone or sharded-index headers without reading tensor payloads. */
+  readonly inspect: (path: string) => Effect.Effect<PathSafetensorsInspection, BackendError>
 }
 
 /**
@@ -1173,6 +1298,17 @@ export interface GgufLoadArchive {
 }
 
 /**
+ * Tensor-name selection for a native GGUF read.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface GgufLoadOptions {
+  /** Unique tensor names. Omit for all tensors; an empty array loads none. */
+  readonly names?: ReadonlyArray<string>
+}
+
+/**
  * Optional native GGUF parser and loader extension. Inspection owns no tensor
  * storage. Loading follows the parent runtime's cancellation and ownership
  * rules.
@@ -1188,7 +1324,7 @@ export interface GgufRuntime {
    * successful Effect completion and must release partial or late results when
    * interrupted; ownership transfers to the caller with the returned archive.
    */
-  readonly load: (path: string) => Effect.Effect<GgufLoadArchive, BackendError>
+  readonly load: (path: string, options?: GgufLoadOptions) => Effect.Effect<GgufLoadArchive, BackendError>
 }
 
 /**
@@ -1907,8 +2043,8 @@ export interface RuntimeService {
    * Exposes the tensor's host-transfer representation through an `ArrayBuffer`.
    * The concrete handle is borrowed for the operation. Dense `f16` and `bf16`
    * values are widened to `f32`; other dense dtypes retain their logical dtype.
-   * For encoded handles this is the packed `u8` representation, not logical
-   * `f32` values. A backend may copy the data or directly export retained
+   * Encoded handles cannot be read back. Use a dedicated packed operation to
+   * produce a dense result. A backend may copy the data or directly export retained
    * runtime storage; callers must not rely on either mode. The returned buffer
    * remains readable after the handle is released; a direct export may defer
    * physical cleanup until the buffer becomes unreachable. Interruption

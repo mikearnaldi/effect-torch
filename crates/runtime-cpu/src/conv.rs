@@ -6,11 +6,10 @@
 //! support grouped convolutions. Composed graph nodes handle bias and
 //! input-gradient backward operations elsewhere.
 //!
-//! All kernels use [`ConvAlgorithm::DirectF64Accumulator`], a direct loop
-//! nest without im2col. It widens each input and weight element to `f64`,
-//! accumulates the receptive-field dot product in `f64`, and narrows once
-//! when writing the output. Transposed convolutions scatter each input
-//! element's contribution into the output instead of gathering.
+//! All kernels use direct loop nests without im2col. Half and F32 inputs
+//! compute and accumulate in F32; F64 inputs stay F64. Integer operations
+//! use their dtype's wrapping arithmetic. Each output is formed once after
+//! accumulating the receptive-field dot product.
 //! Forward kernels read through the input layouts, so strided inputs work
 //! without materialization.
 //!
@@ -18,14 +17,52 @@
 //! matching `*_into` kernel does not allocate. The allocating wrapper composes
 //! the planner and kernel.
 
+use super::composed::ModelElement;
 use super::tensor::{CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
+use effect_torch_runtime::DType;
 
 /// Kernel selected for a convolution invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvAlgorithm {
+    /// Direct loop nest accumulating in F32, narrowing half outputs once.
+    DirectF32Accumulator,
     /// Direct loop nest accumulating in `f64`, narrowing on write-out.
     DirectF64Accumulator,
+    /// Direct loop nest with wrapping integer multiply-add in the input dtype.
+    DirectIntegerAccumulator,
 }
+
+trait ConvElement: Elem {
+    type Accumulator: Default;
+    fn accumulate(accumulator: &mut Self::Accumulator, left: Self, right: Self);
+    fn finish(accumulator: Self::Accumulator) -> Self;
+}
+
+macro_rules! float_conv_element {
+    ($($type:ty),*) => {$(
+        impl ConvElement for $type {
+            type Accumulator = <Self as ModelElement>::Compute;
+            fn accumulate(accumulator: &mut Self::Accumulator, left: Self, right: Self) {
+                *accumulator += left.widen() * right.widen();
+            }
+            fn finish(accumulator: Self::Accumulator) -> Self { Self::narrow(accumulator) }
+        }
+    )*};
+}
+float_conv_element!(f32, f64, half::f16, half::bf16);
+
+macro_rules! integer_conv_element {
+    ($($type:ty),*) => {$(
+        impl ConvElement for $type {
+            type Accumulator = Self;
+            fn accumulate(accumulator: &mut Self, left: Self, right: Self) {
+                *accumulator = accumulator.wrapping_add(left.wrapping_mul(right));
+            }
+            fn finish(accumulator: Self) -> Self { accumulator }
+        }
+    )*};
+}
+integer_conv_element!(u8, u32, i64);
 
 /// Exact output, scratch, and selected algorithm for one convolution invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,7 +437,11 @@ fn requirement(shape: &[usize], tensor: &Tensor) -> Result<ConvRequirements, Str
     Ok(ConvRequirements {
         output: CpuTensorRequirement::new(shape, tensor.dtype()),
         scratch: Vec::new(),
-        algorithm: ConvAlgorithm::DirectF64Accumulator,
+        algorithm: match tensor.dtype() {
+            DType::F16 | DType::BF16 | DType::F32 => ConvAlgorithm::DirectF32Accumulator,
+            DType::F64 => ConvAlgorithm::DirectF64Accumulator,
+            DType::U8 | DType::U32 | DType::I64 => ConvAlgorithm::DirectIntegerAccumulator,
+        },
         output_elements,
     })
 }
@@ -729,7 +770,7 @@ pub fn conv2d_backward_w_scratch_requirements(
     .scratch)
 }
 
-fn conv1d_into_impl<T: Elem>(
+fn conv1d_into_impl<T: ConvElement>(
     x: &Tensor,
     x_values: &[T],
     w: &Tensor,
@@ -750,7 +791,7 @@ fn conv1d_into_impl<T: Elem>(
             for output_channel in 0..c_out {
                 let group = output_channel / output_channels_per_group;
                 for output_position in 0..length_out {
-                    let mut accumulator = 0.0f64;
+                    let mut accumulator = T::Accumulator::default();
                     for input_channel_in_group in 0..channels_per_group {
                         let input_channel = group * channels_per_group + input_channel_in_group;
                         for kernel_position in 0..kernel {
@@ -771,11 +812,11 @@ fn conv1d_into_impl<T: Elem>(
                                 + output_channel * w.layout.strides()[0]
                                 + input_channel_in_group * w.layout.strides()[1]
                                 + kernel_position * w.layout.strides()[2];
-                            accumulator += x_values[x_index].to_f64() * w_values[w_index].to_f64();
+                            T::accumulate(&mut accumulator, x_values[x_index], w_values[w_index]);
                         }
                     }
                     output[(batch * c_out + output_channel) * length_out + output_position] =
-                        T::from_f64(accumulator);
+                        T::finish(accumulator);
                 }
             }
         }
@@ -783,7 +824,7 @@ fn conv1d_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conv2d_into_impl<T: Elem>(
+fn conv2d_into_impl<T: ConvElement>(
     x: &Tensor,
     x_values: &[T],
     w: &Tensor,
@@ -805,7 +846,7 @@ fn conv2d_into_impl<T: Elem>(
                 let group = output_channel / output_channels_per_group;
                 for output_y in 0..height_out {
                     for output_x in 0..width_out {
-                        let mut accumulator = 0.0f64;
+                        let mut accumulator = T::Accumulator::default();
                         for input_channel_in_group in 0..channels_per_group {
                             let input_channel = group * channels_per_group + input_channel_in_group;
                             for kernel_y in 0..kernel_height {
@@ -836,14 +877,17 @@ fn conv2d_into_impl<T: Elem>(
                                         + input_channel_in_group * w.layout.strides()[1]
                                         + kernel_y * w.layout.strides()[2]
                                         + kernel_x * w.layout.strides()[3];
-                                    accumulator +=
-                                        x_values[x_index].to_f64() * w_values[w_index].to_f64();
+                                    T::accumulate(
+                                        &mut accumulator,
+                                        x_values[x_index],
+                                        w_values[w_index],
+                                    );
                                 }
                             }
                         }
                         output[((batch * c_out + output_channel) * height_out + output_y)
                             * width_out
-                            + output_x] = T::from_f64(accumulator);
+                            + output_x] = T::finish(accumulator);
                     }
                 }
             }
@@ -852,7 +896,7 @@ fn conv2d_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conv_transpose1d_into_impl<T: Elem>(
+fn conv_transpose1d_into_impl<T: ConvElement>(
     x: &Tensor,
     x_values: &[T],
     w: &Tensor,
@@ -874,7 +918,7 @@ fn conv_transpose1d_into_impl<T: Elem>(
                 let group = output_channel / output_channels_per_group;
                 let output_channel_in_group = output_channel % output_channels_per_group;
                 for output_position in 0..length_out {
-                    let mut accumulator = 0.0f64;
+                    let mut accumulator = T::Accumulator::default();
                     for input_channel_in_group in 0..input_channels_per_group {
                         let input_channel =
                             group * input_channels_per_group + input_channel_in_group;
@@ -895,13 +939,16 @@ fn conv_transpose1d_into_impl<T: Elem>(
                                     + input_channel * w.layout.strides()[0]
                                     + output_channel_in_group * w.layout.strides()[1]
                                     + kernel_position * w.layout.strides()[2];
-                                accumulator +=
-                                    x_values[x_index].to_f64() * w_values[w_index].to_f64();
+                                T::accumulate(
+                                    &mut accumulator,
+                                    x_values[x_index],
+                                    w_values[w_index],
+                                );
                             }
                         }
                     }
                     output[(batch * c_out + output_channel) * length_out + output_position] =
-                        T::from_f64(accumulator);
+                        T::finish(accumulator);
                 }
             }
         }
@@ -909,7 +956,7 @@ fn conv_transpose1d_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conv_transpose2d_into_impl<T: Elem>(
+fn conv_transpose2d_into_impl<T: ConvElement>(
     x: &Tensor,
     x_values: &[T],
     w: &Tensor,
@@ -932,7 +979,7 @@ fn conv_transpose2d_into_impl<T: Elem>(
                 let output_channel_in_group = output_channel % output_channels_per_group;
                 for output_y in 0..height_out {
                     for output_x in 0..width_out {
-                        let mut accumulator = 0.0f64;
+                        let mut accumulator = T::Accumulator::default();
                         for input_channel_in_group in 0..input_channels_per_group {
                             let input_channel =
                                 group * input_channels_per_group + input_channel_in_group;
@@ -961,8 +1008,11 @@ fn conv_transpose2d_into_impl<T: Elem>(
                                                 + output_channel_in_group * w.layout.strides()[1]
                                                 + kernel_y * w.layout.strides()[2]
                                                 + kernel_x * w.layout.strides()[3];
-                                            accumulator += x_values[x_index].to_f64()
-                                                * w_values[w_index].to_f64();
+                                            T::accumulate(
+                                                &mut accumulator,
+                                                x_values[x_index],
+                                                w_values[w_index],
+                                            );
                                         }
                                     }
                                 }
@@ -970,7 +1020,7 @@ fn conv_transpose2d_into_impl<T: Elem>(
                         }
                         output[((batch * c_out + output_channel) * height_out + output_y)
                             * width_out
-                            + output_x] = T::from_f64(accumulator);
+                            + output_x] = T::finish(accumulator);
                     }
                 }
             }
@@ -979,7 +1029,7 @@ fn conv_transpose2d_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conv1d_backward_w_into_impl<T: Elem>(
+fn conv1d_backward_w_into_impl<T: ConvElement>(
     x: &Tensor,
     x_values: &[T],
     gradient: &Tensor,
@@ -999,7 +1049,7 @@ fn conv1d_backward_w_into_impl<T: Elem>(
             for input_channel_in_group in 0..channels_per_group {
                 let input_channel = group * channels_per_group + input_channel_in_group;
                 for kernel_position in 0..kernel {
-                    let mut accumulator = 0.0f64;
+                    let mut accumulator = T::Accumulator::default();
                     for batch in 0..x.shape()[0] {
                         for output_position in 0..gradient.shape()[2] {
                             let padded_position =
@@ -1019,13 +1069,16 @@ fn conv1d_backward_w_into_impl<T: Elem>(
                                 + batch * gradient.layout.strides()[0]
                                 + output_channel * gradient.layout.strides()[1]
                                 + output_position * gradient.layout.strides()[2];
-                            accumulator += x_values[x_index].to_f64()
-                                * gradient_values[gradient_index].to_f64();
+                            T::accumulate(
+                                &mut accumulator,
+                                x_values[x_index],
+                                gradient_values[gradient_index],
+                            );
                         }
                     }
                     output[(output_channel * channels_per_group + input_channel_in_group)
                         * kernel
-                        + kernel_position] = T::from_f64(accumulator);
+                        + kernel_position] = T::finish(accumulator);
                 }
             }
         }
@@ -1033,7 +1086,7 @@ fn conv1d_backward_w_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conv2d_backward_w_into_impl<T: Elem>(
+fn conv2d_backward_w_into_impl<T: ConvElement>(
     x: &Tensor,
     x_values: &[T],
     gradient: &Tensor,
@@ -1054,7 +1107,7 @@ fn conv2d_backward_w_into_impl<T: Elem>(
                 let input_channel = group * channels_per_group + input_channel_in_group;
                 for kernel_y in 0..kernel_height {
                     for kernel_x in 0..kernel_width {
-                        let mut accumulator = 0.0f64;
+                        let mut accumulator = T::Accumulator::default();
                         for batch in 0..x.shape()[0] {
                             for output_y in 0..gradient.shape()[2] {
                                 let padded_y = output_y * stride + kernel_y * dilation;
@@ -1084,8 +1137,11 @@ fn conv2d_backward_w_into_impl<T: Elem>(
                                         + output_channel * gradient.layout.strides()[1]
                                         + output_y * gradient.layout.strides()[2]
                                         + output_x * gradient.layout.strides()[3];
-                                    accumulator += x_values[x_index].to_f64()
-                                        * gradient_values[gradient_index].to_f64();
+                                    T::accumulate(
+                                        &mut accumulator,
+                                        x_values[x_index],
+                                        gradient_values[gradient_index],
+                                    );
                                 }
                             }
                         }
@@ -1093,7 +1149,7 @@ fn conv2d_backward_w_into_impl<T: Elem>(
                             * kernel_height
                             + kernel_y)
                             * kernel_width
-                            + kernel_x] = T::from_f64(accumulator);
+                            + kernel_x] = T::finish(accumulator);
                     }
                 }
             }
@@ -1102,7 +1158,7 @@ fn conv2d_backward_w_into_impl<T: Elem>(
 }
 
 /// Executes a `conv1d` into `destination` without allocating, accumulating
-/// in `f64`.
+/// in the selected compute dtype.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_into(
     x: &Tensor,
@@ -1160,7 +1216,7 @@ pub fn conv1d(
 }
 
 /// Executes a `conv2d` into `destination` without allocating, accumulating
-/// in `f64`.
+/// in the selected compute dtype.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_into(
     x: &Tensor,
@@ -1555,6 +1611,60 @@ mod tests {
     }
 
     #[test]
+    fn convolution_variants_use_the_declared_accumulator_dtype() {
+        for (dtype, large, small) in [
+            (DType::F16, 32768f32, 2f32.powi(-10)),
+            (DType::BF16, 16777216., 1.),
+            (DType::F32, 16777216., 1.),
+            (DType::F64, 16777216., 1.),
+        ] {
+            let input = |shape| Tensor::from_vec(vec![large, small, -large], shape).cast(dtype);
+            let ones = |shape: &[usize]| Tensor::ones(shape, dtype);
+            let outputs = [
+                conv1d(&input(vec![1, 3, 1]), &ones(&[1, 3, 1]), 1, 0, 1, 1),
+                conv2d(&input(vec![1, 3, 1, 1]), &ones(&[1, 3, 1, 1]), 1, 0, 1, 1),
+                conv_transpose1d(&input(vec![1, 3, 1]), &ones(&[3, 1, 1]), 1, 0, 0, 1, 1),
+                conv_transpose2d(
+                    &input(vec![1, 3, 1, 1]),
+                    &ones(&[3, 1, 1, 1]),
+                    1,
+                    0,
+                    0,
+                    1,
+                    1,
+                ),
+                conv1d_backward_w(&input(vec![3, 1, 1]), &ones(&[3, 1, 1]), 1, 1, 1, 0, 1, 1),
+                conv2d_backward_w(
+                    &input(vec![3, 1, 1, 1]),
+                    &ones(&[3, 1, 1, 1]),
+                    [1, 1],
+                    1,
+                    1,
+                    0,
+                    1,
+                    1,
+                ),
+            ];
+            for output in outputs {
+                assert_eq!(
+                    f32_data(&output.cast(DType::F32)),
+                    vec![if dtype == DType::F64 { small } else { 0. }]
+                );
+            }
+        }
+        let exact = (1i64 << 60) + 1;
+        let output = conv1d(
+            &Tensor::from_vec(vec![exact], vec![1, 1, 1]),
+            &Tensor::from_vec(vec![1i64], vec![1, 1, 1]),
+            1,
+            0,
+            1,
+            1,
+        );
+        assert_eq!(i64::slice_of(&output).unwrap(), &[exact]);
+    }
+
+    #[test]
     fn conv1d_basic() {
         let x = Tensor::from_vec(vec![1f32, 2., 3., 4.], vec![1, 1, 4]);
         let w = Tensor::from_vec(vec![1f32, 1.], vec![1, 1, 2]);
@@ -1733,7 +1843,7 @@ mod tests {
             2 * 4 * 3 * std::mem::size_of::<f32>()
         );
         assert_eq!(requirements.output.alignment, CPU_STORAGE_ALIGNMENT);
-        assert_eq!(requirements.algorithm, ConvAlgorithm::DirectF64Accumulator);
+        assert_eq!(requirements.algorithm, ConvAlgorithm::DirectF32Accumulator);
         assert_eq!(requirements.output_elements, 2 * 4 * 3);
         assert!(requirements.scratch.is_empty());
         assert_eq!(requirements.scratch_bytes(), 0);

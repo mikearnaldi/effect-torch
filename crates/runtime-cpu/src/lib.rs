@@ -29,6 +29,7 @@
 //! - [`pool`] provides dtype-generic KV-cache slabs for stateful decoding.
 //! - `napi` (feature `napi-addon`) exports the runtime to Node.js.
 
+pub mod capabilities;
 pub mod composed;
 pub mod conv;
 pub mod executable;
@@ -75,6 +76,18 @@ fn placement() -> &'static Placement {
 
 /// Every CPU [`Tensor`] is a [`Buffer`] rooted at the single `cpu:0` device.
 impl Buffer for Tensor {
+    fn value_spec(&self) -> effect_torch_runtime::ValueSpec<'_> {
+        effect_torch_runtime::ValueSpec {
+            semantic_dtype: self.dtype(),
+            logical_shape: self.shape(),
+            storage: effect_torch_runtime::StorageSpec {
+                representation: effect_torch_runtime::StorageRepresentation::Dense,
+                layout_constraint: effect_torch_runtime::LayoutConstraintSpec::DenseStrided(
+                    &self.layout,
+                ),
+            },
+        }
+    }
     fn runtime_id(&self) -> effect_torch_runtime::RuntimeId {
         identity().id()
     }

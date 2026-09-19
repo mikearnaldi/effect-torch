@@ -5,7 +5,7 @@
 //! dispatched callbacks, and the driver records each boundary as a named
 //! [`CompilePhaseTiming`]. The `*_PHASE` constants below define this order:
 //!
-//! `graph_index`, `optimization`, `lowering`,
+//! `graph_index`, `optimization`, `target_legalization`, `lowering`,
 //! `lowered_program_validation`, `memory_planning`, the backend phases
 //! `physical_planning`, `pipeline_preparation`, `artifact_assembly`, and
 //! `compile_submission`, then `publication`.
@@ -18,6 +18,7 @@ use crate::{
     CompilerWorkReport, GraphIndex, LoweredProgram, LoweredValue, LoweringUnit,
     MemoryPlannerConfig, OptimizationPlan, PlannerError, PreparedProgram, ProgramRequest,
 };
+use crate::{ExecutableDTypePlan, LegalizationPlan, LegalizationWork, TargetDTypeCapabilities};
 use effect_torch_runtime::{CompilePhaseTiming, MemoryPlan};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +27,8 @@ use std::time::{Duration, Instant};
 pub const GRAPH_INDEX_PHASE: &str = "graph_index";
 /// Region selection and lowering-order construction.
 pub const OPTIMIZATION_PHASE: &str = "optimization";
+/// Complete and validate target execution contracts for all lowering units.
+pub const TARGET_LEGALIZATION_PHASE: &str = "target_legalization";
 /// Backend lowering of every planned lowering unit.
 pub const LOWERING_PHASE: &str = "lowering";
 /// Structural validation of the lowered dense tables before planning.
@@ -68,7 +71,7 @@ pub fn prepare_program(request: ProgramRequest) -> Result<PreparedProgram, Strin
     let started = Instant::now();
     let index = GraphIndex::new(&roots);
     let graph_index_timing = timing(GRAPH_INDEX_PHASE, started.elapsed());
-    let index = index?;
+    let mut index = index?;
     if index
         .order
         .iter()
@@ -81,6 +84,7 @@ pub fn prepare_program(request: ProgramRequest) -> Result<PreparedProgram, Strin
     } else {
         signature_with_contract(&index, bindings, invocation)
     };
+    crate::request::resolve_binding_storage(&mut index, &signature, state_cursor)?;
     Ok(PreparedProgram {
         roots: roots.into_boxed_slice(),
         index: Arc::new(index),
@@ -101,20 +105,45 @@ pub fn prepare_program(request: ProgramRequest) -> Result<PreparedProgram, Strin
 pub struct CompilerDriver<'a> {
     prepared: &'a PreparedProgram,
     optimization: OptimizationPlan,
+    legalization: LegalizationPlan,
+    materialized_conversions: usize,
+    materialized_conversion_bytes: usize,
     compile_phases: Vec<CompilePhaseTiming>,
 }
 
 impl<'a> CompilerDriver<'a> {
     /// Selects regions for the prepared program and records the optimization
     /// phase after the graph-index timing.
-    pub fn new(prepared: &'a PreparedProgram) -> Result<Self, String> {
+    pub fn new<C: TargetDTypeCapabilities>(
+        prepared: &'a PreparedProgram,
+        target: &C,
+    ) -> Result<Self, String> {
+        target.fingerprint().validate(target.device())?;
         let mut compile_phases = prepared.preparation_phases.to_vec();
+        if prepared
+            .index
+            .order
+            .iter()
+            .any(|node| !node.device.same_device(target.device()))
+        {
+            return Err(format!(
+                "legalization: graph placement differs from target {}",
+                target.device()
+            ));
+        }
         let started = Instant::now();
-        let optimization = OptimizationPlan::from_prepared(prepared);
+        let optimization = OptimizationPlan::from_prepared(prepared, target);
         compile_phases.push(timing(OPTIMIZATION_PHASE, started.elapsed()));
+        let optimization = optimization?;
+        let started = Instant::now();
+        let legalization = LegalizationPlan::build(&prepared.index, &optimization, target);
+        compile_phases.push(timing(TARGET_LEGALIZATION_PHASE, started.elapsed()));
         Ok(Self {
             prepared,
-            optimization: optimization?,
+            optimization,
+            legalization: legalization?,
+            materialized_conversions: 0,
+            materialized_conversion_bytes: 0,
             compile_phases,
         })
     }
@@ -127,18 +156,67 @@ impl<'a> CompilerDriver<'a> {
         &self.optimization
     }
 
+    pub fn legalization(&self) -> &LegalizationPlan {
+        &self.legalization
+    }
+
+    /// Records emitted conversion instructions, excluding kernel-local casts.
+    pub fn record_materialized_conversions(&mut self, count: usize, bytes: usize) {
+        self.materialized_conversions += count;
+        self.materialized_conversion_bytes += bytes;
+    }
+
+    /// Runtime-owned snapshot for executable diagnostics and NAPI adapters.
+    pub fn legalization_diagnostics(&self) -> effect_torch_runtime::DTypeLegalizationDiagnostics {
+        let work = self.legalization_work();
+        let target = self.legalization.target();
+        effect_torch_runtime::DTypeLegalizationDiagnostics {
+            target_backend: match target.backend {
+                crate::TargetBackend::Cpu => "cpu",
+                crate::TargetBackend::Metal => "metal",
+                crate::TargetBackend::Cuda => "cuda",
+            }
+            .into(),
+            target_architecture: target.architecture.clone(),
+            lowering_abi_revision: target.lowering_abi_revision,
+            policy_revision: self.legalization.policy_revision(),
+            capability_queries: work.capability_queries,
+            native_lowering_units: work.native_lowering_units,
+            legalized_lowering_units: work.legalized_lowering_units,
+            kernel_local_legalizations: work.kernel_local_legalizations,
+            materialized_conversions: work.materialized_conversions,
+            materialized_conversion_bytes: work.materialized_conversion_bytes,
+            decompositions: work.decompositions,
+            rejected_region_candidates: work.rejected_region_candidates,
+        }
+    }
+
+    fn legalization_work(&self) -> LegalizationWork {
+        let mut work = *self.legalization.work();
+        work.materialized_conversions = self.materialized_conversions;
+        work.materialized_conversion_bytes = self.materialized_conversion_bytes;
+        work
+    }
+
     /// Iterates the plan's deterministic lowering units through a backend callback.
     pub fn lower(
         &mut self,
-        mut lower: impl FnMut(LoweringUnit, &GraphIndex, &OptimizationPlan) -> Result<(), String>,
+        mut lower: impl FnMut(
+            LoweringUnit,
+            &GraphIndex,
+            &OptimizationPlan,
+            &ExecutableDTypePlan,
+        ) -> Result<(), String>,
     ) -> Result<(), String> {
         let started = Instant::now();
-        let result = self
-            .optimization
-            .lowering_order
-            .iter()
-            .copied()
-            .try_for_each(|unit| lower(unit, &self.prepared.index, &self.optimization));
+        let result = self.legalization.units().iter().try_for_each(|entry| {
+            lower(
+                entry.unit(),
+                &self.prepared.index,
+                &self.optimization,
+                entry.disposition(),
+            )
+        });
         self.compile_phases
             .push(timing(LOWERING_PHASE, started.elapsed()));
         result
@@ -190,6 +268,8 @@ impl<'a> CompilerDriver<'a> {
         V: LoweredValue<M>,
     {
         CompilerWorkReport::from_artifacts(&self.prepared.index, &self.optimization.work, lowered)
+            .with_legalization(self.legalization_work())
+            .with_legalization_diagnostics(self.legalization_diagnostics())
             .with_compile_phases(self.compile_phases.into_boxed_slice())
     }
 
@@ -211,7 +291,10 @@ impl<'a> CompilerDriver<'a> {
             lowered,
         );
         self.record_phase(phase, started.elapsed());
-        report.with_compile_phases(self.compile_phases.into_boxed_slice())
+        report
+            .with_legalization(self.legalization_work())
+            .with_legalization_diagnostics(self.legalization_diagnostics())
+            .with_compile_phases(self.compile_phases.into_boxed_slice())
     }
 }
 
@@ -233,10 +316,14 @@ mod tests {
         let prepared = ProgramRequest::from_roots(vec![root], CompileOptions::default())
             .prepare()
             .unwrap();
-        let mut driver = CompilerDriver::new(&prepared).unwrap();
+        let mut driver = CompilerDriver::new(
+            &prepared,
+            &crate::test_target::TestTarget::for_index(&prepared.index),
+        )
+        .unwrap();
         let mut units = Vec::new();
         driver
-            .lower(|unit, _, _| {
+            .lower(|unit, _, _, _| {
                 units.push(unit);
                 Ok(())
             })
@@ -274,6 +361,7 @@ mod tests {
             [
                 GRAPH_INDEX_PHASE,
                 OPTIMIZATION_PHASE,
+                TARGET_LEGALIZATION_PHASE,
                 LOWERING_PHASE,
                 LOWERED_PROGRAM_VALIDATION_PHASE,
                 MEMORY_PLANNING_PHASE,

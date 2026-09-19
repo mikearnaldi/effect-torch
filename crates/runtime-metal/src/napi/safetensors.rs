@@ -10,8 +10,9 @@
 use super::err::{err, Res};
 use super::value::Value;
 use crate::device::MetalDevice;
+use effect_torch_napi::safetensors::{self as shared, Error as SharedError};
 use effect_torch_runtime::DType;
-use safetensors::tensor::{serialize, Dtype, SafeTensors, TensorView};
+use safetensors::tensor::{serialize, Dtype, TensorView};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,9 @@ fn runtime_dtype(dtype: Dtype) -> Res<DType> {
 
 /// Copies a logical tensor into canonical little-endian safetensors bytes.
 pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
+    if value.storage().representation != effect_torch_runtime::StorageRepresentation::Dense {
+        return err("safetensors: packed storage cannot be serialized as dense values");
+    }
     let tensor = &value.0;
     MetalDevice::get().synchronize()?;
     let count = tensor.numel();
@@ -161,21 +165,35 @@ pub struct LoadedArchive {
     pub metadata: HashMap<String, String>,
 }
 
-pub fn load(path: &str) -> Res<LoadedArchive> {
-    let raw = std::fs::read(path).map_err(|error| error.to_string())?;
-    let (_, parsed_metadata) =
-        SafeTensors::read_metadata(&raw).map_err(|error| error.to_string())?;
-    let metadata = parsed_metadata.metadata().clone().unwrap_or_default();
-    let tensors = SafeTensors::deserialize(&raw).map_err(|error| error.to_string())?;
-    let mut entries = Vec::with_capacity(tensors.len());
-    for name in tensors.names() {
-        let view = tensors.tensor(name).map_err(|error| error.to_string())?;
-        entries.push((
-            name.to_string(),
-            value_from_bytes(view.data(), view.shape(), runtime_dtype(view.dtype())?)?,
-        ));
+/// Plans and loads the archive at `path`. `names` selects tensors; `None`
+/// loads every tensor and `Some([])` loads none. Every selected dtype is
+/// validated before any payload is uploaded, so an unsupported dtype cannot
+/// leave partial device allocations behind.
+pub fn load(
+    path: &str,
+    names: Option<&[String]>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LoadedArchive, SharedError> {
+    let plan = shared::plan(path, names, cancelled)?;
+    let metadata = plan.metadata().clone();
+    for meta in plan.entries() {
+        let dtype = runtime_dtype(meta.dtype).map_err(SharedError::message)?;
+        if dtype == DType::F64 {
+            return Err(SharedError::message("f64 is not supported on Metal"));
+        }
+        if cancelled() {
+            return Err(SharedError::Cancelled);
+        }
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let entries = plan.load(cancelled, |meta, bytes| {
+        let dtype = runtime_dtype(meta.dtype).map_err(SharedError::message)?;
+        let shape = meta
+            .shape
+            .iter()
+            .map(|&dimension| dimension as usize)
+            .collect::<Vec<_>>();
+        value_from_bytes(&bytes, &shape, dtype).map_err(SharedError::message)
+    })?;
     Ok(LoadedArchive { entries, metadata })
 }
 
@@ -199,7 +217,7 @@ mod tests {
         let metadata = HashMap::from([("framework".to_string(), "effect-torch".to_string())]);
         let path = archive_path("roundtrip");
         save(&tensors, &metadata, path.to_str().unwrap()).unwrap();
-        let archive = load(path.to_str().unwrap()).unwrap();
+        let archive = load(path.to_str().unwrap(), None, &|| false).unwrap();
         assert_eq!(archive.metadata, metadata);
         assert_eq!(archive.entries[0].0, name);
         assert_eq!(
@@ -211,16 +229,48 @@ mod tests {
 
     #[test]
     fn exact_bf16_import_export() {
-        let bytes = [0x80, 0x3f, 0x00, 0xc0];
-        let value = value_from_bytes(&bytes, &[2], DType::BF16).unwrap();
+        let bytes = [0x80, 0x3f, 0x00, 0xc0, 0x81, 0x7f, 0x01, 0x00, 0x00, 0x80];
+        let value = value_from_bytes(&bytes, &[5], DType::BF16).unwrap();
         assert_eq!(tensor_bytes(&value).unwrap(), bytes);
+    }
+
+    #[test]
+    fn selected_load_keeps_bf16_bits_and_skips_f64() {
+        let path = archive_path("selected");
+        let bits = [0x81, 0x7f, 0x00, 0x80];
+        let encoded = serialize(
+            [
+                (
+                    "selected",
+                    TensorView::new(Dtype::BF16, vec![2], &bits).unwrap(),
+                ),
+                (
+                    "unused",
+                    TensorView::new(Dtype::F64, vec![1], &[0; 8]).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        std::fs::write(&path, encoded).unwrap();
+        assert!(load(path.to_str().unwrap(), None, &|| false).is_err());
+        let loaded = load(
+            path.to_str().unwrap(),
+            Some(&["selected".to_string()]),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].1.dtype(), DType::BF16);
+        assert_eq!(tensor_bytes(&loaded.entries[0].1).unwrap(), bits);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn malformed_archive_is_rejected() {
         let path = archive_path("bad");
         std::fs::write(&path, b"not a safetensors archive").unwrap();
-        assert!(load(path.to_str().unwrap()).is_err());
+        assert!(load(path.to_str().unwrap(), None, &|| false).is_err());
         std::fs::remove_file(path).ok();
     }
 }

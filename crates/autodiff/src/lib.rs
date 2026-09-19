@@ -57,6 +57,7 @@ mod tests {
             shape,
             dtype: DType::F32,
             device: Device::Cpu(0),
+            storage: effect_torch_runtime::StorageMetadata::dense(),
         })
         .unwrap()
     }

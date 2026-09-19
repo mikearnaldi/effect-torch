@@ -137,7 +137,7 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         let requested_bytes = len
             .checked_mul(std::mem::size_of::<U>())
             .ok_or_else(|| "CUDA buffer byte size overflowed usize".to_string())?;
-        if requested_bytes > source_bytes {
+        if requested_bytes != source_bytes {
             return Err(format!(
                 "CUDA typed view requires {requested_bytes} bytes, but the source has {source_bytes}"
             ));

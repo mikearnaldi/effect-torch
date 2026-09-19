@@ -1,4 +1,4 @@
-import { Loss, Model, Tensor } from "@effect-torch/core"
+import { Loss, Model, Safetensors, Tensor } from "@effect-torch/core"
 import type { Runtime } from "@effect-torch/core"
 import * as Tokenizer from "@effect-torch/tokenizers"
 import { Effect } from "effect"
@@ -72,17 +72,17 @@ export const loadTokenizer = Tokenizer.fromFile(TOKENIZER_JSON, {
  * has no trainer state. The caller must supply every parameter.
  */
 export const saveParams = (model: Model.Model, params: Model.Params, path: string) =>
-  Tensor.save(path, Object.fromEntries(model.parameterSpecs.map(({ name }, i) => [name, params[i]])))
+  Safetensors.save(path, Object.fromEntries(model.parameterSpecs.map(({ name }, i) => [name, params[i]])))
 
 /**
- * Loads bare named parameters in model order. `Tensor.load` imports the entire
- * archive. {@link Model.load} releases extras and returns the required handles.
+ * Loads bare named parameters in model order. {@link Safetensors.loadModel}
+ * checks the archive header and loads only the required handles.
  */
 export const loadParams = (
   model: Model.Model,
   path: string
 ): Effect.Effect<ReadonlyArray<Tensor.Concrete>, Model.ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  Model.load(model, path)
+  Safetensors.loadModel(model, path)
 
 /** Reads a headerless u16 token bin that `prepare.ts` produces. */
 export const loadBin = (path: string) => {

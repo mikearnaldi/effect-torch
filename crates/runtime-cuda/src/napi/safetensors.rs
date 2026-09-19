@@ -1,6 +1,9 @@
 use crate::{CudaDevice, CudaValue};
-use effect_torch_runtime::DType;
-use safetensors::tensor::{serialize, Dtype, SafeTensors, TensorView};
+use effect_torch_napi::safetensors::{self as shared, Error as SharedError};
+use effect_torch_runtime::{DType, StorageRepresentation};
+#[cfg(test)]
+use safetensors::tensor::SafeTensors;
+use safetensors::tensor::{serialize, Dtype, TensorView};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,62 +38,13 @@ fn runtime_dtype(dtype: Dtype) -> Result<DType, String> {
 }
 
 fn tensor_bytes(value: &CudaValue) -> Result<Vec<u8>, String> {
-    if value.dtype() == DType::I64 {
-        let values = value.readback_i64()?;
-        let mut output = Vec::with_capacity(values.len() * 8);
-        for value in values {
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        return Ok(output);
+    if value.spec().storage.representation != StorageRepresentation::Dense {
+        return Err(
+            "safetensors: packed tensors require an explicit representation-aware archive"
+                .to_string(),
+        );
     }
-    let values = value.readback()?;
-    let dtype = value.dtype();
-    let mut output = Vec::with_capacity(values.len() * dtype.size_in_bytes());
-    for value in values {
-        match dtype {
-            DType::F64 => output.extend_from_slice(&value.to_le_bytes()),
-            DType::F32 => output.extend_from_slice(&(value as f32).to_le_bytes()),
-            DType::F16 => output.extend_from_slice(&half::f16::from_f64(value).to_le_bytes()),
-            DType::BF16 => output.extend_from_slice(&half::bf16::from_f64(value).to_le_bytes()),
-            DType::I64 => output.extend_from_slice(&(value as i64).to_le_bytes()),
-            DType::U32 => output.extend_from_slice(&(value as u32).to_le_bytes()),
-            DType::U8 => output.push(value as u8),
-        }
-    }
-    Ok(output)
-}
-
-fn values_from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Vec<f64>, String> {
-    let elements = shape
-        .iter()
-        .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
-        .ok_or_else(|| "safetensors: tensor element count overflows".to_string())?;
-    let expected = elements
-        .checked_mul(dtype.size_in_bytes())
-        .ok_or_else(|| "safetensors: tensor byte length overflows".to_string())?;
-    if bytes.len() != expected {
-        return Err(format!(
-            "safetensors: expected {expected} bytes for {dtype} tensor with shape {shape:?}, got {}",
-            bytes.len()
-        ));
-    }
-    let width = dtype.size_in_bytes();
-    Ok(bytes
-        .chunks_exact(width)
-        .map(|chunk| match dtype {
-            DType::F64 => f64::from_le_bytes(chunk.try_into().expect("validated chunk")),
-            DType::F32 => f32::from_le_bytes(chunk.try_into().expect("validated chunk")) as f64,
-            DType::F16 => {
-                half::f16::from_le_bytes(chunk.try_into().expect("validated chunk")).to_f64()
-            }
-            DType::BF16 => {
-                half::bf16::from_le_bytes(chunk.try_into().expect("validated chunk")).to_f64()
-            }
-            DType::I64 => i64::from_le_bytes(chunk.try_into().expect("validated chunk")) as f64,
-            DType::U32 => u32::from_le_bytes(chunk.try_into().expect("validated chunk")) as f64,
-            DType::U8 => chunk[0] as f64,
-        })
-        .collect())
+    value.read_storage_bytes()
 }
 
 fn temporary_path(path: &Path) -> Result<PathBuf, String> {
@@ -142,6 +96,14 @@ pub fn save(
             tensor_bytes(tensor)?,
         ));
     }
+    let encoded = encode_archive(&owned, metadata)?;
+    atomic_write(Path::new(path), &encoded)
+}
+
+fn encode_archive(
+    owned: &[(String, Dtype, Vec<usize>, Vec<u8>)],
+    metadata: &HashMap<String, String>,
+) -> Result<Vec<u8>, String> {
     let views = owned
         .iter()
         .map(|(name, dtype, shape, bytes)| {
@@ -149,8 +111,23 @@ pub fn save(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    let encoded = serialize(views, Some(metadata.clone())).map_err(|error| error.to_string())?;
-    atomic_write(Path::new(path), &encoded)
+    serialize(views, Some(metadata.clone())).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn decode_archive(raw: &[u8]) -> Result<(SafeTensors<'_>, HashMap<String, String>), String> {
+    let (_, parsed_metadata) =
+        SafeTensors::read_metadata(raw).map_err(|error| error.to_string())?;
+    let metadata = parsed_metadata.metadata().clone().unwrap_or_default();
+    let tensors = SafeTensors::deserialize(raw).map_err(|error| error.to_string())?;
+    for name in tensors.names() {
+        let view = tensors.tensor(name).map_err(|error| error.to_string())?;
+        crate::value::validate_storage_bytes(
+            effect_torch_runtime::ValueSpec::dense(runtime_dtype(view.dtype())?, view.shape()),
+            view.data().len(),
+        )?;
+    }
+    Ok((tensors, metadata))
 }
 
 pub struct LoadedArchive {
@@ -158,30 +135,204 @@ pub struct LoadedArchive {
     pub metadata: HashMap<String, String>,
 }
 
-pub fn load(path: &str, device: Arc<CudaDevice>) -> Result<LoadedArchive, String> {
-    let raw = std::fs::read(path).map_err(|error| error.to_string())?;
-    let (_, parsed_metadata) =
-        SafeTensors::read_metadata(&raw).map_err(|error| error.to_string())?;
-    let metadata = parsed_metadata.metadata().clone().unwrap_or_default();
-    let tensors = SafeTensors::deserialize(&raw).map_err(|error| error.to_string())?;
-    let mut entries = Vec::with_capacity(tensors.len());
-    for name in tensors.names() {
-        let view = tensors.tensor(name).map_err(|error| error.to_string())?;
-        let dtype = runtime_dtype(view.dtype())?;
-        let shape = view.shape().to_vec();
-        let value = if dtype == DType::I64 {
-            let values = view
-                .data()
-                .chunks_exact(8)
-                .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("validated chunk")))
-                .collect::<Vec<_>>();
-            CudaValue::from_i64_host(device.clone(), shape, &values)?
-        } else {
-            let values = values_from_bytes(view.data(), &shape, dtype)?;
-            CudaValue::from_host(device.clone(), shape, dtype, &values)?
-        };
-        entries.push((name.to_string(), value));
+/// Plans and loads the archive at `path` onto `device`. `names` selects
+/// tensors; `None` loads every tensor and `Some([])` loads none. Every
+/// selected dtype is validated before the first device allocation, so an
+/// unsupported dtype cannot leave a partially uploaded archive behind.
+pub fn load(
+    path: &str,
+    names: Option<&[String]>,
+    device: Arc<CudaDevice>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LoadedArchive, SharedError> {
+    let plan = shared::plan(path, names, cancelled)?;
+    let metadata = plan.metadata().clone();
+    for meta in plan.entries() {
+        let dtype = runtime_dtype(meta.dtype).map_err(SharedError::message)?;
+        let shape = meta
+            .shape
+            .iter()
+            .map(|&dimension| dimension as usize)
+            .collect::<Vec<_>>();
+        let bytes = usize::try_from(meta.byte_length)
+            .map_err(|_| SharedError::message("safetensors: payload exceeds host address range"))?;
+        crate::value::validate_storage_bytes(
+            effect_torch_runtime::ValueSpec::dense(dtype, &shape),
+            bytes,
+        )
+        .map_err(SharedError::message)?;
+        if cancelled() {
+            return Err(SharedError::Cancelled);
+        }
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let entries = plan.load(cancelled, |meta, bytes| {
+        let dtype = runtime_dtype(meta.dtype).map_err(SharedError::message)?;
+        let shape = meta
+            .shape
+            .iter()
+            .map(|&dimension| dimension as usize)
+            .collect::<Vec<_>>();
+        CudaValue::from_dense_bytes(device.clone(), shape, dtype, &bytes)
+            .map_err(SharedError::message)
+    })?;
     Ok(LoadedArchive { entries, metadata })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_inspection_needs_no_cuda_device_or_u32_element_count() {
+        let path = std::env::temp_dir().join(format!(
+            "cuda-inspection-{}-{}.safetensors",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let header = r#"{"unused":{"dtype":"U8","shape":[2,2147483648],"data_offsets":[0,4294967296]},"selected":{"dtype":"BF16","shape":[1],"data_offsets":[4294967296,4294967298]}}"#;
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.set_len(8 + header.len() as u64 + 4_294_967_298)
+            .unwrap();
+        drop(file);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let inspection = runtime
+            .block_on(super::super::inspect_safetensors(
+                path.to_str().unwrap().to_string(),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(inspection.entries.len(), 2);
+        assert_eq!(inspection.entries[0].name, "selected");
+        assert_eq!(inspection.entries[0].dtype, "bf16");
+        assert_eq!(inspection.entries[0].byte_length, 2.0);
+        assert_eq!(inspection.entries[1].shape, vec![2, 2_147_483_648]);
+        assert_eq!(inspection.entries[1].byte_length, 4_294_967_296.0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn archive_preserves_integer_and_float_bits() {
+        let integers = [
+            i64::MIN,
+            i64::MIN + 1,
+            -9_007_199_254_740_993,
+            9_007_199_254_740_993,
+            i64::MAX,
+        ];
+        let i64_bytes = integers
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let half_bytes = [0x0000u16, 0x8000, 0x0001, 0x7c01, 0x7e42]
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let entries = vec![
+            (
+                "i64".to_string(),
+                Dtype::I64,
+                vec![integers.len()],
+                i64_bytes,
+            ),
+            ("f16".to_string(), Dtype::F16, vec![5], half_bytes.clone()),
+            ("bf16".to_string(), Dtype::BF16, vec![5], half_bytes),
+            (
+                "u32".to_string(),
+                Dtype::U32,
+                vec![1],
+                u32::MAX.to_le_bytes().to_vec(),
+            ),
+            ("u8".to_string(), Dtype::U8, vec![2], vec![0, 255]),
+            (
+                "f32".to_string(),
+                Dtype::F32,
+                vec![1],
+                0x7f800123u32.to_le_bytes().to_vec(),
+            ),
+            (
+                "f64".to_string(),
+                Dtype::F64,
+                vec![1],
+                0x7ff0000000000123u64.to_le_bytes().to_vec(),
+            ),
+        ];
+        let metadata = HashMap::from([("test".to_string(), "exact-bits".to_string())]);
+        let encoded = encode_archive(&entries, &metadata).unwrap();
+        let (decoded, actual_metadata) = decode_archive(&encoded).unwrap();
+        assert_eq!(actual_metadata, metadata);
+        for (name, dtype, shape, bytes) in entries {
+            let view = decoded.tensor(&name).unwrap();
+            assert_eq!(view.dtype(), dtype);
+            assert_eq!(view.shape(), shape);
+            assert_eq!(view.data(), bytes);
+        }
+    }
+
+    #[test]
+    fn archive_rejects_unsupported_scalar_dtype() {
+        let encoded = encode_archive(
+            &[("i32".to_string(), Dtype::I32, vec![1], vec![0; 4])],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(decode_archive(&encoded).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn device_archive_preserves_i64_and_half_payloads() {
+        let device = CudaDevice::get(0).unwrap();
+        let integers = [
+            i64::MIN + 1,
+            -9_007_199_254_740_993,
+            9_007_199_254_740_993,
+            i64::MAX,
+        ];
+        let half = [1u16, 0x8000, 0x7c01, 0x7e42]
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let values = HashMap::from([
+            (
+                "i64".to_string(),
+                CudaValue::from_dense_bytes(
+                    device.clone(),
+                    vec![4],
+                    DType::I64,
+                    &integers
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            ),
+            (
+                "f16".to_string(),
+                CudaValue::from_dense_bytes(device.clone(), vec![4], DType::F16, &half).unwrap(),
+            ),
+            (
+                "bf16".to_string(),
+                CudaValue::from_dense_bytes(device.clone(), vec![4], DType::BF16, &half).unwrap(),
+            ),
+        ]);
+        let path =
+            std::env::temp_dir().join(format!("cuda-storage-{}.safetensors", std::process::id()));
+        save(&values, &HashMap::new(), path.to_str().unwrap()).unwrap();
+        let loaded = load(path.to_str().unwrap(), None, device, &|| false).unwrap();
+        std::fs::remove_file(path).unwrap();
+        for (name, value) in loaded.entries {
+            assert_eq!(
+                value.read_storage_bytes().unwrap(),
+                values[&name].read_storage_bytes().unwrap()
+            );
+            if name == "i64" {
+                assert_eq!(value.readback_i64().unwrap(), integers);
+            }
+        }
+    }
 }

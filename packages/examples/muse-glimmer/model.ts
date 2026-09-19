@@ -74,11 +74,13 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
       Config.withDefault(true)
     )
 
+    // Match the benchmark: seven drafts plus the current token form an
+    // eight-token verification batch, which uses Metal's packed matrix kernel.
     const draftTokens = yield* Config.schema(
       Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(15)),
       "MUSE_GLIMMER_DRAFT_TOKENS"
     ).pipe(
-      Config.withDefault(5)
+      Config.withDefault(7)
     )
 
     // The runtime splits prompts across these compiled prefill widths. It uses

@@ -234,32 +234,29 @@ const validShape = (value: ReadonlyArray<number>): boolean =>
 const sameShape = (left: ReadonlyArray<number>, right: ReadonlyArray<number>): boolean =>
   left.length === right.length && left.every((dimension, index) => dimension === right[index])
 
+const sameStorage = (
+  left: Runtime.EncodedTensorStorage | undefined,
+  right: Runtime.EncodedTensorStorage | undefined
+): boolean =>
+  left === undefined
+    ? right === undefined
+    : right !== undefined && left.encoding === right.encoding && left.physicalDtype === right.physicalDtype &&
+      sameShape(left.physicalShape, right.physicalShape)
+
 const isGgufFormat = (value: string): value is Runtime.GgufTensorDescriptor["format"] =>
-  value === "F32" || value === "Q2_K" || value === "Q3_K" || value === "Q4_K" || value === "Q5_K" ||
-  value === "Q6_K"
+  value === "F32" || Runtime.isTensorStorageEncoding(value)
 
-const encodedRowBytes = (encoding: Runtime.TensorStorageEncoding, columns: number): number | undefined => {
-  if (columns % 256 !== 0) return undefined
-  const blockBytes = encoding === "Q2_K"
-    ? 84
-    : encoding === "Q3_K"
-    ? 110
-    : encoding === "Q4_K"
-    ? 144
-    : encoding === "Q5_K"
-    ? 176
-    : 210
-  return columns / 256 * blockBytes
-}
-
-const validEncodedGeometry = (
-  logicalShape: ReadonlyArray<number>,
-  storage: Runtime.EncodedTensorStorage
-): boolean => {
-  const columns = logicalShape.at(-1)
-  const rows = logicalShape.slice(0, -1).reduce((total, dimension) => total * dimension, 1)
-  const rowBytes = columns === undefined ? undefined : encodedRowBytes(storage.encoding, columns)
-  return rowBytes !== undefined && sameShape(storage.physicalShape, [rows, rowBytes])
+const tensorStorage = (
+  shape: ReadonlyArray<number>,
+  storage: LazyTensor["storage"]
+): Runtime.EncodedTensorStorage | undefined => {
+  if (storage.representation === "dense" && storage.format === undefined) return undefined
+  if (storage.representation !== "packed" || !Runtime.isTensorStorageEncoding(storage.format)) {
+    throw new Error("native runtime returned an unsupported storage representation")
+  }
+  const geometry = Runtime.encodedStorageGeometry(storage.format, shape)
+  if (geometry === undefined) throw new Error("native runtime returned invalid packed tensor geometry")
+  return { encoding: storage.format, physicalShape: geometry.physicalShape, physicalDtype: "u8" }
 }
 
 /** Builds the backend-neutral service around one native CUDA runtime. @internal */
@@ -287,6 +284,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     if (!validShape(shape)) throw new Error(`native CUDA runtime returned invalid shape [${shape}]`)
     if (nativeDevice !== placement.id) {
       throw new Error(`native CUDA runtime returned placement ${nativeDevice}, expected ${placement.id}`)
+    }
+    if (storage !== undefined && (tensorDtype !== "f32" || !Runtime.validEncodedStorage(shape, storage))) {
+      throw new Error("native CUDA runtime returned invalid encoded tensor metadata")
     }
     // SAFETY: the tag selects H and the object supplies every TensorHandle field.
     return Object.freeze({
@@ -316,12 +316,20 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       readonly storage?: Runtime.EncodedTensorStorage | undefined
     }
   ): Runtime.LazyTensorHandle => {
+    const storage = tensorStorage(graph.shape, graph.storage)
+    if (
+      logical !== undefined &&
+      (!sameShape(graph.shape, logical.shape) || graph.dtype !== logical.dtype ||
+        !sameStorage(storage, logical.storage))
+    ) {
+      throw new Error("native CUDA runtime returned tensor metadata inconsistent with its logical declaration")
+    }
     const handle = tensorObject<Runtime.LazyTensorHandle>(
       "LazyTensor",
-      logical?.shape ?? graph.shape,
-      logical?.dtype ?? graph.dtype,
+      graph.shape,
+      graph.dtype,
       graph.device,
-      logical?.storage
+      storage
     )
     records.set(handle, { owner, kind: "lazy", graph, disposed: false })
     backendHandles.add(handle)
@@ -336,21 +344,22 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       readonly storage?: Runtime.EncodedTensorStorage | undefined
     }
   ): Runtime.ConcreteTensorHandle => {
-    const expectedShape = logical?.storage?.physicalShape ?? logical?.shape
-    const expectedDtype = logical?.storage?.physicalDtype ?? logical?.dtype
-    if (expectedShape !== undefined && (!sameShape(value.shape, expectedShape) || value.dtype !== expectedDtype)) {
-      throw new Error(
-        `native CUDA runtime returned physical tensor ${value.dtype} [${value.shape}], expected ${expectedDtype} [${expectedShape}]`
-      )
+    const storage = tensorStorage(value.shape, value.storage)
+    if (
+      logical !== undefined &&
+      (!sameShape(value.shape, logical.shape) || value.dtype !== logical.dtype ||
+        !sameStorage(storage, logical.storage))
+    ) {
+      throw new Error("native CUDA runtime returned tensor metadata inconsistent with its logical declaration")
     }
-    const graph = runtime.fromMaterialized(value)
     const handle = tensorObject<Runtime.ConcreteTensorHandle>(
       "Tensor",
-      logical?.shape ?? value.shape,
-      logical?.dtype ?? value.dtype,
+      value.shape,
+      value.dtype,
       value.device,
-      logical?.storage
+      storage
     )
+    const graph = runtime.fromMaterialized(value)
     records.set(handle, { owner, kind: "concrete", graph, value, disposed: false })
     backendHandles.add(handle)
     return handle
@@ -843,7 +852,10 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             )
           case "input": {
             const storage = request.attributes.storage
-            if (storage !== undefined && !validEncodedGeometry(request.attributes.shape, storage)) {
+            if (
+              storage !== undefined &&
+              (request.attributes.dtype !== "f32" || !Runtime.validEncodedStorage(request.attributes.shape, storage))
+            ) {
               throw new Error("input: encoded storage does not match its logical GGML geometry")
             }
             return lazyHandle(
@@ -852,8 +864,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 inputs,
                 JSON.stringify({
                   ...request.attributes,
-                  shape: storage?.physicalShape ?? request.attributes.shape,
-                  dtype: storage?.physicalDtype ?? request.attributes.dtype
+                  storage: storage === undefined ? undefined : { representation: "packed", format: storage.encoding }
                 })
               ),
               {
@@ -1697,8 +1708,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     if (
       !Predicate.isString(value.name) || value.name.length === 0 || !isGgufFormat(format) ||
       value.logicalDtype !== "f32" || value.physicalDtype !== (encoded ? "u8" : "f32") ||
-      !validShape(value.logicalShape) || !validShape(value.physicalShape) ||
-      (encoded && !validEncodedGeometry(value.logicalShape, {
+      !Array.isArray(value.logicalShape) || !Array.isArray(value.physicalShape) ||
+      !value.logicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0) ||
+      !value.physicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0) ||
+      (format === "F32" && !sameShape(value.logicalShape, value.physicalShape)) ||
+      (format !== "F32" && !Runtime.validEncodedStorage(value.logicalShape, {
         encoding: format,
         physicalShape: value.physicalShape,
         physicalDtype: "u8"
@@ -1715,6 +1729,15 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       physicalDtype: value.physicalDtype
     })
   }
+  const clearArchiveTensors = (values: ReadonlyArray<NativeTensor>): void => {
+    for (const value of new Set(values)) {
+      try {
+        value.clear()
+      } catch {
+        // Attempt every release when discarding an interrupted or invalid archive.
+      }
+    }
+  }
   const gguf: Runtime.GgufRuntime = {
     inspect: (path) =>
       cancellable(native, "inspectGguf", "io", (token) => native.inspectGguf(path, token)).pipe(
@@ -1729,21 +1752,28 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           })
         )
       ),
-    load: (path) =>
+    load: (path, options = {}) =>
       cancellable(
         native,
         "loadGguf",
         "io",
-        (token) => native.loadGgufForDevice(path, deviceOrdinal, token),
-        (archive) => {
-          for (const entry of archive.entries) entry.tensor.clear()
-        }
+        (token) =>
+          native.loadGgufForDevice(
+            path,
+            deviceOrdinal,
+            token,
+            options.names === undefined ? undefined : [...options.names]
+          ),
+        (archive) => clearArchiveTensors(archive.entries.map((entry) => entry.tensor))
       ).pipe(
         Effect.flatMap((archive) =>
           Effect.try({
             try: () => {
               const values = archive.entries.map((entry) => entry.tensor)
               try {
+                if (new Set(values).size !== values.length) {
+                  throw new Error("native CUDA runtime returned duplicate tensor ownership")
+                }
                 return Object.freeze({
                   entries: Object.freeze(archive.entries.map((entry) => {
                     const descriptor = ggufDescriptor(entry.descriptor)
@@ -1765,7 +1795,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                   }))
                 })
               } catch (error) {
-                for (const value of values) value.clear()
+                clearArchiveTensors(values)
                 throw error
               }
             },
@@ -1775,6 +1805,26 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       )
   }
   const pathSafetensors: Runtime.PathSafetensors = {
+    inspect: (path) =>
+      cancellable(native, "inspectArchive", "io", (token) => native.inspectSafetensors(path, token)).pipe(
+        Effect.flatMap((inspection) =>
+          Effect.try({
+            try: () =>
+              Object.freeze({
+                entries: Object.freeze(inspection.entries.map((entry) =>
+                  Object.freeze({
+                    name: entry.name,
+                    dtype: dtype(entry.dtype),
+                    shape: Object.freeze([...entry.shape]),
+                    byteLength: entry.byteLength
+                  })
+                )),
+                metadata: Object.freeze({ ...inspection.metadata })
+              }),
+            catch: errorFor("inspectArchive", "io", "io-failed")
+          })
+        )
+      ),
     save: (path, archive) =>
       archive.entries.some((entry) => entry.tensor.storage !== undefined)
         ? Effect.fail(
@@ -1799,25 +1849,35 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               token
             )
         ),
-    load: (path) =>
+    load: (path, options = {}) =>
       cancellable(
         native,
         "load",
         "io",
-        (token) => native.loadTensors(path, deviceOrdinal, token),
-        (archive) => {
-          for (const entry of archive.entries) entry.tensor.clear()
-        }
+        (token) =>
+          native.loadTensors(path, deviceOrdinal, token, options.names === undefined ? undefined : [...options.names]),
+        (archive) => clearArchiveTensors(archive.entries.map((entry) => entry.tensor))
       ).pipe(
         Effect.flatMap((archive) =>
           Effect.try({
-            try: () => ({
-              entries: archive.entries.map((entry) => ({
-                name: entry.name,
-                tensor: concreteHandle(entry.tensor)
-              })),
-              metadata: Object.freeze({ ...archive.metadata })
-            }),
+            try: () => {
+              const values = archive.entries.map((entry) => entry.tensor)
+              try {
+                if (new Set(values).size !== values.length) {
+                  throw new Error("native CUDA runtime returned duplicate tensor ownership")
+                }
+                return {
+                  entries: archive.entries.map((entry) => ({
+                    name: entry.name,
+                    tensor: concreteHandle(entry.tensor)
+                  })),
+                  metadata: Object.freeze({ ...archive.metadata })
+                }
+              } catch (error) {
+                clearArchiveTensors(values)
+                throw error
+              }
+            },
             catch: errorFor("load", "io", "io-failed")
           })
         )
@@ -1895,6 +1955,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               nativeDiagnostics.instructions.map((instruction) => Object.freeze(instruction))
             ),
             memory: Object.freeze(nativeDiagnostics.memory),
+            legalization: Object.freeze(nativeDiagnostics.legalization),
             compilePhases: Object.freeze(
               nativeDiagnostics.compilePhases.map((phase) => Object.freeze(phase))
             )
@@ -1966,14 +2027,6 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 }
                 return values.map((value, index) => {
                   const output = executable.outputs[index]!
-                  const physicalShape = output.storage?.physicalShape ?? output.shape
-                  const physicalDtype = output.storage?.physicalDtype ?? output.dtype
-                  if (
-                    dtype(value.dtype) !== physicalDtype || !validShape(value.shape) ||
-                    !sameShape(value.shape, physicalShape)
-                  ) {
-                    throw new Error(`execute: native CUDA output ${index} has invalid metadata`)
-                  }
                   return concreteHandle(value, output)
                 })
               } catch (cause) {

@@ -211,13 +211,9 @@ fn push_last_token_row_through_head(
 ) -> Result<Option<Arc<Node>>, String> {
     fn descend(node: &Arc<Node>) -> Result<Option<Arc<Node>>, String> {
         match &node.kind {
-            NodeKind::QuantizedLinear {
-                x,
-                weight,
-                bias,
-                codec,
-                weight_shape,
-            } if x.shape.len() == 3 && x.shape[0] == 1 => {
+            NodeKind::QuantizedLinear { x, weight, bias }
+                if x.shape.len() == 3 && x.shape[0] == 1 =>
+            {
                 let columns = x.shape[2];
                 let selected = Node::new(NodeKind::LastTokenRow { a: x.clone() })?;
                 let selected = Node::new(NodeKind::Reshape {
@@ -228,8 +224,6 @@ fn push_last_token_row_through_head(
                     x: selected,
                     weight: weight.clone(),
                     bias: bias.clone(),
-                    codec: *codec,
-                    weight_shape: *weight_shape,
                 })
                 .map(Some)
             }
@@ -567,6 +561,7 @@ pub fn specialize_decode_layout_outputs_with_attention(
                 if graph_rows > 1 {
                     cursor_tensor = true;
                     let cursors = Node::new(NodeKind::Input {
+                        storage: effect_torch_runtime::StorageMetadata::dense(),
                         slot: cursor_slot,
                         shape: vec![graph_rows],
                         dtype: DType::I64,
@@ -776,6 +771,7 @@ mod tests {
 
     fn input(slot: u32, shape: &[usize], dtype: DType, device: Device) -> Arc<Node> {
         Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot,
             shape: shape.to_vec(),
             dtype,

@@ -202,13 +202,20 @@ impl Capabilities {
 ///
 /// Implementors must guarantee that [`runtime_id`](Buffer::runtime_id)
 /// returns the id of the runtime that allocated the buffer and that
-/// [`layout`](Buffer::layout) and [`dtype`](Buffer::dtype) describe the
-/// buffer's current contents. Buffers must implement `Send + Sync` because
+/// [`value_spec`](Buffer::value_spec) describes the logical value and
+/// [`layout`](Buffer::layout) describes the physical payload. Constructors must
+/// validate the allocation against that specification before publication.
+/// Buffers must implement `Send + Sync` because
 /// execution pools move them across thread boundaries.
 pub trait Buffer: Any + fmt::Debug + Send + Sync {
     fn runtime_id(&self) -> RuntimeId;
     fn placement(&self) -> &Placement;
-    fn dtype(&self) -> DType;
+    /// Semantic dtype. Packed buffers report F32.
+    fn dtype(&self) -> DType {
+        self.value_spec().semantic_dtype
+    }
+    /// Validated logical metadata, distinct from the physical buffer layout.
+    fn value_spec(&self) -> crate::ValueSpec<'_>;
     fn layout(&self) -> &Layout;
     fn as_any(&self) -> &dyn Any;
 }
@@ -236,7 +243,11 @@ impl ErasedBuffer {
     }
 
     pub fn dtype(&self) -> DType {
-        self.0.dtype()
+        self.value_spec().semantic_dtype
+    }
+
+    pub fn value_spec(&self) -> crate::ValueSpec<'_> {
+        self.0.value_spec()
     }
 
     pub fn layout(&self) -> &Layout {
@@ -294,6 +305,10 @@ mod tests {
 
         fn dtype(&self) -> DType {
             DType::F32
+        }
+
+        fn value_spec(&self) -> crate::ValueSpec<'_> {
+            crate::ValueSpec::dense(DType::F32, self.layout.shape())
         }
 
         fn layout(&self) -> &Layout {

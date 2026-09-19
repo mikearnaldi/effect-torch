@@ -44,7 +44,7 @@ use effect_torch_compiler::{
     specialize_decode_layout_outputs_with_attention, CompileOptions,
     ConvGeometry as DecodeConvGeometry, CurrentBlockAttention, DecodeLayout, DecodeOutputSelection,
     InferenceOptions, KdaGeometry as DecodeKdaGeometry, PreparedProgram, ProgramRequest,
-    ProgramSlot, StateCursorSlot,
+    ProgramSlot, StateCursorSlot, TargetDTypeCapabilities, TargetFingerprint,
 };
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
 use effect_torch_graph::{
@@ -363,6 +363,22 @@ pub struct NativeMemoryDiagnostics {
 }
 
 #[napi(object)]
+pub struct NativeDTypeLegalizationDiagnostics {
+    pub target_backend: String,
+    pub target_architecture: String,
+    pub lowering_abi_revision: f64,
+    pub policy_revision: f64,
+    pub capability_queries: f64,
+    pub native_lowering_units: f64,
+    pub legalized_lowering_units: f64,
+    pub kernel_local_legalizations: f64,
+    pub materialized_conversions: f64,
+    pub materialized_conversion_bytes: f64,
+    pub decompositions: f64,
+    pub rejected_region_candidates: f64,
+}
+
+#[napi(object)]
 pub struct NativeExecutableDiagnostics {
     pub semantic_nodes_before_optimization: f64,
     pub semantic_nodes_after_optimization: f64,
@@ -371,6 +387,7 @@ pub struct NativeExecutableDiagnostics {
     pub command_count: f64,
     pub synchronization_count: f64,
     pub memory: NativeMemoryDiagnostics,
+    pub legalization: NativeDTypeLegalizationDiagnostics,
     pub compile_phases: Vec<NativeCompilePhaseDiagnostics>,
 }
 
@@ -378,7 +395,22 @@ fn executable_diagnostics(
     diagnostics: &effect_torch_runtime::ExecutableDiagnostics,
 ) -> NativeExecutableDiagnostics {
     let memory = &diagnostics.memory;
+    let legalization = &diagnostics.legalization;
     NativeExecutableDiagnostics {
+        legalization: NativeDTypeLegalizationDiagnostics {
+            target_backend: legalization.target_backend.clone(),
+            target_architecture: legalization.target_architecture.clone(),
+            lowering_abi_revision: legalization.lowering_abi_revision as f64,
+            policy_revision: legalization.policy_revision as f64,
+            capability_queries: legalization.capability_queries as f64,
+            native_lowering_units: legalization.native_lowering_units as f64,
+            legalized_lowering_units: legalization.legalized_lowering_units as f64,
+            kernel_local_legalizations: legalization.kernel_local_legalizations as f64,
+            materialized_conversions: legalization.materialized_conversions as f64,
+            materialized_conversion_bytes: legalization.materialized_conversion_bytes as f64,
+            decompositions: legalization.decompositions as f64,
+            rejected_region_candidates: legalization.rejected_region_candidates as f64,
+        },
         semantic_nodes_before_optimization: diagnostics.semantic_nodes_before_optimization as f64,
         semantic_nodes_after_optimization: diagnostics.semantic_nodes_after_optimization as f64,
         instructions: diagnostics
@@ -619,6 +651,40 @@ impl CancellationToken {
     }
 }
 
+#[napi(object)]
+pub struct NativeStorageMetadata {
+    pub representation: String,
+    pub format: Option<String>,
+}
+
+impl NativeStorageMetadata {
+    fn from_metadata(storage: effect_torch_runtime::StorageMetadata) -> Self {
+        match storage.representation {
+            effect_torch_runtime::StorageRepresentation::Dense => Self {
+                representation: "dense".into(),
+                format: None,
+            },
+            effect_torch_runtime::StorageRepresentation::Packed(format) => Self {
+                representation: "packed".into(),
+                format: Some(format.name().into()),
+            },
+        }
+    }
+
+    fn metadata(self) -> Result<effect_torch_runtime::StorageMetadata> {
+        match (self.representation.as_str(), self.format.as_deref()) {
+            ("dense", None) => Ok(effect_torch_runtime::StorageMetadata::dense()),
+            ("packed", Some(format)) => Ok(effect_torch_runtime::StorageMetadata::packed(
+                ggml_k_quant(format)?,
+            )),
+            _ => Err(Error::new(
+                Status::InvalidArg,
+                "invalid tensor storage representation",
+            )),
+        }
+    }
+}
+
 #[napi]
 impl NativeTensor {
     /// Releases the tensor's buffer before garbage collection. Later use of the
@@ -630,6 +696,13 @@ impl NativeTensor {
             sync_v8(&env);
         }
         Ok(())
+    }
+
+    #[napi(getter)]
+    pub fn storage(&self) -> Result<NativeStorageMetadata> {
+        Ok(NativeStorageMetadata::from_metadata(
+            self.val_cloned()?.storage(),
+        ))
     }
 
     #[napi(getter)]
@@ -707,6 +780,12 @@ fn sample_blocking(
     options: SamplingOptions,
     cancelled: &effect_torch_runtime::CancellationFlag,
 ) -> Result<u32> {
+    if inner.storage().representation != effect_torch_runtime::StorageRepresentation::Dense {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "sample requires dense logits",
+        ));
+    }
     let tensor = inner.as_metal().map_err(to_napi_err)?;
     if cancelled.is_cancelled() {
         return Err(Error::new(Status::Cancelled, "operation aborted"));
@@ -737,6 +816,12 @@ fn sample_blocking(
 }
 
 fn readback_blocking(inner: &value::Value) -> Result<Readback> {
+    if inner.storage().representation != effect_torch_runtime::StorageRepresentation::Dense {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "readback: packed tensors require explicit dequantization",
+        ));
+    }
     let tensor = inner.as_metal().map_err(to_napi_err)?;
     runtime::metal::device::MetalDevice::get()
         .synchronize_buffer(&tensor.buffer)
@@ -1012,6 +1097,11 @@ impl LazyTensor {
         dtype_name(self.node.dtype).to_string()
     }
 
+    #[napi(getter)]
+    pub fn storage(&self) -> NativeStorageMetadata {
+        NativeStorageMetadata::from_metadata(self.node.storage.clone())
+    }
+
     #[napi]
     pub fn metadata(&self) -> (Vec<u32>, String) {
         (self.shape(), self.dtype())
@@ -1169,8 +1259,13 @@ impl LazyTensor {
         shape: Vec<u32>,
         dtype: Option<NativeDType>,
         device_ordinal: Option<u32>,
+        storage: Option<NativeStorageMetadata>,
     ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Input {
+            storage: storage
+                .map(NativeStorageMetadata::metadata)
+                .transpose()?
+                .unwrap_or_else(effect_torch_runtime::StorageMetadata::dense),
             slot,
             shape: shape.iter().map(|&d| d as usize).collect(),
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
@@ -1554,20 +1649,11 @@ impl LazyTensor {
     }
 
     #[napi]
-    pub fn quantized_linear(
-        &self,
-        weight: &LazyTensor,
-        bias: Option<&LazyTensor>,
-        encoding: String,
-        rows: u32,
-        columns: u32,
-    ) -> Result<Self> {
+    pub fn quantized_linear(&self, weight: &LazyTensor, bias: Option<&LazyTensor>) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::QuantizedLinear {
             x: self.node.clone(),
             weight: weight.node.clone(),
             bias: bias.map(|value| value.node.clone()),
-            codec: ggml_k_quant(&encoding)?,
-            weight_shape: [rows as usize, columns as usize],
         }))
     }
 
@@ -1575,16 +1661,11 @@ impl LazyTensor {
     pub fn quantized_embedding(
         &self,
         weight: &LazyTensor,
-        encoding: String,
-        rows: u32,
-        columns: u32,
         padding_index: Option<u32>,
     ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::QuantizedEmbedding {
             indexes: self.node.clone(),
             weight: weight.node.clone(),
-            codec: ggml_k_quant(&encoding)?,
-            weight_shape: [rows as usize, columns as usize],
             padding_index: padding_index.map(|value| value as usize),
         }))
     }
@@ -9613,23 +9694,33 @@ struct CachedProgram {
     generated_order: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProgramCacheKey {
+    device_ordinal: usize,
+    semantic_program: String,
+    options: CompileOptions,
+    target: TargetFingerprint,
+    policy_revision: u64,
+    state_schema: Option<KvStateSchema>,
+}
+
 #[derive(Default)]
 struct ProgramCache {
-    entries: HashMap<String, CachedProgram>,
-    order: VecDeque<String>,
+    entries: HashMap<ProgramCacheKey, CachedProgram>,
+    order: VecDeque<ProgramCacheKey>,
 }
 
 impl ProgramCache {
-    fn get(&mut self, key: &str) -> Option<CachedProgram> {
+    fn get(&mut self, key: &ProgramCacheKey) -> Option<CachedProgram> {
         let entry = self.entries.get(key)?.clone();
         if let Some(index) = self.order.iter().position(|existing| existing == key) {
             self.order.remove(index);
         }
-        self.order.push_back(key.to_string());
+        self.order.push_back(key.clone());
         Some(entry)
     }
 
-    fn insert(&mut self, key: String, entry: CachedProgram) {
+    fn insert(&mut self, key: ProgramCacheKey, entry: CachedProgram) {
         const CAPACITY: usize = 64;
         if self.entries.contains_key(&key) {
             self.order.retain(|existing| existing != &key);
@@ -9745,7 +9836,12 @@ impl Executable {
         for (index, value) in inputs.iter().enumerate() {
             let tensor = value.as_metal().map_err(to_napi_err)?;
             signature
-                .validate_binding_metadata(index, value.dtype(), tensor.placement(), &tensor.layout)
+                .validate_binding_metadata(
+                    index,
+                    value.value_spec(),
+                    tensor.placement(),
+                    &tensor.layout,
+                )
                 .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
         }
         let device_ordinal = self.device_ordinal;
@@ -9959,14 +10055,27 @@ fn compile_inner(
                     .as_ref()
                     .is_some_and(|inference| inference.constant_weights)
         })
-        .map(|key| format!("metal:{device_ordinal}|{key}|{:?}", program.options));
-    if let Some(key) = effective_cache_key.as_deref() {
+        .map(|key| {
+            let capabilities =
+                crate::dtype::MetalDTypeCapabilities::snapshot(crate::device::MetalDevice::get());
+            ProgramCacheKey {
+                device_ordinal,
+                semantic_program: key,
+                options: program.options.clone(),
+                target: capabilities.fingerprint().clone(),
+                policy_revision: capabilities.policy_revision(),
+                state_schema,
+            }
+        });
+    if let Some(key) = effective_cache_key.as_ref() {
         let cached = program_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(key);
         if let Some(cached) = cached {
-            if cached.executable.signature == program.signature {
+            if cached.executable.signature == program.signature
+                && cached.executable.state_schema == state_schema
+            {
                 if let Some(current) = ordered_generated_bindings(
                     &program,
                     &semantic_generated,
@@ -10102,15 +10211,72 @@ pub struct NativeSafetensorsArchive {
     pub metadata: HashMap<String, String>,
 }
 
+#[napi(object, object_from_js = false)]
+pub struct NativeSafetensorsTensorInfo {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u32>,
+    pub byte_length: f64,
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeSafetensorsInspection {
+    pub entries: Vec<NativeSafetensorsTensorInfo>,
+    pub metadata: HashMap<String, String>,
+}
+
+fn native_safetensors_inspection(
+    inspection: effect_torch_napi::safetensors::Inspection,
+) -> Result<NativeSafetensorsInspection> {
+    let mut entries = Vec::with_capacity(inspection.entries.len());
+    for meta in inspection.entries {
+        entries.push(NativeSafetensorsTensorInfo {
+            name: meta.name,
+            dtype: effect_torch_napi::safetensors::dtype_name(meta.dtype),
+            shape: meta.shape,
+            byte_length: effect_torch_napi::safetensors::byte_length_f64(meta.byte_length)
+                .map_err(effect_torch_napi::safetensors::Error::into_napi)?,
+        });
+    }
+    Ok(NativeSafetensorsInspection {
+        entries,
+        metadata: inspection.metadata,
+    })
+}
+
+// Reads a standalone safetensors header or a Hugging Face index and every
+// shard header it references without reading or allocating any payload.
+#[napi]
+pub async fn inspect_safetensors(
+    path: String,
+    token: Option<&CancellationToken>,
+) -> Result<NativeSafetensorsInspection> {
+    run_compute(token, move |cancelled, _state| {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Error::new(
+                Status::Cancelled,
+                "operation aborted".to_string(),
+            ));
+        }
+        let inspection =
+            effect_torch_napi::safetensors::inspect(&path, &|| cancelled.load(Ordering::Acquire))
+                .map_err(effect_torch_napi::safetensors::Error::into_napi)?;
+        native_safetensors_inspection(inspection)
+    })
+    .await
+}
+
 // Loads a safetensors file straight into native tensors on the given device;
 // JS only receives opaque handles and names. Entries are sorted by name so
-// the result is deterministic.
+// the result is deterministic. Optional names select unique tensors; omission
+// loads every tensor and an empty array loads none.
 #[napi]
 pub async fn load_tensors(
     path: String,
     token: Option<&CancellationToken>,
+    names: Option<Vec<String>>,
 ) -> Result<NativeSafetensorsArchive> {
-    load_tensors_on(path, token, 0).await
+    load_tensors_on(path, token, 0, names).await
 }
 
 #[napi]
@@ -10118,14 +10284,16 @@ pub async fn load_tensors_for_device(
     path: String,
     device_ordinal: u32,
     token: Option<&CancellationToken>,
+    names: Option<Vec<String>>,
 ) -> Result<NativeSafetensorsArchive> {
-    load_tensors_on(path, token, device_ordinal as usize).await
+    load_tensors_on(path, token, device_ordinal as usize, names).await
 }
 
 async fn load_tensors_on(
     path: String,
     token: Option<&CancellationToken>,
     device_ordinal: usize,
+    names: Option<Vec<String>>,
 ) -> Result<NativeSafetensorsArchive> {
     run_compute_on(device_ordinal, token, move |cancelled, _state| {
         if cancelled.load(Ordering::Acquire) {
@@ -10134,7 +10302,10 @@ async fn load_tensors_on(
                 "operation aborted".to_string(),
             ));
         }
-        let archive = safetensors::load(&path).map_err(to_napi_err)?;
+        let archive = safetensors::load(&path, names.as_deref(), &|| {
+            cancelled.load(Ordering::Acquire)
+        })
+        .map_err(effect_torch_napi::safetensors::Error::into_napi)?;
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::new(
                 Status::Cancelled,
@@ -10981,7 +11152,7 @@ mod epilogue_tests {
     fn mleaf(data: Vec<f32>, shape: Vec<usize>) -> Arc<Node> {
         let t = MetalTensor::from_f32(MetalDevice::get(), data, shape);
         Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(
-            value::Value(t),
+            value::Value::dense(t),
         ))))
         .unwrap()
     }
@@ -11024,7 +11195,7 @@ mod epilogue_tests {
         ];
 
         for (dtype, bytes) in cases {
-            let logits = value::Value(MetalTensor {
+            let logits = value::Value::dense(MetalTensor {
                 buffer: MetalDevice::get().upload_bytes(&bytes),
                 layout: runtime::layout::Layout::new(vec![3], vec![2], 1),
                 dtype,
@@ -11046,9 +11217,9 @@ mod epilogue_tests {
     fn sampling_rejects_non_vector_empty_and_nonfloat_logits() {
         let device = MetalDevice::get();
         let cancelled = effect_torch_runtime::CancellationFlag::new();
-        let matrix = value::Value(MetalTensor::from_f32(device, vec![1.0, 2.0], vec![1, 2]));
-        let empty = value::Value(MetalTensor::empty(device, vec![0], DType::F32));
-        let integers = value::Value(MetalTensor {
+        let matrix = value::Value::dense(MetalTensor::from_f32(device, vec![1.0, 2.0], vec![1, 2]));
+        let empty = value::Value::dense(MetalTensor::empty(device, vec![0], DType::F32));
+        let integers = value::Value::dense(MetalTensor {
             buffer: device.alloc_with_data_u32(&[1, 2]),
             layout: runtime::layout::Layout::contiguous(vec![2]),
             dtype: DType::U32,
@@ -11166,6 +11337,100 @@ mod epilogue_tests {
     }
 
     #[test]
+    fn native_cache_identity_includes_target_and_policy() {
+        let capabilities = crate::dtype::MetalDTypeCapabilities::snapshot(MetalDevice::get());
+        let original = ProgramCacheKey {
+            device_ordinal: 0,
+            semantic_program: "same-program".into(),
+            options: CompileOptions::default(),
+            target: capabilities.fingerprint().clone(),
+            policy_revision: capabilities.policy_revision(),
+            state_schema: None,
+        };
+        let entries = HashMap::from([(original.clone(), ())]);
+        let mut changed = original.clone();
+        changed.policy_revision += 1;
+        assert!(!entries.contains_key(&changed));
+        changed = original.clone();
+        changed.target.lowering_abi_revision += 1;
+        assert!(!entries.contains_key(&changed));
+        changed = original.clone();
+        changed.target.features = vec!["different-family".to_string()].into_boxed_slice();
+        assert!(!entries.contains_key(&changed));
+        assert!(entries.contains_key(&original));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_cache_identity_includes_the_complete_decode_state_schema() {
+        let root = LazyTensor {
+            node: mleaf(
+                vec![0., 1., 2., 3., 0., 1., 2., 3., 0., 1., 2., 3.],
+                vec![1, 3, 4],
+            ),
+        };
+        let key = format!("decode-state-schema-regression-{}", root.node.id);
+        let state = |max_tokens| NativeKvStateSchema {
+            max_tokens,
+            block_size: 4,
+            kv_dtype: NativeDType::F32,
+            window: None,
+            batch: 1,
+            packed_causal_chains: None,
+            last_token_row: Some(true),
+            output_selections: None,
+            current_block_attention: None,
+        };
+        let small = compile(vec![&root], None, Some(state(32)), Some(key.clone())).unwrap();
+        let large = compile(vec![&root], None, Some(state(64)), Some(key.clone())).unwrap();
+        let small_again = compile(vec![&root], None, Some(state(32)), Some(key.clone())).unwrap();
+        let large_again = compile(vec![&root], None, Some(state(64)), Some(key)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &small.inner.executable,
+            &large.inner.executable
+        ));
+        assert!(Arc::ptr_eq(
+            &small.inner.executable,
+            &small_again.inner.executable
+        ));
+        assert!(Arc::ptr_eq(
+            &large.inner.executable,
+            &large_again.inner.executable
+        ));
+        for (max_tokens, executable) in [(32, small_again), (64, large_again)] {
+            assert_eq!(
+                executable.inner.executable.state_schema,
+                Some(executable.state.as_ref().unwrap().schema)
+            );
+            let pool =
+                NativeKvPool::new(0, 0, 0, max_tokens, Some(4), Some(NativeDType::F32), None)
+                    .unwrap();
+            let sequence = pool.make_sequence().unwrap();
+            let tokens = executable
+                .execute_sampled(
+                    Vec::new(),
+                    vec![&sequence],
+                    vec![0],
+                    vec![true],
+                    vec![2],
+                    vec![2],
+                    vec![vec![1, 2]],
+                    vec![NativeSamplingOptions {
+                        temperature: 0.,
+                        top_k: 0.,
+                        top_p: 1.,
+                        seed: 7.,
+                        counter: 3.,
+                    }],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(tokens, [3]);
+            sequence.release();
+        }
+    }
+
+    #[test]
     fn executable_diagnostics_exposes_compile_phases() {
         let root = mleaf(vec![1.0], vec![1]);
         let compilation = compile_metal_roots(std::slice::from_ref(&root)).unwrap();
@@ -11180,6 +11445,7 @@ mod epilogue_tests {
             [
                 "graph_index",
                 "optimization",
+                "target_legalization",
                 "lowering",
                 "lowered_program_validation",
                 "memory_planning",
@@ -11203,7 +11469,7 @@ mod epilogue_tests {
             dtype: DType::U32,
         };
         Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(
-            value::Value(t),
+            value::Value::dense(t),
         ))))
         .unwrap()
     }
@@ -11892,6 +12158,7 @@ mod epilogue_tests {
         };
         let reference = eval_f32(&build(mleaf(input_data.clone(), vec![1, 4, 4])));
         let declared_input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![1, 4, 4],
             dtype: DType::F32,
@@ -11934,7 +12201,7 @@ mod epilogue_tests {
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
-            &[value::Value(MetalTensor::from_f32(
+            &[value::Value::dense(MetalTensor::from_f32(
                 MetalDevice::get(),
                 input_data,
                 vec![1, 4, 4],

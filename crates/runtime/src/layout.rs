@@ -97,6 +97,9 @@ impl Layout {
     /// Returns the total element count, or `None` on overflow. Empty layouts
     /// have 0 elements. Scalars have 1.
     pub fn checked_numel(&self) -> Option<usize> {
+        if self.shape.contains(&0) {
+            return Some(0);
+        }
         self.shape
             .iter()
             .try_fold(1usize, |count, &dim| count.checked_mul(dim))

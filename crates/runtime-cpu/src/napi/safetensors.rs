@@ -10,8 +10,9 @@
 use super::err::{err, Res};
 use super::value::Value;
 use crate::{CpuBuffer, Tensor};
+use effect_torch_napi::safetensors::{self as shared, Error as SharedError};
 use effect_torch_runtime::DType as RuntimeDType;
-use safetensors::tensor::{serialize, Dtype, SafeTensors, TensorView};
+use safetensors::tensor::{serialize, Dtype, TensorView};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,7 @@ fn runtime_dtype(dtype: Dtype) -> Res<RuntimeDType> {
 
 /// Gathers a value's logical elements into dense little-endian bytes.
 pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
+    value.require_dense()?;
     let tensor = value.tensor();
     let mut output = Vec::with_capacity(tensor.numel() * tensor.dtype().size_in_bytes());
     let logical_offset = |mut linear: usize| {
@@ -141,7 +143,7 @@ pub fn value_from_bytes(bytes: &[u8], shape: &[usize], dtype: RuntimeDType) -> R
             shape.to_vec(),
         ),
     };
-    Ok(Value(tensor))
+    Ok(Value::dense(tensor))
 }
 
 fn temporary_path(path: &Path) -> Res<PathBuf> {
@@ -212,24 +214,31 @@ pub struct LoadedArchive {
     pub metadata: HashMap<String, String>,
 }
 
-/// Loads the archive at `path`. Decodes every tensor and returns the entries
-/// sorted by name.
-pub fn load(path: &str) -> Res<LoadedArchive> {
-    let raw = std::fs::read(path).map_err(|error| error.to_string())?;
-    let (_, parsed_metadata) =
-        SafeTensors::read_metadata(&raw).map_err(|error| error.to_string())?;
-    let metadata = parsed_metadata.metadata().clone().unwrap_or_default();
-    let tensors = SafeTensors::deserialize(&raw).map_err(|error| error.to_string())?;
-    let mut entries = Vec::with_capacity(tensors.len());
-    for name in tensors.names() {
-        let view = tensors.tensor(name).map_err(|error| error.to_string())?;
-        let dtype = runtime_dtype(view.dtype())?;
-        entries.push((
-            name.to_string(),
-            value_from_bytes(view.data(), view.shape(), dtype)?,
-        ));
+/// Plans and loads the archive at `path`. `names` selects tensors; `None`
+/// loads every tensor and `Some([])` loads none. Header geometry is validated
+/// before any payload is read. Decoded entries are sorted by name.
+pub fn load(
+    path: &str,
+    names: Option<&[String]>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LoadedArchive, SharedError> {
+    let plan = shared::plan(path, names, cancelled)?;
+    let metadata = plan.metadata().clone();
+    for meta in plan.entries() {
+        runtime_dtype(meta.dtype).map_err(SharedError::message)?;
+        if cancelled() {
+            return Err(SharedError::Cancelled);
+        }
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let entries = plan.load(cancelled, |meta, bytes| {
+        let dtype = runtime_dtype(meta.dtype).map_err(SharedError::message)?;
+        let shape = meta
+            .shape
+            .iter()
+            .map(|&dimension| dimension as usize)
+            .collect::<Vec<_>>();
+        value_from_bytes(&bytes, &shape, dtype).map_err(SharedError::message)
+    })?;
     Ok(LoadedArchive { entries, metadata })
 }
 
@@ -242,7 +251,7 @@ mod tests {
         let mut tensors = HashMap::new();
         tensors.insert(
             "quoted\"\\\nname".to_string(),
-            Value(Tensor::from_vec(
+            Value::dense(Tensor::from_vec(
                 vec![half::f16::from_bits(0x3e00), half::f16::from_bits(0xc080)],
                 vec![2],
             )),
@@ -254,7 +263,7 @@ mod tests {
             NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         save(&tensors, &metadata, path.to_str().unwrap()).unwrap();
-        let archive = load(path.to_str().unwrap()).unwrap();
+        let archive = load(path.to_str().unwrap(), None, &|| false).unwrap();
         assert_eq!(archive.metadata, metadata);
         assert_eq!(archive.entries[0].0, "quoted\"\\\nname");
         assert_eq!(
@@ -266,9 +275,45 @@ mod tests {
 
     #[test]
     fn exact_bf16_import_export() {
-        let bytes = [0x80, 0x3f, 0x00, 0xc0];
-        let value = value_from_bytes(&bytes, &[2], RuntimeDType::BF16).unwrap();
+        let bytes = [0x80, 0x3f, 0x00, 0xc0, 0x81, 0x7f, 0x01, 0x00, 0x00, 0x80];
+        let value = value_from_bytes(&bytes, &[5], RuntimeDType::BF16).unwrap();
         assert_eq!(tensor_bytes(&value).unwrap(), bytes);
+    }
+
+    #[test]
+    fn selected_load_keeps_bf16_bits_and_skips_unsupported_dtype() {
+        let path = std::env::temp_dir().join(format!(
+            "cpu-selected-{}-{}.safetensors",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bits = [0x81, 0x7f, 0x00, 0x80];
+        let encoded = serialize(
+            [
+                (
+                    "selected",
+                    TensorView::new(Dtype::BF16, vec![2], &bits).unwrap(),
+                ),
+                (
+                    "unused",
+                    TensorView::new(Dtype::I32, vec![1], &[0; 4]).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        std::fs::write(&path, encoded).unwrap();
+        assert!(load(path.to_str().unwrap(), None, &|| false).is_err());
+        let loaded = load(
+            path.to_str().unwrap(),
+            Some(&["selected".to_string()]),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].1.dtype(), RuntimeDType::BF16);
+        assert_eq!(tensor_bytes(&loaded.entries[0].1).unwrap(), bits);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -279,7 +324,7 @@ mod tests {
             NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, b"not a safetensors archive").unwrap();
-        assert!(load(path.to_str().unwrap()).is_err());
+        assert!(load(path.to_str().unwrap(), None, &|| false).is_err());
         std::fs::remove_file(path).ok();
     }
 }

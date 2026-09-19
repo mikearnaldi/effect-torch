@@ -470,7 +470,7 @@ impl Tensor {
         maximum_requirements,
         maximum_output_requirements,
         maximum_scratch_requirements,
-        |a, b| if a >= b { a } else { b }
+        |a, b| a.max(b)
     );
     binary_operation!(
         minimum,
@@ -478,7 +478,7 @@ impl Tensor {
         minimum_requirements,
         minimum_output_requirements,
         minimum_scratch_requirements,
-        |a, b| if a <= b { a } else { b }
+        |a, b| a.min(b)
     );
 
     pub fn pow_requirements(&self, rhs: &Tensor) -> CpuOperationRequirements {

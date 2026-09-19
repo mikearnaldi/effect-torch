@@ -341,29 +341,6 @@ const fromBackend = <A>(
     Effect.mapError((error) => new Tensor.TensorError({ op, message: error.message, backend: error }))
   )
 
-const validateResult = (
-  op: string,
-  runtime: Runtime.RuntimeService,
-  value: Runtime.LazyTensorHandle,
-  expected: Tensor.Any
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> => {
-  const candidate = value
-  const placement = candidate.placement
-  if (
-    candidate._tag !== "LazyTensor" || candidate.dtype !== expected.dtype || !Array.isArray(candidate.shape) ||
-    candidate.shape.length !== expected.shape.length ||
-    !candidate.shape.every((dimension, index) => dimension === expected.shape[index]) ||
-    placement === undefined || candidate.device !== placement.deviceType || placement.id !== expected.placement.id ||
-    placement.deviceType !== expected.placement.deviceType ||
-    placement.description !== expected.placement.description ||
-    placement.ordinal !== expected.placement.ordinal || placement.memorySpace !== expected.placement.memorySpace ||
-    placement.id !== runtime.placement.id || placement.deviceType !== runtime.placement.deviceType
-  ) {
-    return new Tensor.TensorError({ op, message: `${op}: backend returned invalid lazy tensor metadata` })
-  }
-  return Effect.succeed(value)
-}
-
 /**
  * Creates a stochastic gradient descent optimizer with optional momentum,
  * dampening, nesterov, and coupled (L2) weight decay. With no momentum the
@@ -427,7 +404,7 @@ export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> 
             updates.push(yield* Tensor.sub(params[i], yield* Tensor.mul(g, lr)))
             continue
           }
-          const rawStep = yield* fromBackend(
+          const step = yield* fromBackend(
             "sgd",
             runtime.node({
               op: "sgdStep",
@@ -435,12 +412,8 @@ export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> 
               attributes: { momentum, dampening, nesterov, weightDecay }
             })
           )
-          const step = yield* validateResult("sgd", runtime, rawStep, params[i])
           const makeOut = (index: number): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-            Effect.flatMap(
-              fromBackend("sgd", runtime.node({ op: "sgdOut", inputs: [step], attributes: { index } })),
-              (value) => validateResult("sgd", runtime, value, params[i])
-            )
+            fromBackend("sgd", runtime.node({ op: "sgdOut", inputs: [step], attributes: { index } }))
           updates.push(yield* makeOut(0))
           velocities.push(yield* makeOut(1))
         }
@@ -543,7 +516,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
         const m: Array<Tensor.Lazy> = []
         const v: Array<Tensor.Lazy> = []
         for (let i = 0; i < params.length; i++) {
-          const rawStep = yield* fromBackend(
+          const step = yield* fromBackend(
             op,
             runtime.node({
               op: "adamwStep",
@@ -559,12 +532,8 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
               attributes: { beta1, beta2, eps, weightDecay }
             })
           )
-          const step = yield* validateResult(op, runtime, rawStep, params[i])
           const makeOut = (index: number): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-            Effect.flatMap(
-              fromBackend(op, runtime.node({ op: "adamwOut", inputs: [step], attributes: { index } })),
-              (value) => validateResult(op, runtime, value, params[i])
-            )
+            fromBackend(op, runtime.node({ op: "adamwOut", inputs: [step], attributes: { index } }))
           updates.push(yield* makeOut(0))
           m.push(yield* makeOut(1))
           v.push(yield* makeOut(2))

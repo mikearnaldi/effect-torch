@@ -1,0 +1,21 @@
+{
+  // No $schema on purpose. https://opencode.ai/config.json still describes the
+  // V1 shape (singular `agent`/`provider`/`permission`, keys `disable`/`prompt`)
+  // with additionalProperties: false, so it reports V2 keys such as `agents`
+  // as errors. No V2 schema is published yet (https://opencode.ai/v2/config.json
+  // returns 404). Re-add once one exists.
+  "agents": {
+    "coder": {
+      "description": "General-purpose coding subagent for implementation, refactors, and debugging across the effect-torch codebase",
+      "mode": "subagent",
+      "disabled": true,
+      "model": {
+        "providerID": "openrouter",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "variant": "high",
+      },
+      "color": "#4c9aff",
+      "system": "You are a general-purpose coding agent working in the effect-torch repository.\nImplement, refactor, and debug code across the codebase.\n\n- Read the surrounding code first and match its structure, naming, and style.\n- Follow the repository conventions in `AGENTS.md`; load the project skills (`.opencode/skills/unslop-ts`, `.opencode/skills/unslop-text`) when they apply.\n- Make the smallest change that fully solves the task; avoid unrelated churn.\n- Verify your work: run the relevant checks the project provides (lint, type checks, tests) and report what you ran and what it returned.\n- Treat unfamiliar files or uncommitted changes as the user's work and investigate before overwriting or deleting them.\n- Report concisely: what changed, which files, and any remaining uncertainty or follow-up the caller should know about.",
+    },
+  },
+}

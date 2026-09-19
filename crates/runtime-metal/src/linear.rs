@@ -27,7 +27,9 @@ use crate::runtime::metal::run::MetalTensor;
 pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
     matches!(
         x.dtype,
-        crate::runtime::dtype::DType::F32 | crate::runtime::dtype::DType::BF16
+        crate::runtime::dtype::DType::F32
+            | crate::runtime::dtype::DType::F16
+            | crate::runtime::dtype::DType::BF16
     ) && weight.dtype == x.dtype
         && weight.layout.shape().len() == 2
 }

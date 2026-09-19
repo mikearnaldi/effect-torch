@@ -455,7 +455,11 @@ pub fn cross_entropy_forward_requirements(
     Ok(CrossEntropyForwardRequirements {
         loss: checked_requirement(&[], logits.dtype(), "cross_entropy loss")?,
         status: checked_requirement(&[3], DType::F64, "cross_entropy status")?,
-        nll_scratch: checked_requirement(&[rows], DType::F64, "cross_entropy nll scratch")?,
+        nll_scratch: checked_requirement(
+            &[rows],
+            work_dtype(logits.dtype()),
+            "cross_entropy nll scratch",
+        )?,
         flags_scratch: checked_requirement(&[rows], DType::U32, "cross_entropy flags scratch")?,
         topology: CrossEntropyForwardTopology::RowsThenStatus {
             row_passes: 2,
@@ -731,7 +735,7 @@ pub fn layer_norm_backward_requirements(
         dbias: checked_requirement(weight.shape(), weight.dtype(), "layer_norm dbias")?,
         normalized_scratch: checked_requirement(
             x.shape(),
-            x.dtype(),
+            work_dtype(x.dtype()),
             "layer_norm normalized scratch",
         )?,
         topology: LayerNormTopology::Rows { row_passes: 5 },
@@ -881,8 +885,84 @@ fn sdpa_allowed(
     key <= end && window.is_none_or(|window| key >= (end + 1).saturating_sub(window))
 }
 
+pub(crate) trait ModelElement: Elem {
+    type Compute: ComputeFloat;
+    fn widen(self) -> Self::Compute;
+    fn narrow(value: Self::Compute) -> Self;
+}
+
+macro_rules! model_element {
+    ($storage:ty, $compute:ty, $widen:expr, $narrow:expr) => {
+        impl ModelElement for $storage {
+            type Compute = $compute;
+            fn widen(self) -> Self::Compute {
+                ($widen)(self)
+            }
+            fn narrow(value: Self::Compute) -> Self {
+                ($narrow)(value)
+            }
+        }
+    };
+}
+model_element!(f32, f32, |value| value, |value| value);
+model_element!(f64, f64, |value| value, |value| value);
+model_element!(f16, f32, f16::to_f32, f16::from_f32);
+model_element!(bf16, f32, bf16::to_f32, bf16::from_f32);
+
+pub(crate) trait ComputeFloat:
+    Elem
+    + PartialEq
+    + std::ops::Add<Output = Self>
+    + std::ops::AddAssign
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + std::ops::Div<Output = Self>
+    + std::ops::DivAssign
+{
+    const ZERO: Self;
+    const ONE: Self;
+    fn sqrt(self) -> Self;
+    fn powf(self, power: Self) -> Self;
+    fn sin_cos(self) -> (Self, Self);
+    const NEG_INFINITY: Self;
+    fn maximum(self, other: Self) -> Self;
+    fn exp(self) -> Self;
+    fn ln(self) -> Self;
+}
+
+macro_rules! compute_float {
+    ($ty:ty) => {
+        impl ComputeFloat for $ty {
+            const ZERO: Self = 0.0;
+            const ONE: Self = 1.0;
+            fn sqrt(self) -> Self {
+                self.sqrt()
+            }
+            fn powf(self, power: Self) -> Self {
+                self.powf(power)
+            }
+            fn sin_cos(self) -> (Self, Self) {
+                self.sin_cos()
+            }
+            const NEG_INFINITY: Self = <$ty>::NEG_INFINITY;
+            fn maximum(self, other: Self) -> Self {
+                self.max(other)
+            }
+            fn exp(self) -> Self {
+                self.exp()
+            }
+            fn ln(self) -> Self {
+                self.ln()
+            }
+        }
+    };
+}
+
+compute_float!(f32);
+compute_float!(f64);
+
 #[allow(clippy::too_many_arguments)]
-fn sdpa_forward_into_impl<T: Elem>(
+fn sdpa_forward_into_impl<T: ComputeFloat>(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -899,6 +979,7 @@ fn sdpa_forward_into_impl<T: Elem>(
     query_heads: usize,
     kv_heads: usize,
 ) -> Result<(), String> {
+    let scale = T::from_f64(scale);
     let q_values = tensor_values::<T>(q, "sdpa")?;
     let k_values = tensor_values::<T>(k, "sdpa")?;
     let v_values = tensor_values::<T>(v, "sdpa")?;
@@ -920,46 +1001,45 @@ fn sdpa_forward_into_impl<T: Elem>(
                     let row = bh * query_len + query;
                     let output_base = row * value_depth;
                     out[output_base..output_base + value_depth].fill(T::default());
-                    let mut maximum = f64::NEG_INFINITY;
-                    let mut denominator = 0.0f64;
+                    let mut maximum = T::NEG_INFINITY;
+                    let mut denominator = T::ZERO;
                     for key in 0..key_len {
                         if !sdpa_allowed(query, key, query_len, key_len, causal, window) {
                             continue;
                         }
                         let k_base = (kv_bh * key_len + key) * query_depth;
-                        let mut score = 0.0f64;
+                        let mut score = T::ZERO;
                         for depth in 0..query_depth {
-                            score += logical_value(q_values, q, q_base + depth).to_f64()
-                                * logical_value(k_values, k, k_base + depth).to_f64();
+                            score += logical_value(q_values, q, q_base + depth)
+                                * logical_value(k_values, k, k_base + depth);
                         }
                         let score = score * scale;
-                        let next_maximum = maximum.max(score);
-                        let previous_scale = if maximum == f64::NEG_INFINITY {
-                            0.0
+                        let next_maximum = maximum.maximum(score);
+                        let previous_scale = if maximum == T::NEG_INFINITY {
+                            T::ZERO
                         } else {
                             (maximum - next_maximum).exp()
                         };
                         let weight = (score - next_maximum).exp();
                         for value_index in 0..value_depth {
                             let output_index = output_base + value_index;
-                            let value = out[output_index].to_f64() * previous_scale
+                            let value = out[output_index] * previous_scale
                                 + weight
                                     * logical_value(
                                         v_values,
                                         v,
                                         (kv_bh * key_len + key) * value_depth + value_index,
-                                    )
-                                    .to_f64();
-                            out[output_index] = T::from_f64(value);
+                                    );
+                            out[output_index] = value;
                         }
                         denominator = denominator * previous_scale + weight;
                         maximum = next_maximum;
                     }
                     for value_index in 0..value_depth {
                         let output_index = output_base + value_index;
-                        out[output_index] = T::from_f64(out[output_index].to_f64() / denominator);
+                        out[output_index] = out[output_index] / denominator;
                     }
-                    lse[row] = T::from_f64(maximum + denominator.ln());
+                    lse[row] = maximum + denominator.ln();
                 }
             }
         })
@@ -1022,7 +1102,7 @@ pub fn sdpa_forward_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sdpa_logsumexp_into_impl<T: Elem>(
+fn sdpa_logsumexp_into_impl<T: ComputeFloat>(
     q: &Tensor,
     k: &Tensor,
     scale: f64,
@@ -1034,35 +1114,36 @@ fn sdpa_logsumexp_into_impl<T: Elem>(
     key_len: usize,
     query_depth: usize,
 ) -> Result<(), String> {
+    let scale = T::from_f64(scale);
     let q_values = tensor_values::<T>(q, "sdpa logsumexp")?;
     let k_values = tensor_values::<T>(k, "sdpa logsumexp")?;
     logsumexp.write::<T, _>("sdpa logsumexp", &q.shape()[..q.shape().len() - 1], |lse| {
         for bh in 0..batch_heads {
             for query in 0..query_len {
                 let q_base = (bh * query_len + query) * query_depth;
-                let mut maximum = f64::NEG_INFINITY;
-                let mut denominator = 0.0f64;
+                let mut maximum = T::NEG_INFINITY;
+                let mut denominator = T::ZERO;
                 for key in 0..key_len {
                     if !sdpa_allowed(query, key, query_len, key_len, causal, window) {
                         continue;
                     }
                     let k_base = (bh * key_len + key) * query_depth;
-                    let mut score = 0.0f64;
+                    let mut score = T::ZERO;
                     for depth in 0..query_depth {
-                        score += logical_value(q_values, q, q_base + depth).to_f64()
-                            * logical_value(k_values, k, k_base + depth).to_f64();
+                        score += logical_value(q_values, q, q_base + depth)
+                            * logical_value(k_values, k, k_base + depth);
                     }
                     let score = score * scale;
-                    let next_maximum = maximum.max(score);
-                    let previous_scale = if maximum == f64::NEG_INFINITY {
-                        0.0
+                    let next_maximum = maximum.maximum(score);
+                    let previous_scale = if maximum == T::NEG_INFINITY {
+                        T::ZERO
                     } else {
                         (maximum - next_maximum).exp()
                     };
                     denominator = denominator * previous_scale + (score - next_maximum).exp();
                     maximum = next_maximum;
                 }
-                lse[bh * query_len + query] = T::from_f64(maximum + denominator.ln());
+                lse[bh * query_len + query] = maximum + denominator.ln();
             }
         }
     })?;
@@ -1114,7 +1195,7 @@ pub fn sdpa_logsumexp_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sdpa_backward_into_impl<T: Elem>(
+fn sdpa_backward_into_impl<T: ComputeFloat>(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -1134,6 +1215,7 @@ fn sdpa_backward_into_impl<T: Elem>(
     query_depth: usize,
     value_depth: usize,
 ) -> Result<(), String> {
+    let scale = T::from_f64(scale);
     let q_values = tensor_values::<T>(q, "sdpa backward")?;
     let k_values = tensor_values::<T>(k, "sdpa backward")?;
     let v_values = tensor_values::<T>(v, "sdpa backward")?;
@@ -1145,12 +1227,12 @@ fn sdpa_backward_into_impl<T: Elem>(
         &q.shape()[..q.shape().len() - 1],
         |d_vec| {
             for row in 0..batch_heads * query_len {
-                let mut value = 0.0f64;
+                let mut value = T::ZERO;
                 for depth in 0..value_depth {
-                    value += logical_value(o_values, output, row * value_depth + depth).to_f64()
-                        * logical_value(g_values, gradient, row * value_depth + depth).to_f64();
+                    value += logical_value(o_values, output, row * value_depth + depth)
+                        * logical_value(g_values, gradient, row * value_depth + depth);
                 }
-                d_vec[row] = T::from_f64(value);
+                d_vec[row] = value;
             }
             dq.write::<T, _>("sdpa dq", q.shape(), |dq_values| {
                 dk.write::<T, _>("sdpa dk", k.shape(), |dk_values| {
@@ -1169,50 +1251,38 @@ fn sdpa_backward_into_impl<T: Elem>(
                                     }
                                     let k_base = (bh * key_len + key) * query_depth;
                                     let v_base = (bh * key_len + key) * value_depth;
-                                    let mut score = 0.0f64;
+                                    let mut score = T::ZERO;
                                     for depth in 0..query_depth {
                                         score += logical_value(q_values, q, q_base + depth)
-                                            .to_f64()
-                                            * logical_value(k_values, k, k_base + depth).to_f64();
+                                            * logical_value(k_values, k, k_base + depth);
                                     }
                                     let probability = (score * scale
-                                        - logical_value(lse_values, logsumexp, row).to_f64())
+                                        - logical_value(lse_values, logsumexp, row))
                                     .exp();
-                                    let mut dp = 0.0f64;
+                                    let mut dp = T::ZERO;
                                     for value_index in 0..value_depth {
                                         dp += logical_value(
                                             g_values,
                                             gradient,
                                             row * value_depth + value_index,
-                                        )
-                                        .to_f64()
-                                            * logical_value(v_values, v, v_base + value_index)
-                                                .to_f64();
+                                        ) * logical_value(v_values, v, v_base + value_index);
                                     }
-                                    let ds = probability * (dp - d_vec[row].to_f64()) * scale;
+                                    let ds = probability * (dp - d_vec[row]) * scale;
                                     for depth in 0..query_depth {
-                                        dq_values[q_base + depth] = T::from_f64(
-                                            dq_values[q_base + depth].to_f64()
-                                                + ds * logical_value(k_values, k, k_base + depth)
-                                                    .to_f64(),
-                                        );
-                                        dk_values[k_base + depth] = T::from_f64(
-                                            dk_values[k_base + depth].to_f64()
-                                                + ds * logical_value(q_values, q, q_base + depth)
-                                                    .to_f64(),
-                                        );
+                                        dq_values[q_base + depth] = dq_values[q_base + depth]
+                                            + ds * logical_value(k_values, k, k_base + depth);
+                                        dk_values[k_base + depth] = dk_values[k_base + depth]
+                                            + ds * logical_value(q_values, q, q_base + depth);
                                     }
                                     for value_index in 0..value_depth {
-                                        dv_values[v_base + value_index] = T::from_f64(
-                                            dv_values[v_base + value_index].to_f64()
-                                                + probability
-                                                    * logical_value(
-                                                        g_values,
-                                                        gradient,
-                                                        row * value_depth + value_index,
-                                                    )
-                                                    .to_f64(),
-                                        );
+                                        dv_values[v_base + value_index] = dv_values
+                                            [v_base + value_index]
+                                            + probability
+                                                * logical_value(
+                                                    g_values,
+                                                    gradient,
+                                                    row * value_depth + value_index,
+                                                );
                                     }
                                 }
                             }
@@ -1360,7 +1430,7 @@ pub fn layer_norm_backward(
     (dx, dw, db)
 }
 
-fn layer_norm_forward_into_impl<T: Elem>(
+fn layer_norm_forward_into_impl<T: ModelElement>(
     x: &Tensor,
     weight: &Tensor,
     bias: &Tensor,
@@ -1369,30 +1439,31 @@ fn layer_norm_forward_into_impl<T: Elem>(
     rows: usize,
     normalized_elements: usize,
 ) -> Result<(), String> {
+    let eps = T::Compute::from_f64(eps);
     let x_values = tensor_values::<T>(x, "layer_norm")?;
     let weight_values = tensor_values::<T>(weight, "layer_norm")?;
     let bias_values = tensor_values::<T>(bias, "layer_norm")?;
     output.write::<T, _>("layer_norm output", x.shape(), |out| {
         for row in 0..rows {
             let base = row * normalized_elements;
-            let mut mean = 0.0f64;
+            let mut mean = T::Compute::ZERO;
             for index in 0..normalized_elements {
-                mean += logical_value(x_values, x, base + index).to_f64();
+                mean += logical_value(x_values, x, base + index).widen();
             }
-            mean /= normalized_elements as f64;
-            let mut variance = 0.0f64;
+            mean /= T::Compute::from_f64(normalized_elements as f64);
+            let mut variance = T::Compute::ZERO;
             for index in 0..normalized_elements {
-                let centered = logical_value(x_values, x, base + index).to_f64() - mean;
+                let centered = logical_value(x_values, x, base + index).widen() - mean;
                 variance += centered * centered;
             }
-            variance /= normalized_elements as f64;
-            let rstd = 1.0 / (variance + eps).sqrt();
+            variance /= T::Compute::from_f64(normalized_elements as f64);
+            let rstd = T::Compute::ONE / (variance + eps).sqrt();
             for index in 0..normalized_elements {
-                out[base + index] = T::from_f64(
-                    (logical_value(x_values, x, base + index).to_f64() - mean)
+                out[base + index] = T::narrow(
+                    (logical_value(x_values, x, base + index).widen() - mean)
                         * rstd
-                        * logical_value(weight_values, weight, index).to_f64()
-                        + logical_value(bias_values, bias, index).to_f64(),
+                        * logical_value(weight_values, weight, index).widen()
+                        + logical_value(bias_values, bias, index).widen(),
                 );
             }
         }
@@ -1454,7 +1525,7 @@ pub fn layer_norm_forward_into(
     }
 }
 
-fn rms_norm_forward_into_impl<T: Elem>(
+fn rms_norm_forward_into_impl<T: ModelElement>(
     x: &Tensor,
     weight: Option<&Tensor>,
     eps: f64,
@@ -1462,6 +1533,7 @@ fn rms_norm_forward_into_impl<T: Elem>(
     rows: usize,
     normalized_elements: usize,
 ) -> Result<(), String> {
+    let eps = T::Compute::from_f64(eps);
     let x_values = tensor_values::<T>(x, "rms_norm")?;
     let weight_values = weight
         .map(|weight| tensor_values::<T>(weight, "rms_norm"))
@@ -1469,18 +1541,19 @@ fn rms_norm_forward_into_impl<T: Elem>(
     output.write::<T, _>("rms_norm output", x.shape(), |out| {
         for row in 0..rows {
             let base = row * normalized_elements;
-            let mut mean_square = 0.0f64;
+            let mut mean_square = T::Compute::ZERO;
             for index in 0..normalized_elements {
-                let value = logical_value(x_values, x, base + index).to_f64();
+                let value = logical_value(x_values, x, base + index).widen();
                 mean_square += value * value;
             }
-            let scale = 1.0 / (mean_square / normalized_elements as f64 + eps).sqrt();
+            let scale = T::Compute::ONE
+                / (mean_square / T::Compute::from_f64(normalized_elements as f64) + eps).sqrt();
             for index in 0..normalized_elements {
-                let weight = weight_values.map_or(1.0, |values| {
-                    logical_value(values, weight.expect("values require weight"), index).to_f64()
+                let weight = weight_values.map_or(T::Compute::ONE, |values| {
+                    logical_value(values, weight.expect("values require weight"), index).widen()
                 });
                 out[base + index] =
-                    T::from_f64(logical_value(x_values, x, base + index).to_f64() * scale * weight);
+                    T::narrow(logical_value(x_values, x, base + index).widen() * scale * weight);
             }
         }
     })
@@ -1533,7 +1606,7 @@ pub fn rms_norm_forward_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn layer_norm_backward_into_impl<T: Elem>(
+fn layer_norm_backward_into_impl<T: ModelElement>(
     x: &Tensor,
     weight: &Tensor,
     gradient: &Tensor,
@@ -1545,63 +1618,63 @@ fn layer_norm_backward_into_impl<T: Elem>(
     rows: usize,
     normalized_elements: usize,
 ) -> Result<(), String> {
+    let eps = T::Compute::from_f64(eps);
     let x_values = tensor_values::<T>(x, "layer_norm backward")?;
     let weight_values = tensor_values::<T>(weight, "layer_norm backward")?;
     let gradient_values = tensor_values::<T>(gradient, "layer_norm backward")?;
-    normalized_scratch.write::<T, _>(
+    normalized_scratch.write::<T::Compute, _>(
         "layer_norm normalized scratch",
         x.shape(),
         |normalized| {
             dx.write::<T, _>("layer_norm dx", x.shape(), |dx_values| {
                 for row in 0..rows {
                     let base = row * normalized_elements;
-                    let mut mean = 0.0f64;
+                    let mut mean = T::Compute::ZERO;
                     for index in 0..normalized_elements {
-                        mean += logical_value(x_values, x, base + index).to_f64();
+                        mean += logical_value(x_values, x, base + index).widen();
                     }
-                    mean /= normalized_elements as f64;
-                    let mut variance = 0.0f64;
+                    mean /= T::Compute::from_f64(normalized_elements as f64);
+                    let mut variance = T::Compute::ZERO;
                     for index in 0..normalized_elements {
-                        let centered = logical_value(x_values, x, base + index).to_f64() - mean;
+                        let centered = logical_value(x_values, x, base + index).widen() - mean;
                         variance += centered * centered;
                     }
-                    variance /= normalized_elements as f64;
-                    let rstd = 1.0 / (variance + eps).sqrt();
-                    let mut mean_dyw = 0.0f64;
-                    let mut mean_dyw_xhat = 0.0f64;
+                    variance /= T::Compute::from_f64(normalized_elements as f64);
+                    let rstd = T::Compute::ONE / (variance + eps).sqrt();
+                    let mut mean_dyw = T::Compute::ZERO;
+                    let mut mean_dyw_xhat = T::Compute::ZERO;
                     for index in 0..normalized_elements {
-                        let xhat =
-                            (logical_value(x_values, x, base + index).to_f64() - mean) * rstd;
-                        normalized[base + index] = T::from_f64(xhat);
-                        let dyw = logical_value(gradient_values, gradient, base + index).to_f64()
-                            * logical_value(weight_values, weight, index).to_f64();
+                        let xhat = (logical_value(x_values, x, base + index).widen() - mean) * rstd;
+                        normalized[base + index] = xhat;
+                        let dyw = logical_value(gradient_values, gradient, base + index).widen()
+                            * logical_value(weight_values, weight, index).widen();
                         mean_dyw += dyw;
                         mean_dyw_xhat += dyw * xhat;
                     }
-                    mean_dyw /= normalized_elements as f64;
-                    mean_dyw_xhat /= normalized_elements as f64;
+                    mean_dyw /= T::Compute::from_f64(normalized_elements as f64);
+                    mean_dyw_xhat /= T::Compute::from_f64(normalized_elements as f64);
                     for index in 0..normalized_elements {
-                        let xhat = normalized[base + index].to_f64();
-                        let dyw = logical_value(gradient_values, gradient, base + index).to_f64()
-                            * logical_value(weight_values, weight, index).to_f64();
+                        let xhat = normalized[base + index];
+                        let dyw = logical_value(gradient_values, gradient, base + index).widen()
+                            * logical_value(weight_values, weight, index).widen();
                         dx_values[base + index] =
-                            T::from_f64((dyw - mean_dyw - xhat * mean_dyw_xhat) * rstd);
+                            T::narrow((dyw - mean_dyw - xhat * mean_dyw_xhat) * rstd);
                     }
                 }
             })?;
             dweight.write::<T, _>("layer_norm dweight", weight.shape(), |dw| {
                 dbias.write::<T, _>("layer_norm dbias", weight.shape(), |db| {
                     for index in 0..normalized_elements {
-                        let mut weight_sum = 0.0f64;
-                        let mut bias_sum = 0.0f64;
+                        let mut weight_sum = T::Compute::ZERO;
+                        let mut bias_sum = T::Compute::ZERO;
                         for row in 0..rows {
                             let offset = row * normalized_elements + index;
-                            let value = logical_value(gradient_values, gradient, offset).to_f64();
-                            weight_sum += value * normalized[offset].to_f64();
+                            let value = logical_value(gradient_values, gradient, offset).widen();
+                            weight_sum += value * normalized[offset];
                             bias_sum += value;
                         }
-                        dw[index] = T::from_f64(weight_sum);
-                        db[index] = T::from_f64(bias_sum);
+                        dw[index] = T::narrow(weight_sum);
+                        db[index] = T::narrow(bias_sum);
                     }
                 })
             })
@@ -1803,7 +1876,7 @@ fn logical_value<T: Elem>(values: &[T], tensor: &Tensor, index: usize) -> T {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cross_entropy_forward_into_impl<T: Elem>(
+fn cross_entropy_forward_into_impl<T: ModelElement>(
     logits: &Tensor,
     target: &Tensor,
     ignore_index: i64,
@@ -1817,7 +1890,7 @@ fn cross_entropy_forward_into_impl<T: Elem>(
 ) -> Result<(), String> {
     let logits_values = tensor_values::<T>(logits, "cross_entropy")?;
     let targets = target_values(target)?;
-    nll_scratch.write::<f64, _>("cross_entropy nll scratch", &[rows], |nll| {
+    nll_scratch.write::<T::Compute, _>("cross_entropy nll scratch", &[rows], |nll| {
         flags_scratch.write::<u32, _>("cross_entropy flags scratch", &[rows], |flags| {
             for row in 0..rows {
                 let target_value = targets.get(target, row);
@@ -1825,25 +1898,25 @@ fn cross_entropy_forward_into_impl<T: Elem>(
                 let invalid = !ignored && (target_value < 0 || target_value as usize >= classes);
                 flags[row] = (ignored as u32) | ((invalid as u32) << 1);
                 if ignored || invalid {
-                    nll[row] = 0.0;
+                    nll[row] = T::Compute::ZERO;
                     continue;
                 }
                 let base = row * classes;
-                let mut maximum = f64::NEG_INFINITY;
+                let mut maximum = T::Compute::NEG_INFINITY;
                 for class in 0..classes {
                     maximum =
-                        maximum.max(logical_value(logits_values, logits, base + class).to_f64());
+                        maximum.maximum(logical_value(logits_values, logits, base + class).widen());
                 }
-                let mut sum = 0.0f64;
+                let mut sum = T::Compute::ZERO;
                 for class in 0..classes {
-                    sum += (logical_value(logits_values, logits, base + class).to_f64() - maximum)
+                    sum += (logical_value(logits_values, logits, base + class).widen() - maximum)
                         .exp();
                 }
                 let picked =
-                    logical_value(logits_values, logits, base + target_value as usize).to_f64();
+                    logical_value(logits_values, logits, base + target_value as usize).widen();
                 nll[row] = maximum + sum.ln() - picked;
             }
-            let mut total = 0.0f64;
+            let mut total = T::Compute::ZERO;
             let mut active = 0usize;
             let mut invalid = 0usize;
             for row in 0..rows {
@@ -1852,15 +1925,15 @@ fn cross_entropy_forward_into_impl<T: Elem>(
                 invalid += (flags[row] & 2 != 0) as usize;
             }
             let result = if reduction == CrossEntropyReduction::Mean && active != 0 {
-                total / active as f64
+                total / T::Compute::from_f64(active as f64)
             } else {
                 total
             };
             status.write::<f64, _>("cross_entropy status", &[3], |values| {
-                values.copy_from_slice(&[result, active as f64, invalid as f64]);
+                values.copy_from_slice(&[result.to_f64(), active as f64, invalid as f64]);
             })?;
             loss.write::<T, _>("cross_entropy loss", &[], |output| {
-                output[0] = T::from_f64(result);
+                output[0] = T::narrow(result);
             })?;
             if active == 0 && reduction == CrossEntropyReduction::Mean {
                 return Err(
@@ -1951,7 +2024,7 @@ pub fn cross_entropy_forward_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cross_entropy_backward_into_impl<T: Elem>(
+fn cross_entropy_backward_into_impl<T: ModelElement>(
     logits: &Tensor,
     target: &Tensor,
     ignore_index: i64,
@@ -1987,9 +2060,9 @@ fn cross_entropy_backward_into_impl<T: Elem>(
     let logits_values = tensor_values::<T>(logits, "cross_entropy backward")?;
     let targets = target_values(target)?;
     let scale = if reduction == CrossEntropyReduction::Mean {
-        1.0 / active as f64
+        T::Compute::ONE / T::Compute::from_f64(active as f64)
     } else {
-        1.0
+        T::Compute::ONE
     };
     grad.write::<T, _>("cross_entropy gradient", logits.shape(), |output| {
         for row in 0..rows {
@@ -1999,21 +2072,23 @@ fn cross_entropy_backward_into_impl<T: Elem>(
                 continue;
             }
             let base = row * classes;
-            let mut maximum = f64::NEG_INFINITY;
+            let mut maximum = T::Compute::NEG_INFINITY;
             for class in 0..classes {
-                maximum = maximum.max(logical_value(logits_values, logits, base + class).to_f64());
+                maximum =
+                    maximum.maximum(logical_value(logits_values, logits, base + class).widen());
             }
-            let mut sum = 0.0f64;
+            let mut sum = T::Compute::ZERO;
             for class in 0..classes {
-                sum +=
-                    (logical_value(logits_values, logits, base + class).to_f64() - maximum).exp();
+                sum += (logical_value(logits_values, logits, base + class).widen() - maximum).exp();
             }
             for class in 0..classes {
                 let probability =
-                    (logical_value(logits_values, logits, base + class).to_f64() - maximum).exp()
+                    (logical_value(logits_values, logits, base + class).widen() - maximum).exp()
                         / sum;
-                output[base + class] = T::from_f64(
-                    (probability - (class == target_value as usize) as u8 as f64) * scale,
+                output[base + class] = T::narrow(
+                    (probability
+                        - T::Compute::from_f64((class == target_value as usize) as u8 as f64))
+                        * scale,
                 );
             }
         }
@@ -2247,7 +2322,7 @@ fn validate_broadcast_to(tensor: &Tensor, shape: &[usize], operation: &str) -> R
 }
 
 #[allow(clippy::too_many_arguments)]
-fn adamw_step_into_impl<T: Elem>(
+fn adamw_step_into_impl<T: ModelElement>(
     param: &Tensor,
     gradient: &Tensor,
     first_moment: &Tensor,
@@ -2263,6 +2338,11 @@ fn adamw_step_into_impl<T: Elem>(
     next_first_moment: &mut CpuDestination<'_>,
     next_second_moment: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
+    let beta1 = T::Compute::from_f64(beta1);
+    let beta2 = T::Compute::from_f64(beta2);
+    let eps = T::Compute::from_f64(eps);
+    let weight_decay = T::Compute::from_f64(weight_decay);
+
     let p = tensor_values::<T>(param, "adamw")?;
     let g = tensor_values::<T>(gradient, "adamw")?;
     let m = tensor_values::<T>(first_moment, "adamw")?;
@@ -2274,24 +2354,24 @@ fn adamw_step_into_impl<T: Elem>(
         next_first_moment.write::<T, _>("adamw first moment", param.shape(), |m_out| {
             next_second_moment.write::<T, _>("adamw second moment", param.shape(), |v_out| {
                 for index in 0..param.numel() {
-                    let p_value = logical_value(p, param, index).to_f64();
-                    let g_value = logical_value(g, gradient, index).to_f64();
-                    let m_value = beta1 * logical_value(m, first_moment, index).to_f64()
-                        + (1.0 - beta1) * g_value;
-                    let v_value = beta2 * logical_value(v, second_moment, index).to_f64()
-                        + (1.0 - beta2) * g_value * g_value;
-                    let lr_value = broadcast_value(lr_values, lr, param.shape(), index).to_f64();
+                    let p_value = logical_value(p, param, index).widen();
+                    let g_value = logical_value(g, gradient, index).widen();
+                    let m_value = beta1 * logical_value(m, first_moment, index).widen()
+                        + (T::Compute::ONE - beta1) * g_value;
+                    let v_value = beta2 * logical_value(v, second_moment, index).widen()
+                        + (T::Compute::ONE - beta2) * g_value * g_value;
+                    let lr_value = broadcast_value(lr_values, lr, param.shape(), index).widen();
                     let adjusted = (m_value
-                        / broadcast_value(c1_values, c1, param.shape(), index).to_f64())
+                        / broadcast_value(c1_values, c1, param.shape(), index).widen())
                         / ((v_value
-                            / broadcast_value(c2_values, c2, param.shape(), index).to_f64())
+                            / broadcast_value(c2_values, c2, param.shape(), index).widen())
                         .sqrt()
                             + eps)
                         * lr_value;
                     p_out[index] =
-                        T::from_f64(p_value - p_value * lr_value * weight_decay - adjusted);
-                    m_out[index] = T::from_f64(m_value);
-                    v_out[index] = T::from_f64(v_value);
+                        T::narrow(p_value - p_value * lr_value * weight_decay - adjusted);
+                    m_out[index] = T::narrow(m_value);
+                    v_out[index] = T::narrow(v_value);
                 }
             })
         })
@@ -2464,7 +2544,7 @@ pub fn sgd_step_requirements(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sgd_step_into_impl<T: Elem>(
+fn sgd_step_into_impl<T: ModelElement>(
     param: &Tensor,
     gradient: &Tensor,
     velocity: &Tensor,
@@ -2477,6 +2557,10 @@ fn sgd_step_into_impl<T: Elem>(
     next_param: &mut CpuDestination<'_>,
     next_velocity: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
+    let momentum = T::Compute::from_f64(momentum);
+    let dampening = T::Compute::from_f64(dampening);
+    let weight_decay = T::Compute::from_f64(weight_decay);
+
     let p = tensor_values::<T>(param, "sgd")?;
     let g = tensor_values::<T>(gradient, "sgd")?;
     let velocity_values = tensor_values::<T>(velocity, "sgd")?;
@@ -2485,23 +2569,23 @@ fn sgd_step_into_impl<T: Elem>(
     next_param.write::<T, _>("sgd parameter", param.shape(), |p_out| {
         next_velocity.write::<T, _>("sgd velocity", param.shape(), |velocity_out| {
             for index in 0..param.numel() {
-                let p_value = logical_value(p, param, index).to_f64();
+                let p_value = logical_value(p, param, index).widen();
                 let gradient_value =
-                    logical_value(g, gradient, index).to_f64() + weight_decay * p_value;
+                    logical_value(g, gradient, index).widen() + weight_decay * p_value;
                 let first_value =
-                    broadcast_value(first_values, first, param.shape(), index).to_f64();
-                let continued = momentum * logical_value(velocity_values, velocity, index).to_f64()
-                    + (1.0 - dampening) * gradient_value;
+                    broadcast_value(first_values, first, param.shape(), index).widen();
+                let continued = momentum * logical_value(velocity_values, velocity, index).widen()
+                    + (T::Compute::ONE - dampening) * gradient_value;
                 let next_velocity_value =
-                    first_value * gradient_value + (1.0 - first_value) * continued;
+                    first_value * gradient_value + (T::Compute::ONE - first_value) * continued;
                 let used = if nesterov {
                     gradient_value + momentum * next_velocity_value
                 } else {
                     next_velocity_value
                 };
-                let lr_value = broadcast_value(lr_values, lr, param.shape(), index).to_f64();
-                p_out[index] = T::from_f64(p_value - lr_value * used);
-                velocity_out[index] = T::from_f64(next_velocity_value);
+                let lr_value = broadcast_value(lr_values, lr, param.shape(), index).widen();
+                p_out[index] = T::narrow(p_value - lr_value * used);
+                velocity_out[index] = T::narrow(next_velocity_value);
             }
         })
     })??;
@@ -2680,7 +2764,7 @@ pub fn rotary_forward_requirements(x: &Tensor) -> Result<RotaryRequirements, Str
     rotary_requirements(x)
 }
 
-fn rotary_forward_into_impl<T: Elem>(
+fn rotary_forward_into_impl<T: ModelElement>(
     x: &Tensor,
     offsets: &[usize],
     theta: f64,
@@ -2710,18 +2794,21 @@ fn rotary_forward_into_impl<T: Elem>(
             for step in 0..steps {
                 let base = (row * steps + step) * head_dim;
                 for index in 0..half {
-                    let angle = sign
-                        * (offset + step) as f64
-                        * theta.powf(-2.0 * index as f64 / head_dim as f64);
+                    let angle = T::Compute::from_f64(sign)
+                        * T::Compute::from_f64((offset + step) as f64)
+                        * T::Compute::from_f64(theta).powf(
+                            T::Compute::from_f64(-2.0) * T::Compute::from_f64(index as f64)
+                                / T::Compute::from_f64(head_dim as f64),
+                        );
                     let (sin, cos) = angle.sin_cos();
                     let (first_index, second_index) = match layout {
                         RotaryLayout::HalfSplit => (base + index, base + half + index),
                         RotaryLayout::InterleavedPairs => (base + 2 * index, base + 2 * index + 1),
                     };
-                    let first = logical_value(values, x, first_index).to_f64();
-                    let second = logical_value(values, x, second_index).to_f64();
-                    out[first_index] = T::from_f64(first * cos - second * sin);
-                    out[second_index] = T::from_f64(second * cos + first * sin);
+                    let first = logical_value(values, x, first_index).widen();
+                    let second = logical_value(values, x, second_index).widen();
+                    out[first_index] = T::narrow(first * cos - second * sin);
+                    out[second_index] = T::narrow(second * cos + first * sin);
                 }
             }
         }
@@ -2842,7 +2929,11 @@ pub fn chunked_head_ce_forward_requirements(
             x.dtype(),
             "chunked head CE logits scratch",
         )?,
-        nll_scratch: checked_requirement(&[chunk_len], DType::F64, "chunked head CE nll scratch")?,
+        nll_scratch: checked_requirement(
+            &[chunk_len],
+            work_dtype(x.dtype()),
+            "chunked head CE nll scratch",
+        )?,
         flags_scratch: checked_requirement(
             &[chunk_len],
             DType::U32,
@@ -2887,15 +2978,19 @@ pub fn chunked_head_ce_backward_requirements(
         )?,
         grad_logits_scratch: checked_requirement(
             &[chunk_len, vocab],
-            DType::F32,
+            work_dtype(x.dtype()),
             "chunked head CE grad-logits scratch",
         )?,
         dweight_scratch: checked_requirement(
             &[inner, vocab],
-            DType::F32,
+            work_dtype(x.dtype()),
             "chunked head CE dweight scratch",
         )?,
-        dbias_scratch: checked_requirement(&[vocab], DType::F32, "chunked head CE dbias scratch")?,
+        dbias_scratch: checked_requirement(
+            &[vocab],
+            work_dtype(x.dtype()),
+            "chunked head CE dbias scratch",
+        )?,
         topology: ChunkedHeadCeTopology::Backward {
             chunk_len,
             chunks,
@@ -2912,7 +3007,7 @@ pub fn chunked_head_ce_backward_requirements(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn chunked_head_ce_forward_into_impl<T: Elem>(
+fn chunked_head_ce_forward_into_impl<T: ComputeFloat + ModelElement<Compute = T>>(
     x: &Tensor,
     weight: &Tensor,
     bias: &Tensor,
@@ -2936,7 +3031,7 @@ fn chunked_head_ce_forward_into_impl<T: Elem>(
         "chunked head CE logits scratch",
         &[chunk_len, vocab],
         |logits| {
-            nll_scratch.write::<f64, _>(
+            nll_scratch.write::<T, _>(
                 "chunked head CE nll scratch",
                 &[chunk_len],
                 |nll| {
@@ -2944,7 +3039,7 @@ fn chunked_head_ce_forward_into_impl<T: Elem>(
                         "chunked head CE flags scratch",
                         &[chunk_len],
                         |flags| {
-                            let mut total = 0.0f64;
+                            let mut total = T::ZERO;
                             let mut active = 0usize;
                             let mut invalid = 0usize;
                             let mut offset = 0usize;
@@ -2953,23 +3048,23 @@ fn chunked_head_ce_forward_into_impl<T: Elem>(
                                 for local_row in 0..length {
                                     let row = offset + local_row;
                                     for class in 0..vocab {
-                                        let mut value = 0.0f64;
+                                        let mut value = T::ZERO;
                                         for index in 0..inner {
                                             value += logical_value(
                                                 x_values,
                                                 x,
                                                 row * inner + index,
                                             )
-                                            .to_f64()
+                                            .widen()
                                                 * logical_value(
                                                     weight_values,
                                                     weight,
                                                     index * vocab + class,
                                                 )
-                                                .to_f64();
+                                                .widen();
                                         }
-                                        value += logical_value(bias_values, bias, class).to_f64();
-                                        logits[local_row * vocab + class] = T::from_f64(value);
+                                        value += logical_value(bias_values, bias, class).widen();
+                                        logits[local_row * vocab + class] = T::narrow(value);
                                     }
                                     let target_value = targets.get(target, row);
                                     let ignored =
@@ -2979,20 +3074,20 @@ fn chunked_head_ce_forward_into_impl<T: Elem>(
                                     flags[local_row] =
                                         ignored as u32 | ((invalid_row as u32) << 1);
                                     if ignored || invalid_row {
-                                        nll[local_row] = 0.0;
+                                        nll[local_row] = T::ZERO;
                                     } else {
                                         let base = local_row * vocab;
-                                        let mut maximum = f64::NEG_INFINITY;
+                                        let mut maximum = T::NEG_INFINITY;
                                         for class in 0..vocab {
                                             maximum =
-                                                maximum.max(logits[base + class].to_f64());
+                                                maximum.maximum(logits[base + class].widen());
                                         }
-                                        let mut sum = 0.0f64;
+                                        let mut sum = T::ZERO;
                                         for class in 0..vocab {
-                                            sum += (logits[base + class].to_f64() - maximum).exp();
+                                            sum += (logits[base + class].widen() - maximum).exp();
                                         }
                                         nll[local_row] = maximum + sum.ln()
-                                            - logits[base + target_value as usize].to_f64();
+                                            - logits[base + target_value as usize].widen();
                                     }
                                     total += nll[local_row];
                                     active += (!ignored) as usize;
@@ -3001,23 +3096,23 @@ fn chunked_head_ce_forward_into_impl<T: Elem>(
                                 offset += length;
                             }
                             let result = if active == 0 {
-                                0.0
+                                T::ZERO
                             } else {
-                                total / active as f64
+                                total / T::from_f64(active as f64)
                             };
                             status.write::<f64, _>(
                                 "chunked head CE status",
                                 &[3],
                                 |values| {
                                     values.copy_from_slice(&[
-                                        result,
+                                        result.to_f64(),
                                         active as f64,
                                         invalid as f64,
                                     ]);
                                 },
                             )?;
                             loss.write::<T, _>("chunked head CE loss", &[], |output| {
-                                output[0] = T::from_f64(result);
+                                output[0] = T::narrow(result);
                             })?;
                             if active == 0 {
                                 return Err(
@@ -3095,7 +3190,7 @@ pub fn chunked_head_ce_forward_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn chunked_head_ce_backward_into_impl<T: Elem>(
+fn chunked_head_ce_backward_into_impl<T: ComputeFloat + ModelElement<Compute = T>>(
     x: &Tensor,
     weight: &Tensor,
     bias: &Tensor,
@@ -3132,21 +3227,21 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
     let bias_values = tensor_values::<T>(bias, "chunked head CE backward")?;
     let gradient_values = tensor_values::<T>(gradient, "chunked head CE backward")?;
     let targets = target_values(target)?;
-    let scalar_gradient = logical_value(gradient_values, gradient, 0).to_f64() as f32;
-    let scale = scalar_gradient / active as f32;
+    let scalar_gradient = logical_value(gradient_values, gradient, 0).widen();
+    let scale = scalar_gradient / T::from_f64(active as f64);
     logits_scratch.write::<T, _>(
         "chunked head CE logits scratch",
         &[chunk_len, vocab],
         |logits| {
-            grad_logits_scratch.write::<f32, _>(
+            grad_logits_scratch.write::<T, _>(
                 "chunked head CE grad-logits scratch",
                 &[chunk_len, vocab],
                 |grad_logits| {
-                    dweight_scratch.write::<f32, _>(
+                    dweight_scratch.write::<T, _>(
                         "chunked head CE dweight scratch",
                         &[inner, vocab],
                         |dweight_accumulator| {
-                            dbias_scratch.write::<f32, _>(
+                            dbias_scratch.write::<T, _>(
                                 "chunked head CE dbias scratch",
                                 &[vocab],
                                 |dbias_accumulator| {
@@ -3159,8 +3254,8 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
                                                     "chunked head CE dbias",
                                                     bias.shape(),
                                                     |dbias_values| {
-                                                        dweight_accumulator.fill(0.0);
-                                                        dbias_accumulator.fill(0.0);
+                                                        dweight_accumulator.fill(T::ZERO);
+                                                        dbias_accumulator.fill(T::ZERO);
                                                         let mut offset = 0usize;
                                                         while offset < rows {
                                                             let length =
@@ -3168,31 +3263,31 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
                                                             for local_row in 0..length {
                                                                 let row = offset + local_row;
                                                                 for class in 0..vocab {
-                                                                    let mut value = 0.0f64;
+                                                                    let mut value = T::ZERO;
                                                                     for index in 0..inner {
                                                                         value += logical_value(
                                                                             x_values,
                                                                             x,
                                                                             row * inner + index,
                                                                         )
-                                                                        .to_f64()
+                                                                        .widen()
                                                                             * logical_value(
                                                                                 weight_values,
                                                                                 weight,
                                                                                 index * vocab
                                                                                     + class,
                                                                             )
-                                                                            .to_f64();
+                                                                            .widen();
                                                                     }
                                                                     value += logical_value(
                                                                         bias_values,
                                                                         bias,
                                                                         class,
                                                                     )
-                                                                    .to_f64();
+                                                                    .widen();
                                                                     logits[local_row * vocab
                                                                         + class] =
-                                                                        T::from_f64(value);
+                                                                        T::narrow(value);
                                                                 }
                                                                 let target_value =
                                                                     targets.get(target, row);
@@ -3204,44 +3299,38 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
                                                                 let base = local_row * vocab;
                                                                 if ignored {
                                                                     grad_logits[base..base + vocab]
-                                                                        .fill(0.0);
+                                                                        .fill(T::ZERO);
                                                                 } else {
                                                                     let mut maximum =
-                                                                        f64::NEG_INFINITY;
+                                                                        T::NEG_INFINITY;
                                                                     for class in 0..vocab {
-                                                                        maximum = maximum.max(
+                                                                        maximum = maximum.maximum(
                                                                             logits[base + class]
-                                                                                .to_f64(),
+                                                                                .widen(),
                                                                         );
                                                                     }
-                                                                    let mut sum = 0.0f64;
+                                                                    let mut sum = T::ZERO;
                                                                     for class in 0..vocab {
                                                                         sum += (logits
                                                                             [base + class]
-                                                                            .to_f64()
+                                                                            .widen()
                                                                             - maximum)
                                                                             .exp();
                                                                     }
                                                                     for class in 0..vocab {
                                                                         let probability = (logits
                                                                             [base + class]
-                                                                            .to_f64()
+                                                                            .widen()
                                                                             - maximum)
                                                                             .exp()
                                                                             / sum;
                                                                         grad_logits[base + class] =
-                                                                            ((probability
-                                                                                - (class
-                                                                                    == target_value
-                                                                                        as usize)
-                                                                                    as u8
-                                                                                    as f64)
-                                                                                as f32)
+                                                                            (probability - T::from_f64((class == target_value as usize) as u8 as f64))
                                                                                 * scale;
                                                                     }
                                                                 }
                                                                 for index in 0..inner {
-                                                                    let mut value = 0.0f32;
+                                                                    let mut value = T::ZERO;
                                                                     for class in 0..vocab {
                                                                         value += grad_logits
                                                                             [base + class]
@@ -3251,8 +3340,7 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
                                                                                 index * vocab
                                                                                     + class,
                                                                             )
-                                                                            .to_f64()
-                                                                                as f32;
+                                                                            .widen();
                                                                         dweight_accumulator[index
                                                                             * vocab
                                                                             + class] +=
@@ -3261,14 +3349,13 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
                                                                                 x,
                                                                                 row * inner + index,
                                                                             )
-                                                                            .to_f64()
-                                                                                as f32
+                                                                            .widen()
                                                                                 * grad_logits
                                                                                     [base + class];
                                                                     }
                                                                     dx_values
                                                                         [row * inner + index] =
-                                                                        T::from_f64(value as f64);
+                                                                        T::narrow(value);
                                                                 }
                                                                 for class in 0..vocab {
                                                                     dbias_accumulator[class] +=
@@ -3278,13 +3365,13 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
                                                             offset += length;
                                                         }
                                                         for index in 0..inner * vocab {
-                                                            dweight_values[index] = T::from_f64(
-                                                                dweight_accumulator[index] as f64,
+                                                            dweight_values[index] = T::narrow(
+                                                                dweight_accumulator[index],
                                                             );
                                                         }
                                                         for class in 0..vocab {
-                                                            dbias_values[class] = T::from_f64(
-                                                                dbias_accumulator[class] as f64,
+                                                            dbias_values[class] = T::narrow(
+                                                                dbias_accumulator[class],
                                                             );
                                                         }
                                                     },
@@ -3659,7 +3746,10 @@ pub fn kda_decode_requirements(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn kda_forward_into_impl<I: Elem, W: Elem>(
+fn kda_forward_into_impl<
+    I: ModelElement<Compute = W>,
+    W: ComputeFloat + ModelElement<Compute = W>,
+>(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -3674,6 +3764,7 @@ fn kda_forward_into_impl<I: Elem, W: Elem>(
     dk: usize,
     dv: usize,
 ) -> Result<(), String> {
+    let scale = W::from_f64(scale);
     let q_values = tensor_values::<I>(q, "kda forward")?;
     let k_values = tensor_values::<I>(k, "kda forward")?;
     let v_values = tensor_values::<I>(v, "kda forward")?;
@@ -3700,40 +3791,40 @@ fn kda_forward_into_impl<I: Elem, W: Elem>(
                         let q_base = (bh * steps + step) * dk;
                         let v_base = (bh * steps + step) * dv;
                         let beta_value =
-                            logical_value(beta_values, beta, bh * steps + step).to_f64();
+                            logical_value(beta_values, beta, bh * steps + step).widen();
                         for value_index in 0..dv {
-                            let mut prediction = 0.0f64;
+                            let mut prediction = W::ZERO;
                             for depth in 0..dk {
                                 let alpha = logical_value(decay_values, log_decay, q_base + depth)
-                                    .to_f64()
+                                    .widen()
                                     .exp();
                                 prediction += alpha
-                                    * state_values[state_base + depth * dv + value_index].to_f64()
-                                    * logical_value(k_values, k, q_base + depth).to_f64();
+                                    * state_values[state_base + depth * dv + value_index].widen()
+                                    * logical_value(k_values, k, q_base + depth).widen();
                             }
-                            let delta = logical_value(v_values, v, v_base + value_index).to_f64()
+                            let delta = logical_value(v_values, v, v_base + value_index).widen()
                                 - prediction;
                             for depth in 0..dk {
                                 let alpha = logical_value(decay_values, log_decay, q_base + depth)
-                                    .to_f64()
+                                    .widen()
                                     .exp();
                                 let index = state_base + depth * dv + value_index;
-                                state_values[index] = W::from_f64(
-                                    alpha * state_values[index].to_f64()
+                                state_values[index] = W::narrow(
+                                    alpha * state_values[index].widen()
                                         + beta_value
-                                            * logical_value(k_values, k, q_base + depth).to_f64()
+                                            * logical_value(k_values, k, q_base + depth).widen()
                                             * delta,
                                 );
                             }
                         }
                         for value_index in 0..dv {
-                            let mut value = 0.0f64;
+                            let mut value = W::ZERO;
                             for depth in 0..dk {
                                 value += state_values[state_base + depth * dv + value_index]
-                                    .to_f64()
-                                    * logical_value(q_values, q, q_base + depth).to_f64();
+                                    .widen()
+                                    * logical_value(q_values, q, q_base + depth).widen();
                             }
-                            out[v_base + value_index] = I::from_f64(value * scale);
+                            out[v_base + value_index] = I::narrow(value * scale);
                         }
                     }
                 }
@@ -3882,7 +3973,10 @@ pub fn kda_chunk_forward_into<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn kda_decode_into_impl<I: Elem, W: Elem>(
+fn kda_decode_into_impl<
+    I: ModelElement<Compute = W>,
+    W: ComputeFloat + ModelElement<Compute = W>,
+>(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -3896,6 +3990,7 @@ fn kda_decode_into_impl<I: Elem, W: Elem>(
     dk: usize,
     dv: usize,
 ) -> Result<(), String> {
+    let scale = W::from_f64(scale);
     let q_values = tensor_values::<I>(q, "kda decode")?;
     let k_values = tensor_values::<I>(k, "kda decode")?;
     let v_values = tensor_values::<I>(v, "kda decode")?;
@@ -3908,12 +4003,12 @@ fn kda_decode_into_impl<I: Elem, W: Elem>(
                 let state_base = head * dk * dv;
                 let input_base = head * dk;
                 let value_base = head * dv;
-                let beta_value = logical_value(beta_values, beta, head).to_f64();
+                let beta_value = logical_value(beta_values, beta, head).widen();
                 for value_index in 0..dv {
-                    let mut prediction = 0.0f64;
+                    let mut prediction = W::ZERO;
                     for depth in 0..dk {
                         let alpha = logical_value(decay_values, log_decay, input_base + depth)
-                            .to_f64()
+                            .widen()
                             .exp();
                         prediction += alpha
                             * logical_value(
@@ -3921,36 +4016,36 @@ fn kda_decode_into_impl<I: Elem, W: Elem>(
                                 state,
                                 state_base + depth * dv + value_index,
                             )
-                            .to_f64()
-                            * logical_value(k_values, k, input_base + depth).to_f64();
+                            .widen()
+                            * logical_value(k_values, k, input_base + depth).widen();
                     }
                     let delta =
-                        logical_value(v_values, v, value_base + value_index).to_f64() - prediction;
+                        logical_value(v_values, v, value_base + value_index).widen() - prediction;
                     for depth in 0..dk {
                         let alpha = logical_value(decay_values, log_decay, input_base + depth)
-                            .to_f64()
+                            .widen()
                             .exp();
-                        next[state_base + depth * dv + value_index] = W::from_f64(
+                        next[state_base + depth * dv + value_index] = W::narrow(
                             alpha
                                 * logical_value(
                                     state_values,
                                     state,
                                     state_base + depth * dv + value_index,
                                 )
-                                .to_f64()
+                                .widen()
                                 + beta_value
-                                    * logical_value(k_values, k, input_base + depth).to_f64()
+                                    * logical_value(k_values, k, input_base + depth).widen()
                                     * delta,
                         );
                     }
                 }
                 for value_index in 0..dv {
-                    let mut value = 0.0f64;
+                    let mut value = W::ZERO;
                     for depth in 0..dk {
-                        value += next[state_base + depth * dv + value_index].to_f64()
-                            * logical_value(q_values, q, input_base + depth).to_f64();
+                        value += next[state_base + depth * dv + value_index].widen()
+                            * logical_value(q_values, q, input_base + depth).widen();
                     }
-                    out[value_base + value_index] = I::from_f64(value * scale);
+                    out[value_base + value_index] = I::narrow(value * scale);
                 }
             }
         })
@@ -4369,7 +4464,7 @@ pub fn short_conv1d_backward_w_requirements(
     })
 }
 
-fn short_conv1d_forward_into_impl<T: Elem>(
+fn short_conv1d_forward_into_impl<T: ModelElement>(
     x: &Tensor,
     weight: &Tensor,
     output: &mut CpuDestination<'_>,
@@ -4384,7 +4479,7 @@ fn short_conv1d_forward_into_impl<T: Elem>(
         for batch_index in 0..batch {
             for step in 0..steps {
                 for channel in 0..channels {
-                    let mut value = 0.0f64;
+                    let mut value = T::Compute::ZERO;
                     for tap in 0..kernel {
                         let source = step + tap + 1;
                         if source >= kernel {
@@ -4394,12 +4489,12 @@ fn short_conv1d_forward_into_impl<T: Elem>(
                                 x,
                                 (batch_index * steps + source_step) * channels + channel,
                             )
-                            .to_f64()
+                            .widen()
                                 * logical_value(weight_values, weight, channel * kernel + tap)
-                                    .to_f64();
+                                    .widen();
                         }
                     }
-                    out[(batch_index * steps + step) * channels + channel] = T::from_f64(value);
+                    out[(batch_index * steps + step) * channels + channel] = T::narrow(value);
                 }
             }
         }
@@ -4431,7 +4526,7 @@ pub fn short_conv1d_forward_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn short_conv1d_with_state_into_impl<T: Elem>(
+fn short_conv1d_with_state_into_impl<T: ModelElement>(
     x: &Tensor,
     weight: &Tensor,
     state: &Tensor,
@@ -4449,7 +4544,7 @@ fn short_conv1d_with_state_into_impl<T: Elem>(
         state_next.write::<T, _>("short_conv1d state-next", &[kernel - 1, channels], |next| {
             for step in 0..steps {
                 for channel in 0..channels {
-                    let mut value = 0.0f64;
+                    let mut value = T::Compute::ZERO;
                     for tap in 0..kernel {
                         let window_index = step + tap;
                         let source = if window_index < kernel - 1 {
@@ -4461,10 +4556,10 @@ fn short_conv1d_with_state_into_impl<T: Elem>(
                                 (window_index - (kernel - 1)) * channels + channel,
                             )
                         };
-                        value += source.to_f64()
-                            * logical_value(weight_values, weight, channel * kernel + tap).to_f64();
+                        value += source.widen()
+                            * logical_value(weight_values, weight, channel * kernel + tap).widen();
                     }
-                    out[step * channels + channel] = T::from_f64(value);
+                    out[step * channels + channel] = T::narrow(value);
                 }
             }
             for index in 0..kernel - 1 {
@@ -4522,7 +4617,7 @@ pub fn short_conv1d_with_state_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn short_conv1d_backward_into_impl<T: Elem>(
+fn short_conv1d_backward_into_impl<T: ModelElement>(
     x: &Tensor,
     weight: &Tensor,
     gradient: &Tensor,
@@ -4541,7 +4636,7 @@ fn short_conv1d_backward_into_impl<T: Elem>(
             for batch_index in 0..batch {
                 for step in 0..steps {
                     for channel in 0..channels {
-                        let mut value = 0.0f64;
+                        let mut value = T::Compute::ZERO;
                         for offset in 0..kernel {
                             if step + offset < steps {
                                 value += logical_value(
@@ -4549,23 +4644,23 @@ fn short_conv1d_backward_into_impl<T: Elem>(
                                     gradient,
                                     (batch_index * steps + step + offset) * channels + channel,
                                 )
-                                .to_f64()
+                                .widen()
                                     * logical_value(
                                         weight_values,
                                         weight,
                                         channel * kernel + kernel - 1 - offset,
                                     )
-                                    .to_f64();
+                                    .widen();
                             }
                         }
                         dx_values[(batch_index * steps + step) * channels + channel] =
-                            T::from_f64(value);
+                            T::narrow(value);
                     }
                 }
             }
             for channel in 0..channels {
                 for tap in 0..kernel {
-                    let mut value = 0.0f64;
+                    let mut value = T::Compute::ZERO;
                     for batch_index in 0..batch {
                         for step in 0..steps {
                             let source = step + tap + 1;
@@ -4576,17 +4671,17 @@ fn short_conv1d_backward_into_impl<T: Elem>(
                                     gradient,
                                     (batch_index * steps + step) * channels + channel,
                                 )
-                                .to_f64()
+                                .widen()
                                     * logical_value(
                                         x_values,
                                         x,
                                         (batch_index * steps + source_step) * channels + channel,
                                     )
-                                    .to_f64();
+                                    .widen();
                             }
                         }
                     }
-                    dweight_values[channel * kernel + tap] = T::from_f64(value);
+                    dweight_values[channel * kernel + tap] = T::narrow(value);
                 }
             }
         })
@@ -4642,7 +4737,8 @@ pub fn short_conv1d_backward_x_into(
                 for batch_index in 0..batch {
                     for step in 0..steps {
                         for channel in 0..channels {
-                            let mut value = 0.0f64;
+                            let mut value =
+                                <<$type as ModelElement>::Compute as ComputeFloat>::ZERO;
                             for offset in 0..kernel {
                                 if step + offset < steps {
                                     value += logical_value(
@@ -4650,17 +4746,17 @@ pub fn short_conv1d_backward_x_into(
                                         gradient,
                                         (batch_index * steps + step + offset) * channels + channel,
                                     )
-                                    .to_f64()
+                                    .widen()
                                         * logical_value(
                                             weights,
                                             weight,
                                             channel * kernel + kernel - 1 - offset,
                                         )
-                                        .to_f64();
+                                        .widen();
                                 }
                             }
                             output[(batch_index * steps + step) * channels + channel] =
-                                <$type as Elem>::from_f64(value);
+                                <$type as ModelElement>::narrow(value);
                         }
                     }
                 }
@@ -4694,7 +4790,7 @@ pub fn short_conv1d_backward_w_into(
             dweight.write::<$type, _>("short_conv1d dweight", weight.shape(), |output| {
                 for channel in 0..channels {
                     for tap in 0..kernel {
-                        let mut value = 0.0f64;
+                        let mut value = <<$type as ModelElement>::Compute as ComputeFloat>::ZERO;
                         for batch_index in 0..batch {
                             for step in 0..steps {
                                 let source = step + tap + 1;
@@ -4704,18 +4800,18 @@ pub fn short_conv1d_backward_w_into(
                                         gradient,
                                         (batch_index * steps + step) * channels + channel,
                                     )
-                                    .to_f64()
+                                    .widen()
                                         * logical_value(
                                             inputs,
                                             x,
                                             (batch_index * steps + source - kernel) * channels
                                                 + channel,
                                         )
-                                        .to_f64();
+                                        .widen();
                                 }
                             }
                         }
-                        output[channel * kernel + tap] = <$type as Elem>::from_f64(value);
+                        output[channel * kernel + tap] = <$type as ModelElement>::narrow(value);
                     }
                 }
             })
@@ -4837,7 +4933,10 @@ pub fn short_conv1d_backward_w(x: &Tensor, weight: &Tensor, g: &Tensor) -> Tenso
 // chunk. Pass 2 walks chunks in reverse and recomputes transient per-token
 // state for one chunk at a time.
 #[allow(clippy::too_many_arguments)]
-fn kda_backward_into_impl<I: Elem, W: Elem>(
+fn kda_backward_into_impl<
+    I: ModelElement<Compute = W>,
+    W: ComputeFloat + ModelElement<Compute = W>,
+>(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -4858,6 +4957,7 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
     chunks: usize,
     scratch_per_head: usize,
 ) -> Result<(), String> {
+    let scale = W::from_f64(scale);
     let q_values = tensor_values::<I>(q, "kda backward")?;
     let k_values = tensor_values::<I>(k, "kda backward")?;
     let v_values = tensor_values::<I>(v, "kda backward")?;
@@ -4905,35 +5005,35 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                                         beta,
                                                         bh * steps + step,
                                                     )
-                                                    .to_f64();
+                                                    .widen();
                                                     for value_index in 0..dv {
-                                                        let mut prediction = 0.0f64;
+                                                        let mut prediction = W::ZERO;
                                                         for depth in 0..dk {
                                                             let alpha = logical_value(
                                                                 decay_values,
                                                                 log_decay,
                                                                 key_base + depth,
                                                             )
-                                                            .to_f64()
+                                                            .widen()
                                                             .exp();
                                                             prediction += alpha
                                                                 * work[lam
                                                                     + depth * dv
                                                                     + value_index]
-                                                                    .to_f64()
+                                                                    .widen()
                                                                 * logical_value(
                                                                     k_values,
                                                                     k,
                                                                     key_base + depth,
                                                                 )
-                                                                .to_f64();
+                                                                .widen();
                                                         }
                                                         let delta = logical_value(
                                                             v_values,
                                                             v,
                                                             value_base + value_index,
                                                         )
-                                                        .to_f64()
+                                                        .widen()
                                                             - prediction;
                                                         for depth in 0..dk {
                                                             let alpha = logical_value(
@@ -4941,19 +5041,19 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                                                 log_decay,
                                                                 key_base + depth,
                                                             )
-                                                            .to_f64()
+                                                            .widen()
                                                             .exp();
                                                             let index =
                                                                 lam + depth * dv + value_index;
-                                                            work[index] = W::from_f64(
-                                                                alpha * work[index].to_f64()
+                                                            work[index] = W::narrow(
+                                                                alpha * work[index].widen()
                                                                     + beta_value
                                                                         * logical_value(
                                                                             k_values,
                                                                             k,
                                                                             key_base + depth,
                                                                         )
-                                                                        .to_f64()
+                                                                        .widen()
                                                                         * delta,
                                                             );
                                                         }
@@ -4982,61 +5082,61 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                                         beta,
                                                         bh * steps + step,
                                                     )
-                                                    .to_f64();
+                                                    .widen();
                                                     for value_index in 0..dv {
-                                                        let mut prediction = 0.0f64;
+                                                        let mut prediction = W::ZERO;
                                                         for depth in 0..dk {
                                                             let alpha = logical_value(
                                                                 decay_values,
                                                                 log_decay,
                                                                 key_base + depth,
                                                             )
-                                                            .to_f64()
+                                                            .widen()
                                                             .exp();
                                                             prediction += alpha
                                                                 * work[previous
                                                                     + depth * dv
                                                                     + value_index]
-                                                                    .to_f64()
+                                                                    .widen()
                                                                 * logical_value(
                                                                     k_values,
                                                                     k,
                                                                     key_base + depth,
                                                                 )
-                                                                .to_f64();
+                                                                .widen();
                                                         }
                                                         let delta = logical_value(
                                                             v_values,
                                                             v,
                                                             value_base + value_index,
                                                         )
-                                                        .to_f64()
+                                                        .widen()
                                                             - prediction;
                                                         work[deltas + local * dv + value_index] =
-                                                            W::from_f64(delta);
+                                                            W::narrow(delta);
                                                         for depth in 0..dk {
                                                             let alpha = logical_value(
                                                                 decay_values,
                                                                 log_decay,
                                                                 key_base + depth,
                                                             )
-                                                            .to_f64()
+                                                            .widen()
                                                             .exp();
                                                             work[current
                                                                 + depth * dv
-                                                                + value_index] = W::from_f64(
+                                                                + value_index] = W::narrow(
                                                                 alpha
                                                                     * work[previous
                                                                         + depth * dv
                                                                         + value_index]
-                                                                        .to_f64()
+                                                                        .widen()
                                                                     + beta_value
                                                                         * logical_value(
                                                                             k_values,
                                                                             k,
                                                                             key_base + depth,
                                                                         )
-                                                                        .to_f64()
+                                                                        .widen()
                                                                         * delta,
                                                             );
                                                         }
@@ -5057,104 +5157,104 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                                         beta,
                                                         bh * steps + step,
                                                     )
-                                                    .to_f64();
+                                                    .widen();
 
                                                     for depth in 0..dk {
                                                         for value_index in 0..dv {
                                                             let index =
                                                                 lam + depth * dv + value_index;
-                                                            work[index] = W::from_f64(
-                                                                work[index].to_f64()
+                                                            work[index] = W::narrow(
+                                                                work[index].widen()
                                                                     + scale
                                                                         * logical_value(
                                                                             q_values,
                                                                             q,
                                                                             key_base + depth,
                                                                         )
-                                                                        .to_f64()
+                                                                        .widen()
                                                                         * logical_value(
                                                                             gradient_values,
                                                                             gradient,
                                                                             value_base
                                                                                 + value_index,
                                                                         )
-                                                                        .to_f64(),
+                                                                        .widen(),
                                                             );
                                                         }
                                                     }
                                                     for depth in 0..dk {
-                                                        let mut value = 0.0f64;
+                                                        let mut value = W::ZERO;
                                                         for value_index in 0..dv {
                                                             value += work[current
                                                                 + depth * dv
                                                                 + value_index]
-                                                                .to_f64()
+                                                                .widen()
                                                                 * logical_value(
                                                                     gradient_values,
                                                                     gradient,
                                                                     value_base + value_index,
                                                                 )
-                                                                .to_f64();
+                                                                .widen();
                                                         }
                                                         dq_values[key_base + depth] =
-                                                            I::from_f64(value * scale);
+                                                            I::narrow(value * scale);
                                                     }
                                                     for value_index in 0..dv {
-                                                        let mut lam_k = 0.0f64;
+                                                        let mut lam_k = W::ZERO;
                                                         for depth in 0..dk {
                                                             lam_k += work
                                                                 [lam + depth * dv + value_index]
-                                                                .to_f64()
+                                                                .widen()
                                                                 * logical_value(
                                                                     k_values,
                                                                     k,
                                                                     key_base + depth,
                                                                 )
-                                                                .to_f64();
+                                                                .widen();
                                                         }
                                                         dv_values[value_base + value_index] =
-                                                            I::from_f64(beta_value * lam_k);
+                                                            I::narrow(beta_value * lam_k);
                                                     }
-                                                    let mut beta_gradient = 0.0f64;
+                                                    let mut beta_gradient = W::ZERO;
                                                     for depth in 0..dk {
                                                         let alpha = logical_value(
                                                             decay_values,
                                                             log_decay,
                                                             key_base + depth,
                                                         )
-                                                        .to_f64()
+                                                        .widen()
                                                         .exp();
-                                                        let mut lam_delta = 0.0f64;
-                                                        let mut sdec_lam_k = 0.0f64;
+                                                        let mut lam_delta = W::ZERO;
+                                                        let mut sdec_lam_k = W::ZERO;
                                                         for value_index in 0..dv {
-                                                            let mut lam_k = 0.0f64;
+                                                            let mut lam_k = W::ZERO;
                                                             for inner in 0..dk {
                                                                 lam_k += work[lam
                                                                     + inner * dv
                                                                     + value_index]
-                                                                    .to_f64()
+                                                                    .widen()
                                                                     * logical_value(
                                                                         k_values,
                                                                         k,
                                                                         key_base + inner,
                                                                     )
-                                                                    .to_f64();
+                                                                    .widen();
                                                             }
                                                             lam_delta += work
                                                                 [lam + depth * dv + value_index]
-                                                                .to_f64()
+                                                                .widen()
                                                                 * work[deltas
                                                                     + local * dv
                                                                     + value_index]
-                                                                    .to_f64();
+                                                                    .widen();
                                                             sdec_lam_k += alpha
                                                                 * work[previous
                                                                     + depth * dv
                                                                     + value_index]
-                                                                    .to_f64()
+                                                                    .widen()
                                                                 * lam_k;
                                                         }
-                                                        dk_values[key_base + depth] = I::from_f64(
+                                                        dk_values[key_base + depth] = I::narrow(
                                                             beta_value * (lam_delta - sdec_lam_k),
                                                         );
                                                         beta_gradient += logical_value(
@@ -5162,59 +5262,59 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                                             k,
                                                             key_base + depth,
                                                         )
-                                                        .to_f64()
+                                                        .widen()
                                                             * lam_delta;
 
-                                                        let mut decay_gradient = 0.0f64;
+                                                        let mut decay_gradient = W::ZERO;
                                                         for value_index in 0..dv {
-                                                            let mut lam_k = 0.0f64;
+                                                            let mut lam_k = W::ZERO;
                                                             for inner in 0..dk {
                                                                 lam_k += work[lam
                                                                     + inner * dv
                                                                     + value_index]
-                                                                    .to_f64()
+                                                                    .widen()
                                                                     * logical_value(
                                                                         k_values,
                                                                         k,
                                                                         key_base + inner,
                                                                     )
-                                                                    .to_f64();
+                                                                    .widen();
                                                             }
                                                             let m = work
                                                                 [lam + depth * dv + value_index]
-                                                                .to_f64()
+                                                                .widen()
                                                                 - beta_value
                                                                     * logical_value(
                                                                         k_values,
                                                                         k,
                                                                         key_base + depth,
                                                                     )
-                                                                    .to_f64()
+                                                                    .widen()
                                                                     * lam_k;
                                                             decay_gradient += work[previous
                                                                 + depth * dv
                                                                 + value_index]
-                                                                .to_f64()
+                                                                .widen()
                                                                 * m;
                                                         }
                                                         dlog_values[key_base + depth] =
-                                                            I::from_f64(decay_gradient * alpha);
+                                                            I::narrow(decay_gradient * alpha);
                                                     }
                                                     dbeta_values[bh * steps + step] =
-                                                        I::from_f64(beta_gradient);
+                                                        I::narrow(beta_gradient);
 
                                                     for value_index in 0..dv {
-                                                        let mut lam_k = 0.0f64;
+                                                        let mut lam_k = W::ZERO;
                                                         for depth in 0..dk {
                                                             lam_k += work
                                                                 [lam + depth * dv + value_index]
-                                                                .to_f64()
+                                                                .widen()
                                                                 * logical_value(
                                                                     k_values,
                                                                     k,
                                                                     key_base + depth,
                                                                 )
-                                                                .to_f64();
+                                                                .widen();
                                                         }
                                                         for depth in 0..dk {
                                                             let alpha = logical_value(
@@ -5222,20 +5322,20 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                                                 log_decay,
                                                                 key_base + depth,
                                                             )
-                                                            .to_f64()
+                                                            .widen()
                                                             .exp();
                                                             let index =
                                                                 lam + depth * dv + value_index;
-                                                            work[index] = W::from_f64(
+                                                            work[index] = W::narrow(
                                                                 alpha
-                                                                    * (work[index].to_f64()
+                                                                    * (work[index].widen()
                                                                         - beta_value
                                                                             * logical_value(
                                                                                 k_values,
                                                                                 k,
                                                                                 key_base + depth,
                                                                             )
-                                                                            .to_f64()
+                                                                            .widen()
                                                                             * lam_k),
                                                             );
                                                         }
@@ -5860,7 +5960,7 @@ mod tests {
             .unwrap();
         assert_eq!(ce.loss.bytes, 4);
         assert_eq!(ce.status.bytes, 3 * 8);
-        assert_eq!(ce.nll_scratch.bytes, 6 * 8);
+        assert_eq!(ce.nll_scratch.bytes, 6 * 4);
         assert_eq!(ce.flags_scratch.bytes, 6 * 4);
         assert_eq!(
             ce.topology,
@@ -6460,6 +6560,244 @@ mod tests {
             ),
             2e-6,
         );
+    }
+
+    #[test]
+    fn short_conv_and_sgd_use_f32_for_half_and_f32_storage() {
+        for (dtype, large, small) in [
+            (DType::F16, 32768f32, 2f32.powi(-10)),
+            (DType::BF16, 16777216., 1.),
+            (DType::F32, 16777216., 1.),
+            (DType::F64, 16777216., 1.),
+        ] {
+            let x = Tensor::from_vec(vec![large, small, -large], vec![1, 3, 1]).cast(dtype);
+            let weight = Tensor::ones(&[1, 3], dtype);
+            let mut forward = Tensor::empty(x.shape(), dtype);
+            let mut dx = Tensor::empty(x.shape(), dtype);
+            let ones = Tensor::ones(x.shape(), dtype);
+            let one_weight = Tensor::ones(&[1, 1], dtype);
+            let mut dw = Tensor::empty(&[1, 1], dtype);
+            let p = Tensor::full(&[1], large as f64, dtype);
+            let g = Tensor::full(&[1], small as f64, dtype);
+            let lr = Tensor::ones(&[], dtype);
+            let first = Tensor::zeros(&[], dtype);
+            let mut next = Tensor::empty(&[1], dtype);
+            let mut velocity = Tensor::empty(&[1], dtype);
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                short_conv1d_forward_into(&x, &weight, &mut forward.destination().unwrap())
+                    .unwrap();
+                short_conv1d_backward_x_into(&ones, &weight, &x, &mut dx.destination().unwrap())
+                    .unwrap();
+                short_conv1d_backward_w_into(
+                    &x,
+                    &one_weight,
+                    &ones,
+                    &mut dw.destination().unwrap(),
+                )
+                .unwrap();
+                sgd_step_into(
+                    &p,
+                    &g,
+                    &p,
+                    &lr,
+                    &first,
+                    1.,
+                    0.,
+                    true,
+                    0.,
+                    &mut next.destination().unwrap(),
+                    &mut velocity.destination().unwrap(),
+                )
+                .unwrap();
+            }
+            let expected = if dtype == DType::F64 {
+                small as f64
+            } else {
+                0.
+            };
+            assert_eq!(
+                f64::slice_of(&forward.cast(DType::F64)).unwrap()[2],
+                expected
+            );
+            assert_eq!(f64::slice_of(&dx.cast(DType::F64)).unwrap()[0], expected);
+            assert_eq!(scalar(&dw), expected);
+            assert_eq!(scalar(&next), -2. * expected);
+        }
+    }
+
+    #[test]
+    fn chunked_head_ce_preserves_f64_gradients_and_uses_f32_logits() {
+        for dtype in [DType::F32, DType::F64] {
+            let x = Tensor::from_vec(vec![16777216f32, 1., -16777216.], vec![1, 3]).cast(dtype);
+            let weight = Tensor::from_vec(vec![1f32, 0., 1., 0., 1., 0.], vec![3, 2]).cast(dtype);
+            let bias = Tensor::zeros(&[2], dtype);
+            let target = Tensor::from_vec(vec![0u32], vec![1]);
+            let requirements =
+                chunked_head_ce_forward_requirements(&x, &weight, &bias, &target, 1).unwrap();
+            let allocate = |r: &CpuTensorRequirement| Tensor::empty(&r.shape, r.dtype);
+            let mut loss = allocate(&requirements.loss);
+            let mut status = allocate(&requirements.status);
+            let mut logits = allocate(&requirements.logits_scratch);
+            let mut nll = allocate(&requirements.nll_scratch);
+            let mut flags = allocate(&requirements.flags_scratch);
+            assert_eq!(requirements.nll_scratch.dtype, dtype);
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                chunked_head_ce_forward_into(
+                    &x,
+                    &weight,
+                    &bias,
+                    &target,
+                    -100,
+                    1,
+                    &mut loss.destination().unwrap(),
+                    &mut status.destination().unwrap(),
+                    &mut logits.destination().unwrap(),
+                    &mut nll.destination().unwrap(),
+                    &mut flags.destination().unwrap(),
+                )
+                .unwrap();
+            }
+            let expected = if dtype == DType::F32 {
+                2f32.ln() as f64
+            } else {
+                (1. + (-1f64).exp()).ln()
+            };
+            assert!((scalar(&loss) - expected).abs() < 1e-15);
+        }
+        let x = Tensor::zeros(&[1, 1], DType::F64);
+        let w = Tensor::zeros(&[1, 2], DType::F64);
+        let b = Tensor::zeros(&[2], DType::F64);
+        let target = Tensor::from_vec(vec![0u32], vec![1]);
+        let g = Tensor::from_vec(vec![1. + 2f64.powi(-40)], vec![]);
+        let r = chunked_head_ce_backward_requirements(&x, &w, &b, &target, 1).unwrap();
+        let allocate = |r: &CpuTensorRequirement| Tensor::empty(&r.shape, r.dtype);
+        let mut dx = allocate(&r.dx);
+        let mut dw = allocate(&r.dweight);
+        let mut db = allocate(&r.dbias);
+        let mut status = allocate(&r.status);
+        let mut logits = allocate(&r.logits_scratch);
+        let mut grad_logits = allocate(&r.grad_logits_scratch);
+        let mut weight_acc = allocate(&r.dweight_scratch);
+        let mut bias_acc = allocate(&r.dbias_scratch);
+        assert_eq!(r.grad_logits_scratch.dtype, DType::F64);
+        assert_eq!(r.dweight_scratch.dtype, DType::F64);
+        assert_eq!(r.dbias_scratch.dtype, DType::F64);
+        {
+            let _guard = ExecutableAllocationGuard::enter();
+            chunked_head_ce_backward_into(
+                &x,
+                &w,
+                &b,
+                &target,
+                &g,
+                -100,
+                1,
+                &mut dx.destination().unwrap(),
+                &mut dw.destination().unwrap(),
+                &mut db.destination().unwrap(),
+                &mut status.destination().unwrap(),
+                &mut logits.destination().unwrap(),
+                &mut grad_logits.destination().unwrap(),
+                &mut weight_acc.destination().unwrap(),
+                &mut bias_acc.destination().unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            f64::slice_of(&db).unwrap(),
+            &[-0.5 - 2f64.powi(-41), 0.5 + 2f64.powi(-41)]
+        );
+    }
+
+    #[test]
+    fn kda_compute_dtype_controls_forward_decode_and_backward_rounding() {
+        for (dtype, large, small) in [
+            (DType::F16, 32768f32, 2f32.powi(-10)),
+            (DType::BF16, 16777216., 1.),
+            (DType::F32, 16777216., 1.),
+            (DType::F64, 16777216., 1.),
+        ] {
+            let q = Tensor::ones(&[1, 1, 3], dtype);
+            let k = Tensor::from_vec(vec![large, small, -large], vec![1, 1, 3]).cast(dtype);
+            let v = Tensor::ones(&[1, 1, 1], dtype);
+            let decay = Tensor::zeros(q.shape(), dtype);
+            let beta = Tensor::ones(v.shape(), dtype);
+            let expected = if dtype == DType::F64 {
+                small as f64
+            } else {
+                0.
+            };
+            let mut output = Tensor::empty(v.shape(), dtype);
+            let mut state = Tensor::empty(&[1, 3, 1], work_dtype(dtype));
+            let backward = kda_backward_requirements(&q, &k, &v, &decay, &beta).unwrap();
+            let allocate = |req: &CpuTensorRequirement| Tensor::empty(&req.shape, req.dtype);
+            let mut dq = allocate(&backward.dq);
+            let mut dk = allocate(&backward.dk);
+            let mut dv = allocate(&backward.dv);
+            let mut ddecay = allocate(&backward.dlog_decay);
+            let mut dbeta = allocate(&backward.dbeta);
+            let mut scratch = allocate(&backward.scratch);
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                kda_forward_into(
+                    &q,
+                    &k,
+                    &v,
+                    &decay,
+                    &beta,
+                    1.,
+                    None,
+                    &mut output.destination().unwrap(),
+                    None,
+                    Some(&mut state.destination().unwrap()),
+                )
+                .unwrap();
+                kda_backward_into(
+                    &q,
+                    &k,
+                    &v,
+                    &decay,
+                    &beta,
+                    &v,
+                    1.,
+                    &mut dq.destination().unwrap(),
+                    &mut dk.destination().unwrap(),
+                    &mut dv.destination().unwrap(),
+                    &mut ddecay.destination().unwrap(),
+                    &mut dbeta.destination().unwrap(),
+                    &mut scratch.destination().unwrap(),
+                )
+                .unwrap();
+            }
+            assert_eq!(scalar(&output), expected);
+            assert_eq!(scalar(&dv), expected);
+            assert_eq!(scalar(&dbeta), expected);
+            let q = q.view(Layout::contiguous(vec![1, 3]));
+            let k = k.view(Layout::contiguous(vec![1, 3]));
+            let decay = decay.view(Layout::contiguous(vec![1, 3]));
+            let v = v.view(Layout::contiguous(vec![1, 1]));
+            let beta = beta.view(Layout::contiguous(vec![1, 1]));
+            let initial = Tensor::zeros(&[1, 3, 1], work_dtype(dtype));
+            let mut output = Tensor::empty(&[1, 1], dtype);
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                kda_decode_into(
+                    &q,
+                    &k,
+                    &v,
+                    &decay,
+                    &beta,
+                    &initial,
+                    1.,
+                    &mut output.destination().unwrap(),
+                    &mut state.destination().unwrap(),
+                )
+                .unwrap();
+            }
+            assert_eq!(scalar(&output), expected);
+        }
     }
 
     #[test]

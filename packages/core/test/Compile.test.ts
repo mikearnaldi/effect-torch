@@ -88,6 +88,7 @@ onDevices("Compile", (device) => (it) => {
         expect(typedPhases.map(({ phase }) => phase)).toEqual([
           "graph_index",
           "optimization",
+          "target_legalization",
           "lowering",
           "lowered_program_validation",
           "memory_planning",

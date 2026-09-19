@@ -26,18 +26,9 @@ onDevices("Dtype", (device) => (it) => {
         const probs = yield* Tensor.toNumberArray(soft)
         expect(probs[0] + probs[1] + probs[2]).toBeCloseTo(1, 2)
         const m = yield* as("bf16", [1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0], [3, 4])
-        if (device !== "cpu") {
-          const [product] = yield* Tensor.compute([yield* Tensor.matmul(a, m)])
-          expect(product.dtype).toBe("bf16")
-        } else {
-          // Candle's Accelerate CPU backend has no bf16 GEMM. It should return
-          // a typed error, not crash or silently upcast.
-          const error = yield* Effect.flip(Effect.gen(function*() {
-            return yield* Tensor.compute([yield* Tensor.matmul(a, m)])
-          }))
-          expect(error._tag).toBe("TensorError")
-          expect(error.message).toMatch(/bf16|bfloat/i)
-        }
+        const [product] = yield* Tensor.compute([yield* Tensor.matmul(a, m)])
+        expect(product.dtype).toBe("bf16")
+        deep(yield* Tensor.toNumberArray(product), [1, 5, 5, 1, 4, 11, 11, 4])
       }))
 
     it.effect("bf16 random init and f32 round-trip", () =>
@@ -51,21 +42,13 @@ onDevices("Dtype", (device) => (it) => {
         expect(back.dtype).toBe("bf16")
       }))
 
-    it.effect("f16 matmul works on Metal and fails with TensorError on CPU", () =>
+    it.effect("f16 matmul preserves f16 outputs on every backend", () =>
       Effect.gen(function*() {
         const a = yield* as("f16", [1, 2, 3, 4, 5, 6], [2, 3])
         const m = yield* as("f16", [1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0], [3, 4])
-        if (device !== "cpu") {
-          const [product] = yield* Tensor.compute([yield* Tensor.matmul(a, m)])
-          expect(product.dtype).toBe("f16")
-          deep(yield* Tensor.toNumberArray(product), [1, 5, 5, 1, 4, 11, 11, 4])
-        } else {
-          const error = yield* Effect.flip(Effect.gen(function*() {
-            return yield* Tensor.compute([yield* Tensor.matmul(a, m)])
-          }))
-          expect(error._tag).toBe("TensorError")
-          expect(error.message).toMatch(/f16/)
-        }
+        const [product] = yield* Tensor.compute([yield* Tensor.matmul(a, m)])
+        expect(product.dtype).toBe("f16")
+        deep(yield* Tensor.toNumberArray(product), [1, 5, 5, 1, 4, 11, 11, 4])
       }))
 
     it.effect("a 0-d float scalar never promotes a float tensor's dtype", () =>
@@ -83,20 +66,22 @@ onDevices("Dtype", (device) => (it) => {
         deep(yield* Tensor.toNumberArray(summed), [4, 6])
       }))
 
-    it.effect("guarded ops state their dtype requirements", () =>
+    it.effect("half attention and cross-entropy preserve their declared dtype", () =>
       Effect.gen(function*() {
         const q = yield* as("f16", [1, 0, 0, 1], [1, 1, 2, 2])
-        const error = yield* Effect.flip(Effect.gen(function*() {
-          return yield* Tensor.compute([yield* Tensor.scaledDotProductAttention(q, q, q, { causal: true })])
-        }))
-        expect(error.message).toMatch(/dtype must be f32, f64 or bf16, got f16/)
-        // bf16 cross-entropy runs on both devices (fused kernel with f32
-        // accumulation on Metal, composed on CPU)
-        const logits = yield* as("bf16", [1, 2, 3, 4, 5, 6], [2, 3])
+        const [attention] = yield* Tensor.compute([
+          yield* Tensor.scaledDotProductAttention(q, q, q, { causal: true })
+        ])
+        expect(attention.dtype).toBe("f16")
+        expect((yield* Tensor.toNumberArray(attention)).slice(0, 2)).toEqual([1, 0])
         const target = yield* Tensor.fromTypedArray(new Uint32Array([0, 2]), [2])
-        const [loss] = yield* Tensor.compute([yield* Tensor.crossEntropy(logits, { target })])
-        const [v] = yield* Tensor.toNumberArray(loss)
-        expect(v).toBeGreaterThan(0)
+        for (const dtype of ["f16", "bf16"] as const) {
+          const logits = yield* as(dtype, [1, 2, 3, 4, 5, 6], [2, 3])
+          const [loss] = yield* Tensor.compute([yield* Tensor.crossEntropy(logits, { target })])
+          expect(loss.dtype).toBe(dtype)
+          const [v] = yield* Tensor.toNumberArray(loss)
+          expect(v).toBeCloseTo(1.407605964, dtype === "bf16" ? 2 : 3)
+        }
       }))
   })
 

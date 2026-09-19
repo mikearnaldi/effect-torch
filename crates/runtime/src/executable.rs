@@ -20,6 +20,28 @@ pub struct CompilePhaseTiming {
     pub nanoseconds: u64,
 }
 
+/// Target identity summary and structural dtype-legalization work for an executable.
+///
+/// The compiler fills this immutable snapshot from its selected target and plan.
+/// Runtime does not depend on compiler types. Counts describe the compiled plan,
+/// not invocation activity; timing remains in [`CompilePhaseTiming`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct DTypeLegalizationDiagnostics {
+    pub target_backend: String,
+    pub target_architecture: String,
+    pub lowering_abi_revision: u64,
+    pub policy_revision: u64,
+    pub capability_queries: usize,
+    pub native_lowering_units: usize,
+    pub legalized_lowering_units: usize,
+    pub kernel_local_legalizations: usize,
+    pub materialized_conversions: usize,
+    /// Sum of declared conversion-value bytes, rather than peak live bytes.
+    pub materialized_conversion_bytes: usize,
+    pub decompositions: usize,
+    pub rejected_region_candidates: usize,
+}
+
 /// Statistics for one compiled executable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ExecutableDiagnostics {
@@ -30,5 +52,6 @@ pub struct ExecutableDiagnostics {
     pub command_count: usize,
     pub synchronization_count: usize,
     pub memory: MemoryReport,
+    pub legalization: DTypeLegalizationDiagnostics,
     pub compile_phases: Box<[CompilePhaseTiming]>,
 }

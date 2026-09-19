@@ -3,6 +3,8 @@
 //! [`parse_gguf`] reads the magic, version, metadata table, and tensor
 //! catalog. It returns a [`GgufFile`] with each tensor's logical shape,
 //! on-disk format, and absolute byte range without reading tensor payloads.
+//! [`GgufFile::select_tensors`] validates a named selection before a backend
+//! allocates storage. It preserves the selected descriptors and file offsets.
 //! [`read_gguf_tensor_into`] uses positioned reads to load one payload into
 //! a caller-owned buffer. Multiple threads can therefore read the same file.
 //!
@@ -51,7 +53,10 @@
 //! returns [`GgufParseError::Cancelled`]. Cancellation may leave part of the
 //! caller's output buffer written.
 
-use crate::CancellationFlag;
+use crate::{
+    CancellationFlag, DType, GgmlKQuant, LayoutConstraintSpec, PackedFormat, StorageMetadata,
+    StorageRepresentation, StorageSpec, ValueSpec,
+};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
@@ -191,62 +196,6 @@ pub struct GgufMetadataEntry {
     pub value: GgufMetadataValue,
 }
 
-/// A GGML K-quant block encoding (256 values per block).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GgmlKQuant {
-    Q2K,
-    Q3K,
-    Q4K,
-    Q5K,
-    Q6K,
-}
-
-impl GgmlKQuant {
-    /// Returns the canonical GGML encoding name, such as `"Q4_K"`.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Q2K => "Q2_K",
-            Self::Q3K => "Q3_K",
-            Self::Q4K => "Q4_K",
-            Self::Q5K => "Q5_K",
-            Self::Q6K => "Q6_K",
-        }
-    }
-
-    /// Parses a canonical GGML name, or returns `None` if it is unknown.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "Q2_K" => Some(Self::Q2K),
-            "Q3_K" => Some(Self::Q3K),
-            "Q4_K" => Some(Self::Q4K),
-            "Q5_K" => Some(Self::Q5K),
-            "Q6_K" => Some(Self::Q6K),
-            _ => None,
-        }
-    }
-
-    // GGML K-quant layouts pack this many bytes per 256-element block.
-    fn block_bytes(self) -> usize {
-        match self {
-            Self::Q2K => 84,
-            Self::Q3K => 110,
-            Self::Q4K => 144,
-            Self::Q5K => 176,
-            Self::Q6K => 210,
-        }
-    }
-
-    /// Returns the packed byte length of a `columns`-element logical row.
-    /// Returns `None` if `columns` is not a multiple of 256 or the result
-    /// overflows.
-    pub fn encoded_row_bytes(self, columns: usize) -> Option<usize> {
-        columns
-            .is_multiple_of(256)
-            .then(|| (columns / 256).checked_mul(self.block_bytes()))
-            .flatten()
-    }
-}
-
 /// On-disk encoding of a tensor: dense little-endian `F32` or one of the
 /// supported K-quants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,8 +236,34 @@ impl GgufTensorFormat {
         }
     }
 
-    fn block_bytes(self) -> Option<usize> {
-        self.quantization().map(GgmlKQuant::block_bytes)
+    /// Exact logical storage representation of this on-disk format.
+    pub fn representation(self) -> StorageRepresentation {
+        match self {
+            Self::F32 => StorageRepresentation::Dense,
+            Self::Q2K => StorageRepresentation::Packed(PackedFormat::GgmlKQuant(GgmlKQuant::Q2K)),
+            Self::Q3K => StorageRepresentation::Packed(PackedFormat::GgmlKQuant(GgmlKQuant::Q3K)),
+            Self::Q4K => StorageRepresentation::Packed(PackedFormat::GgmlKQuant(GgmlKQuant::Q4K)),
+            Self::Q5K => StorageRepresentation::Packed(PackedFormat::GgmlKQuant(GgmlKQuant::Q5K)),
+            Self::Q6K => StorageRepresentation::Packed(PackedFormat::GgmlKQuant(GgmlKQuant::Q6K)),
+        }
+    }
+
+    pub fn storage(self) -> StorageMetadata {
+        StorageMetadata {
+            representation: self.representation(),
+            layout: crate::StorageLayout::Canonical,
+        }
+    }
+
+    pub fn value_spec(self, logical_shape: &[usize]) -> ValueSpec<'_> {
+        ValueSpec {
+            semantic_dtype: DType::F32,
+            logical_shape,
+            storage: StorageSpec {
+                representation: self.representation(),
+                layout_constraint: LayoutConstraintSpec::Canonical,
+            },
+        }
     }
 
     /// The K-quant encoding of this format, or `None` for `F32`.
@@ -322,6 +297,15 @@ pub struct GgufTensorDescriptor {
 }
 
 impl GgufTensorDescriptor {
+    /// The logical value contract. Physical geometry is derived from this format.
+    pub fn value_spec(&self) -> ValueSpec<'_> {
+        self.format.value_spec(&self.logical_shape)
+    }
+
+    pub fn storage(&self) -> StorageMetadata {
+        self.format.storage()
+    }
+
     /// Absolute file offset of the tensor's payload.
     pub fn data_offset(&self) -> u64 {
         self.data_offset
@@ -339,6 +323,58 @@ pub struct GgufFile {
     pub architecture: String,
     pub metadata: Vec<GgufMetadataEntry>,
     pub tensors: Vec<GgufTensorDescriptor>,
+}
+
+impl GgufFile {
+    /// Selects descriptors in archive order without reading tensor payloads.
+    /// `None` selects all tensors; an empty slice selects none. Every requested
+    /// name must be non-empty, unique, and present in the parsed catalog.
+    ///
+    /// Call this after [`parse_gguf`] and before allocating any payload storage.
+    /// Selection does not relax validation of unselected tensor formats, shapes,
+    /// or ranges. All requested names are checked before descriptors are returned.
+    pub fn select_tensors(
+        mut self,
+        names: Option<&[String]>,
+        cancellation: Option<&CancellationFlag>,
+    ) -> Result<Vec<GgufTensorDescriptor>, GgufParseError> {
+        if cancellation.is_some_and(CancellationFlag::is_cancelled) {
+            return Err(GgufParseError::Cancelled);
+        }
+        let Some(names) = names else {
+            return Ok(self.tensors);
+        };
+        let mut requested = HashSet::new();
+        requested
+            .try_reserve(names.len())
+            .map_err(|_| GgufParseError::invalid("tensor selection is too large"))?;
+        for name in names {
+            if cancellation.is_some_and(CancellationFlag::is_cancelled) {
+                return Err(GgufParseError::Cancelled);
+            }
+            if name.is_empty() {
+                return Err(GgufParseError::invalid(
+                    "selected tensor name must not be empty",
+                ));
+            }
+            if !requested.insert(name.as_str()) {
+                return Err(GgufParseError::invalid(format!(
+                    "duplicate selected tensor name {name:?}"
+                )));
+            }
+        }
+        self.tensors
+            .retain(|tensor| requested.remove(tensor.name.as_str()));
+        if cancellation.is_some_and(CancellationFlag::is_cancelled) {
+            return Err(GgufParseError::Cancelled);
+        }
+        if let Some(name) = names.iter().find(|name| requested.contains(name.as_str())) {
+            return Err(GgufParseError::invalid(format!(
+                "unknown selected tensor name {name:?}"
+            )));
+        }
+        Ok(self.tensors)
+    }
 }
 
 // Bounds-checked cursor over the header. `position` cannot exceed `file_len`
@@ -643,14 +679,6 @@ struct RawTensorDescriptor {
     relative_offset: u64,
 }
 
-fn checked_product(values: &[usize], what: &str) -> Result<usize, GgufParseError> {
-    values.iter().try_fold(1usize, |total, &value| {
-        total
-            .checked_mul(value)
-            .ok_or_else(|| GgufParseError::invalid(format!("{what} size overflows")))
-    })
-}
-
 // The caller checks that `alignment` is a non-zero power of two. The mask
 // round-up is exact. Only the addition can overflow.
 fn align_up(value: u64, alignment: u64) -> Result<u64, GgufParseError> {
@@ -851,40 +879,13 @@ pub fn parse_gguf(
     for raw in raw_tensors {
         let mut logical_shape = raw.dimensions.clone();
         logical_shape.reverse();
-        let (physical_shape, byte_len) = match raw.format.block_bytes() {
-            None => {
-                let elements = checked_product(&logical_shape, &format!("tensor {:?}", raw.name))?;
-                let byte_len = elements.checked_mul(4).ok_or_else(|| {
-                    GgufParseError::invalid(format!("tensor {:?} byte length overflows", raw.name))
-                })?;
-                (logical_shape.clone(), byte_len)
-            }
-            Some(block_bytes) => {
-                let columns = raw.dimensions[0];
-                if columns % 256 != 0 {
-                    return Err(GgufParseError::invalid(format!(
-                        "tensor {:?} least-major dimension {columns} is not divisible by 256 for {}",
-                        raw.name,
-                        raw.format.name()
-                    )));
-                }
-                let rows = checked_product(
-                    &raw.dimensions[1..],
-                    &format!("tensor {:?} row count", raw.name),
-                )?;
-                let encoded_row_bytes =
-                    (columns / 256).checked_mul(block_bytes).ok_or_else(|| {
-                        GgufParseError::invalid(format!(
-                            "tensor {:?} encoded row length overflows",
-                            raw.name
-                        ))
-                    })?;
-                let byte_len = rows.checked_mul(encoded_row_bytes).ok_or_else(|| {
-                    GgufParseError::invalid(format!("tensor {:?} byte length overflows", raw.name))
-                })?;
-                (vec![rows, encoded_row_bytes], byte_len)
-            }
-        };
+        let geometry = raw
+            .format
+            .value_spec(&logical_shape)
+            .canonical_geometry()
+            .map_err(|error| GgufParseError::invalid(format!("tensor {:?}: {error}", raw.name)))?;
+        let physical_shape = geometry.physical_shape;
+        let byte_len = geometry.byte_len;
         let data_offset = data_start
             .checked_add(raw.relative_offset)
             .ok_or_else(|| GgufParseError::invalid("absolute tensor offset overflows"))?;
@@ -1000,6 +1001,10 @@ fn read_exact_at(file: &File, output: &mut [u8], offset: u64) -> Result<(), Gguf
 }
 
 #[cfg(test)]
+#[path = "gguf/test_fixture.rs"]
+mod test_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
@@ -1007,6 +1012,112 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn named_selection_preserves_descriptors_in_archive_order() {
+        let mut fixture = test_fixture::SparseGguf::new(4);
+        let parsed = parse_gguf(&mut fixture.file, None).unwrap();
+        assert_eq!(
+            parsed.clone().select_tensors(None, None).unwrap(),
+            parsed.tensors,
+        );
+        assert!(parsed
+            .clone()
+            .select_tensors(Some(&[]), None)
+            .unwrap()
+            .is_empty());
+        let selected = parsed
+            .clone()
+            .select_tensors(Some(&["packed".into(), "dense".into()]), None)
+            .unwrap();
+        assert_eq!(selected, parsed.tensors[1..]);
+    }
+
+    #[test]
+    fn unselected_tensor_formats_and_geometry_still_require_validation() {
+        let mut fixture = test_fixture::SparseGguf::new(4);
+        for (format, expected) in [(1, "unsupported GGML"), (12, "256-value block")] {
+            fixture.set_unused_format(format);
+            for names in [vec![], vec!["dense".into()]] {
+                let error = parse_gguf(&mut fixture.file, None)
+                    .and_then(|parsed| parsed.select_tensors(Some(&names), None))
+                    .unwrap_err();
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn named_selection_rejects_missing_duplicate_and_empty_names() {
+        let mut fixture = test_fixture::SparseGguf::new(4);
+        let parsed = parse_gguf(&mut fixture.file, None).unwrap();
+        fixture.file.set_len(0).unwrap();
+        for (names, message) in [
+            (vec!["dense".into(), "missing".into()], "unknown selected"),
+            (vec!["dense".into(), "dense".into()], "duplicate selected"),
+            (vec!["dense".into(), "".into()], "must not be empty"),
+        ] {
+            let error = parsed
+                .clone()
+                .select_tensors(Some(&names), None)
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn selected_payloads_read_original_offsets_after_unused_8_gib_is_truncated() {
+        let mut fixture = test_fixture::SparseGguf::new(1 << 33);
+        let parsed = parse_gguf(&mut fixture.file, None).unwrap();
+        assert_eq!(parsed.tensors[0].byte_len(), 1 << 33);
+        fixture.truncate_unused();
+        // Reparsing must still reject the now-invalid range of the unused tensor.
+        assert!(parse_gguf(&mut fixture.file, None).is_err());
+        let selected = parsed
+            .select_tensors(Some(&["packed".into(), "dense".into()]), None)
+            .unwrap();
+        assert_eq!(selected[0].data_offset(), fixture.data_start + 32);
+        assert_eq!(selected[1].data_offset(), fixture.data_start + 128);
+        for (tensor, expected) in selected.iter().zip([&fixture.dense, &fixture.packed]) {
+            let mut bytes = vec![0; tensor.byte_len()];
+            read_gguf_tensor_into(&fixture.file, tensor, &mut bytes, None).unwrap();
+            assert_eq!(&bytes, expected);
+        }
+        assert_eq!(selected[1].logical_shape, [2, 256]);
+        assert_eq!(selected[1].physical_shape, [2, 144]);
+        assert_eq!(selected[1].value_spec().semantic_dtype, DType::F32);
+        assert_eq!(
+            selected[1].storage().representation,
+            StorageRepresentation::Packed(PackedFormat::GgmlKQuant(GgmlKQuant::Q4K)),
+        );
+    }
+
+    #[test]
+    fn selection_and_selected_reads_observe_cancellation() {
+        let mut fixture = test_fixture::SparseGguf::new(4);
+        let parsed = parse_gguf(&mut fixture.file, None).unwrap();
+        let cancelled = CancellationFlag::new();
+        cancelled.cancel();
+        for names in [None, Some(vec![]), Some(vec!["dense".into()])] {
+            assert!(matches!(
+                parsed
+                    .clone()
+                    .select_tensors(names.as_deref(), Some(&cancelled)),
+                Err(GgufParseError::Cancelled),
+            ));
+        }
+        let mut bytes = [0xa5; 8];
+        assert!(matches!(
+            read_gguf_tensor_into(
+                &fixture.file,
+                &parsed.tensors[1],
+                &mut bytes,
+                Some(&cancelled),
+            ),
+            Err(GgufParseError::Cancelled),
+        ));
+        assert_eq!(bytes, [0xa5; 8]);
+    }
 
     #[derive(Clone)]
     struct TensorFixture {

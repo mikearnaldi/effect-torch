@@ -20,7 +20,7 @@
 //! not affect artifacts.
 
 use effect_torch_graph::{node_children, Device, Node as GraphNode, NodeKind as GraphNodeKind};
-use effect_torch_runtime::{DType, DenseId};
+use effect_torch_runtime::{DType, DenseId, StorageMetadata};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -89,6 +89,7 @@ pub struct ProgramSlot {
     pub scalar: bool,
     pub shape: Vec<usize>,
     pub dtype: DType,
+    pub storage: StorageMetadata,
     pub device: Device,
 }
 
@@ -125,12 +126,14 @@ fn collect_program_slots_from_order(
                 shape,
                 dtype,
                 device,
+                storage,
             } => Some((
                 *slot,
                 ProgramSlot {
                     scalar: false,
                     shape: shape.clone(),
                     dtype: *dtype,
+                    storage: storage.clone(),
                     device: device.clone(),
                 },
             )),
@@ -144,6 +147,7 @@ fn collect_program_slots_from_order(
                     scalar: true,
                     shape: vec![],
                     dtype: *dtype,
+                    storage: StorageMetadata::dense(),
                     device: device.clone(),
                 },
             )),
@@ -160,6 +164,7 @@ fn collect_program_slots_from_order(
                     if existing.scalar != declared.scalar
                         || existing.shape != declared.shape
                         || existing.dtype != declared.dtype
+                        || existing.storage != declared.storage
                         || existing.device != declared.device
                     {
                         return Err(format!(
@@ -305,6 +310,7 @@ pub struct GeneratedBinding {
     pub slot_identity: usize,
     pub shape: Vec<usize>,
     pub dtype: DType,
+    pub storage: StorageMetadata,
     pub device: Device,
 }
 
@@ -336,6 +342,9 @@ pub struct GraphIndexWork {
 pub struct GraphIndex {
     /// Deduplicated semantic nodes in deterministic postorder.
     pub order: Box<[Arc<Node>]>,
+    /// Materialization constraints, refined from caller binding ABIs during
+    /// preparation without changing semantic node metadata or identity.
+    pub value_storage: Box<[StorageMetadata]>,
     /// Semantic node ID to dense ID, for every node in `order`.
     pub dense_by_node: HashMap<u64, DenseNodeId>,
     /// Direct children of each node, in caller order, duplicate edges kept.
@@ -436,6 +445,7 @@ impl GraphIndex {
                     slot_identity: Arc::as_ptr(slot) as usize,
                     shape: node.shape.clone(),
                     dtype: node.dtype,
+                    storage: node.storage.clone(),
                     device: node.device.clone(),
                 }),
                 NodeKind::Randn { .. } | NodeKind::Uniform { .. } => {
@@ -464,6 +474,7 @@ impl GraphIndex {
                 semantic_node_visits: order.len(),
                 graph_edge_visits: edge_visits,
             },
+            value_storage: order.iter().map(|node| node.storage.clone()).collect(),
             order: order.into_boxed_slice(),
             dense_by_node,
             children: children.into_boxed_slice(),
@@ -492,6 +503,16 @@ impl GraphIndex {
         self.order.get(id.index())
     }
 
+    /// Complete graph value with the prepared binding layout constraint.
+    pub fn value_spec(&self, id: DenseNodeId) -> Option<effect_torch_runtime::ValueSpec<'_>> {
+        let node = self.node(id)?;
+        Some(effect_torch_runtime::ValueSpec {
+            semantic_dtype: node.dtype,
+            logical_shape: &node.shape,
+            storage: self.value_storage.get(id.index())?.as_spec(),
+        })
+    }
+
     /// Direct children of a dense node, in caller order.
     pub fn children_of(&self, id: DenseNodeId) -> Option<&[DenseNodeId]> {
         self.children.get(id.index()).map(Box::as_ref)
@@ -513,6 +534,9 @@ mod tests {
     struct TestLeaf;
 
     impl LeafValue for TestLeaf {
+        fn storage(&self) -> StorageMetadata {
+            StorageMetadata::dense()
+        }
         fn shape(&self) -> Vec<usize> {
             vec![1]
         }
@@ -532,6 +556,7 @@ mod tests {
 
     fn input(slot: u32) -> Arc<Node> {
         Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot,
             shape: vec![1],
             dtype: DType::F32,
@@ -761,6 +786,7 @@ mod tests {
 
         let first = input(0);
         let second = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,

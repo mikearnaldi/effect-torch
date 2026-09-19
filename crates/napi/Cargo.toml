@@ -9,4 +9,7 @@ crate-type = ["rlib"]
 [dependencies]
 effect-torch-runtime = { path = "../runtime" }
 napi = { version = "3", features = ["async"] }
+safetensors = "0.6"
+serde = "1"
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync", "macros"] }

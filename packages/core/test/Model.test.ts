@@ -1,12 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import { Effect } from "effect"
-import * as fs from "node:fs"
-import * as os from "node:os"
-import * as path from "node:path"
 import { Gradient, Model, type Runtime, Tensor } from "../src/index.ts"
 import { deep, floats, onDevices } from "./utils/devices.ts"
-
-const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
@@ -748,73 +743,6 @@ onDevices("Model", () => (it) => {
           )
         ])
         deep(yield* values(viaMapped), yield* values(byHand))
-      }))
-  })
-
-  describe("serialization", () => {
-    it.effect("save/load round-trips values and order", () =>
-      Effect.gen(function*() {
-        const dir = yield* tmpdir
-        const file = path.join(dir, "mlp.safetensors")
-        const model = yield* mlp
-        const params = yield* Tensor.compute(yield* Model.initialize(model))
-        yield* Model.save(model, params, file)
-        const loaded = yield* Model.load(model, file)
-        expect(loaded.length).toBe(model.parameterSpecs.map(({ name }) => name).length)
-        for (let i = 0; i < params.length; i++) {
-          expect(loaded[i].shape).toEqual(params[i].shape)
-          deep(yield* values(loaded[i]), yield* values(params[i]))
-        }
-        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
-        const [before] = yield* Tensor.compute([yield* model.forward(params, x)])
-        const [after] = yield* Tensor.compute([yield* model.forward(loaded, x)])
-        deep(yield* values(after), yield* values(before))
-      }))
-
-    it.effect("save fails with ModelError on an arity mismatch", () =>
-      Effect.gen(function*() {
-        const dir = yield* tmpdir
-        const model = yield* mlp
-        const params = yield* Tensor.compute(yield* Model.initialize(model))
-        const error = yield* Effect.flip(Model.save(model, params.slice(0, 3), path.join(dir, "x.safetensors")))
-        expect(error._tag).toBe("ModelError")
-        expect(error.op).toBe("save")
-        expect(error.message).toContain("4 parameters, got 3")
-      }))
-
-    it.effect("load fails with ModelError on missing keys", () =>
-      Effect.gen(function*() {
-        const dir = yield* tmpdir
-        const file = path.join(dir, "partial.safetensors")
-        const small = yield* Model.linear("fc1", 2, 8)
-        const params = yield* Tensor.compute(yield* Model.initialize(small))
-        yield* Model.save(small, params, file)
-        const error = yield* Effect.flip(Model.load(yield* mlp, file))
-        expect(error._tag).toBe("ModelError")
-        expect(error.op).toBe("load")
-        expect(error.message).toContain("fc2.weight")
-      }))
-
-    it.effect("params from a different architecture fail at graph-build time", () =>
-      Effect.gen(function*() {
-        const dir = yield* tmpdir
-        const file = path.join(dir, "wide.safetensors")
-        const wide = yield* Model.chain(
-          yield* Model.linear("fc1", 3, 8),
-          yield* Model.tanh,
-          yield* Model.linear("fc2", 8, 1)
-        )
-        yield* Model.save(wide, yield* Tensor.compute(yield* Model.initialize(wide)), file)
-        const narrow = yield* Model.chain(
-          yield* Model.linear("fc1", 2, 8),
-          yield* Model.tanh,
-          yield* Model.linear("fc2", 8, 1)
-        )
-        const params = yield* Model.load(narrow, file)
-        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
-        const error = yield* Effect.flip(narrow.forward(params, x))
-        expect(error._tag).toBe("TensorError")
-        expect(error.op).toBe("linear")
       }))
   })
 })

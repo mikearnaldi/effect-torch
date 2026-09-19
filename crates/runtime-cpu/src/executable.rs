@@ -32,6 +32,7 @@
 //! `uniform` node records its provenance at compile time. `random_seed`
 //! mixes that provenance with the invocation nonce.
 
+use crate::capabilities::CpuDTypeCapabilities;
 use crate::composed::{
     AdamWRequirements, ChunkedHeadCeBackwardRequirements, ChunkedHeadCeForwardRequirements,
     CrossEntropyBackwardRequirements, CrossEntropyForwardRequirements, KdaBackwardRequirements,
@@ -51,10 +52,12 @@ use crate::{
 };
 use crate::{ExecutableAllocationGuard, Tensor, CPU_STORAGE_ALIGNMENT};
 use effect_torch_compiler::{
-    build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport, DenseNodeId,
-    DiagnosticsInput, Expr, GraphIndex, InstructionEffects, LoweredInstruction, LoweredProgram,
-    LoweredValue, LoweringUnit, MemoryPlannerConfig, NativeRegion, OptimizationPlan, OutputDecl,
-    PreparedProgram, ProgramRequest, ProgramSlot, RegionId, StateCursorSlot, ValueDecl,
+    build_executable_diagnostics, legalize_region_expressions, CompileOptions, CompilerDriver,
+    CompilerWorkReport, DenseNodeId, DiagnosticsInput, ExecutableDTypePlan, ExecutionRealization,
+    Expr, GraphIndex, InstructionEffects, LoweredInstruction, LoweredProgram, LoweredValue,
+    LoweringUnit, MemoryPlannerConfig, NativeRegion, OperandInterpretation, OperandPreparation,
+    OptimizationPlan, OutputDecl, PreparedProgram, ProgramRequest, ProgramSlot, RegionId,
+    ResultCompletion, StateCursorSlot, TargetDTypeCapabilities, TargetFingerprint, ValueDecl,
     ValueStorage, ValueUse, ARTIFACT_ASSEMBLY_PHASE, PHYSICAL_PLANNING_PHASE, PUBLICATION_PHASE,
 };
 use effect_torch_graph::{
@@ -89,8 +92,11 @@ pub enum CpuBindingSource {
 }
 
 /// Maps a program value to the invocation binding that supplies it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuBinding {
+    pub semantic_shape: Vec<usize>,
+    pub semantic_dtype: DType,
+    pub storage: effect_torch_runtime::StorageMetadata,
     pub value: ValueId,
     pub source: CpuBindingSource,
 }
@@ -598,6 +604,8 @@ pub enum CpuPhysicalCommand {
 /// command schedule, bindings, constants, a memory plan, and diagnostics.
 /// Invocations share it through `Arc`.
 pub struct CpuExecutable {
+    pub target: TargetFingerprint,
+    pub policy_revision: u64,
     pub signature: ProgramSignature,
     pub program: Arc<LoweredProgram<CpuInstruction, NativeMemorySpace, CpuLoweredValue>>,
     pub physical: Box<[CpuPhysicalCommand]>,
@@ -671,6 +679,8 @@ impl CpuGeneratedValue {
 }
 
 struct Lowerer {
+    materialized_conversions: usize,
+    materialized_conversion_bytes: usize,
     values: Vec<CpuValueMetadata>,
     storage: Vec<CpuValueStorage>,
     names: Vec<String>,
@@ -739,6 +749,8 @@ impl Lowerer {
             .collect();
         Self {
             values: Vec::new(),
+            materialized_conversions: 0,
+            materialized_conversion_bytes: 0,
             storage: Vec::new(),
             names: Vec::new(),
             bindings: Vec::new(),
@@ -1030,41 +1042,7 @@ impl Lowerer {
                 }
                 CpuAlgorithmPlan::Solve(requirements)
             }
-            CpuOp::Binary(kind) => {
-                if matches!(
-                    kind,
-                    CpuBinaryOp::Add
-                        | CpuBinaryOp::Sub
-                        | CpuBinaryOp::Mul
-                        | CpuBinaryOp::Div
-                        | CpuBinaryOp::Eq
-                        | CpuBinaryOp::Gt
-                        | CpuBinaryOp::Lt
-                        | CpuBinaryOp::Ge
-                        | CpuBinaryOp::Le
-                        | CpuBinaryOp::Maximum
-                        | CpuBinaryOp::Minimum
-                ) {
-                    let operand_dtype = inputs
-                        .iter()
-                        .map(|input| &self.values[input.index()])
-                        .find(|input| !input.shape.is_empty())
-                        .map_or(self.values[inputs[0].index()].dtype, |input| input.dtype);
-                    for (input_index, input) in inputs.iter().enumerate() {
-                        let declaration = &self.values[input.index()];
-                        if declaration.dtype != operand_dtype && declaration.shape.is_empty() {
-                            let requirement = CpuTensorRequirement::new(&[], operand_dtype);
-                            let value = self.requirement_value(
-                                &requirement,
-                                SegmentOwnership::InvocationStaging,
-                                format!("command_{index}_scalar_{input_index}"),
-                            )?;
-                            staging.push(value);
-                        }
-                    }
-                }
-                CpuAlgorithmPlan::None
-            }
+            CpuOp::Binary(_) => CpuAlgorithmPlan::None,
             CpuOp::Argmax { .. } | CpuOp::Argmin { .. } => {
                 let dimension = match &op {
                     CpuOp::Argmax { dim } | CpuOp::Argmin { dim } => *dim,
@@ -1617,8 +1595,8 @@ impl Lowerer {
 
     fn constant(&mut self, node: &Arc<Node>, payload: Value) -> Result<(), String> {
         let value = self.value_with_layout(
-            &node.shape,
-            node.dtype,
+            payload.tensor().shape(),
+            payload.tensor().dtype(),
             payload.tensor().layout.clone(),
             CpuValueStorage::Constant,
             "constant",
@@ -1728,11 +1706,19 @@ impl Lowerer {
         index: &GraphIndex,
         plan: &OptimizationPlan,
         region_id: RegionId,
+        dtype_plan: &ExecutableDTypePlan,
     ) -> Result<(), String> {
         let region = plan
             .regions
             .get(region_id.index())
             .ok_or_else(|| format!("compile: optimization region {region_id} is out of range"))?;
+        if !matches!(
+            dtype_plan.execution().realization,
+            ExecutionRealization::DirectKernel | ExecutionRealization::KernelLocal
+        ) {
+            return Err("compile: CPU region cannot realize materialized transformations".into());
+        }
+        let expressions = legalize_region_expressions(region, dtype_plan)?;
         let (op, inputs, outputs) = match region {
             NativeRegion::Elementwise(region) => {
                 if !region.device.is_cpu() {
@@ -1758,7 +1744,7 @@ impl Lowerer {
                     CpuOp::FusedElementwise {
                         strides,
                         shape: region.shape.clone(),
-                        exprs: vec![region.output.expression.clone()].into_boxed_slice(),
+                        exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -1788,7 +1774,7 @@ impl Lowerer {
                     CpuOp::FusedReduce {
                         strides,
                         in_shape: region.input_shape.clone(),
-                        expr: region.expression.clone(),
+                        expr: expressions[0].clone(),
                         op: region.op,
                         dims: region.dims.clone(),
                         keepdims: region.keepdims,
@@ -1827,11 +1813,7 @@ impl Lowerer {
                     CpuOp::FusedElementwise {
                         strides,
                         shape: region.shape.clone(),
-                        exprs: region
-                            .outputs
-                            .iter()
-                            .map(|output| output.expression.clone())
-                            .collect(),
+                        exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -1859,7 +1841,7 @@ impl Lowerer {
                         eps: region.options.eps,
                         weight_decay: region.options.weight_decay,
                         implementation: OptimizerImplementation::Fused,
-                        fused_exprs: Some(region.expressions.clone()),
+                        fused_exprs: Some(expressions.clone()),
                     },
                     inputs,
                     outputs,
@@ -1895,7 +1877,7 @@ impl Lowerer {
                 (
                     CpuOp::AdamWGroup {
                         parameters: region.parameter_inputs.len(),
-                        fused_exprs: region.expressions.clone(),
+                        fused_exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -1931,7 +1913,7 @@ impl Lowerer {
                         nesterov: region.options.nesterov,
                         weight_decay: region.options.weight_decay,
                         implementation: OptimizerImplementation::Fused,
-                        fused_exprs: Some(region.expressions.clone()),
+                        fused_exprs: Some(expressions.clone()),
                     },
                     inputs,
                     outputs,
@@ -1955,7 +1937,12 @@ impl Lowerer {
         self.bind_region_outputs(index, plan, region_id, region, &outputs)
     }
 
-    fn lower(&mut self, node: &Arc<Node>) -> Result<(), String> {
+    fn lower(
+        &mut self,
+        node: &Arc<Node>,
+        boundary_storage: &effect_torch_runtime::StorageMetadata,
+        dtype_plan: &ExecutableDTypePlan,
+    ) -> Result<(), String> {
         if !node.device.is_cpu() {
             return Err(format!(
                 "compile: CPU lowering does not support device {}",
@@ -1972,7 +1959,11 @@ impl Lowerer {
                     node.id
                 )
             })?;
-        validate_cpu_support(node)?;
+        if dtype_plan.execution().operations.len() != 1 {
+            return Err(
+                "compile: independent CPU operation requires exactly one dtype plan".into(),
+            );
+        }
 
         match &node.kind {
             NodeKind::Leaf(slot) => {
@@ -2004,8 +1995,8 @@ impl Lowerer {
                 let generated = u32::try_from(self.generated.len())
                     .map_err(|_| "compile: too many generated bindings".to_string())?;
                 let value = self.value_with_layout(
-                    &node.shape,
-                    node.dtype,
+                    payload.tensor().shape(),
+                    payload.tensor().dtype(),
                     payload.tensor().layout.clone(),
                     CpuValueStorage::External,
                     format!("generated_binding_{generated}"),
@@ -2013,6 +2004,9 @@ impl Lowerer {
                 self.generated.push(payload);
                 self.generated_slots.push(Arc::as_ptr(slot) as usize);
                 self.bindings.push(CpuBinding {
+                    semantic_shape: node.shape.clone(),
+                    semantic_dtype: node.dtype,
+                    storage: node.storage.clone(),
                     value,
                     source: CpuBindingSource::Generated(generated),
                 });
@@ -2020,6 +2014,7 @@ impl Lowerer {
                 return Ok(());
             }
             NodeKind::Input { slot, .. } | NodeKind::ScalarInput { slot, .. } => {
+                let geometry = node.value_spec().canonical_geometry()?;
                 let value = match self.declared_values.get(slot).copied() {
                     Some(value) => value,
                     None => {
@@ -2044,9 +2039,18 @@ impl Lowerer {
                             && self
                                 .state
                                 .is_some_and(|state| node.shape.first() == Some(&state.batch));
-                        let value = self.value(
-                            &node.shape,
-                            node.dtype,
+                        let layout = match &boundary_storage.layout {
+                            effect_torch_runtime::StorageLayout::DenseStrided(layout) => {
+                                layout.clone()
+                            }
+                            _ => effect_torch_runtime::Layout::contiguous(
+                                geometry.physical_shape.clone(),
+                            ),
+                        };
+                        let value = self.value_with_layout(
+                            &geometry.physical_shape,
+                            geometry.physical_dtype,
+                            layout,
                             if matches!(
                                 source,
                                 CpuDeclaredSource::Scalar(_) | CpuDeclaredSource::StateCursor
@@ -2070,6 +2074,9 @@ impl Lowerer {
                                         .push(CpuPaddedBinding { value, source });
                                 } else {
                                     self.bindings.push(CpuBinding {
+                                        semantic_shape: node.shape.clone(),
+                                        semantic_dtype: node.dtype,
+                                        storage: boundary_storage.clone(),
                                         value,
                                         source: CpuBindingSource::Declared(source),
                                     });
@@ -2085,7 +2092,9 @@ impl Lowerer {
                     }
                 };
                 let declaration = &self.values[value.index()];
-                if declaration.shape.as_ref() != node.shape || declaration.dtype != node.dtype {
+                if declaration.shape.as_ref() != geometry.physical_shape
+                    || declaration.dtype != geometry.physical_dtype
+                {
                     return Err(format!(
                         "compile: slot {slot} is used with conflicting signatures"
                     ));
@@ -2101,10 +2110,10 @@ impl Lowerer {
                 return self.constant(node, payload);
             }
             NodeKind::Zeros { shape, dtype, .. } => {
-                return self.constant(node, Value(Tensor::zeros(shape, *dtype)));
+                return self.constant(node, Value::dense(Tensor::zeros(shape, *dtype)));
             }
             NodeKind::Ones { shape, dtype, .. } => {
-                return self.constant(node, Value(Tensor::ones(shape, *dtype)));
+                return self.constant(node, Value::dense(Tensor::ones(shape, *dtype)));
             }
             NodeKind::Full {
                 shape,
@@ -2112,7 +2121,7 @@ impl Lowerer {
                 dtype,
                 ..
             } => {
-                return self.constant(node, Value(Tensor::full(shape, *value, *dtype)));
+                return self.constant(node, Value::dense(Tensor::full(shape, *value, *dtype)));
             }
             NodeKind::Arange {
                 start,
@@ -2121,10 +2130,25 @@ impl Lowerer {
                 dtype,
                 ..
             } => {
-                return self.constant(node, Value(Tensor::arange(*start, *end, *step, *dtype)));
+                let execution = dtype_plan.execution();
+                if !matches!(
+                    execution.realization,
+                    ExecutionRealization::DirectKernel | ExecutionRealization::KernelLocal
+                ) || execution.operations[0].compute_dtype != Some(DType::F64)
+                {
+                    return Err(
+                        "compile: CPU arange requires the approved F64 factory recipe".into(),
+                    );
+                }
+                // The constant factory computes each element in F64 and completes
+                // its selected result conversion directly into persistent storage.
+                return self.constant(
+                    node,
+                    Value::dense(Tensor::arange(*start, *end, *step, *dtype)),
+                );
             }
             NodeKind::Eye { n, dtype, .. } => {
-                return self.constant(node, Value(Tensor::eye(*n, *dtype)));
+                return self.constant(node, Value::dense(Tensor::eye(*n, *dtype)));
             }
             NodeKind::SdpaBackwardOut { of, index }
             | NodeKind::ChunkedHeadCeBackwardOut { of, index }
@@ -2277,16 +2301,6 @@ impl Lowerer {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let optimizer_implementation = |dtype: DType| {
-            if self.options.optimize
-                && self.options.environment.fusion
-                && fusion::is_supported(&cpu_device(), dtype)
-            {
-                OptimizerImplementation::Fused
-            } else {
-                OptimizerImplementation::Composed
-            }
-        };
         let op = match &node.kind {
             NodeKind::Randn { shape, dtype, .. } => CpuOp::Randn {
                 shape: shape.clone().into_boxed_slice(),
@@ -2445,22 +2459,20 @@ impl Lowerer {
                 }
             }
             NodeKind::Linear { .. } => CpuOp::Linear,
-            NodeKind::QuantizedLinear {
-                codec,
-                weight_shape,
-                ..
-            } => CpuOp::QuantizedLinear {
-                codec: *codec,
-                weight_shape: *weight_shape,
-            },
-            NodeKind::QuantizedEmbedding {
-                codec,
-                weight_shape,
-                ..
-            } => CpuOp::QuantizedEmbedding {
-                codec: *codec,
-                weight_shape: *weight_shape,
-            },
+            NodeKind::QuantizedLinear { weight, .. } => {
+                let (codec, weight_shape) = weight.value_spec().packed_matrix()?;
+                CpuOp::QuantizedLinear {
+                    codec,
+                    weight_shape,
+                }
+            }
+            NodeKind::QuantizedEmbedding { weight, .. } => {
+                let (codec, weight_shape) = weight.value_spec().packed_matrix()?;
+                CpuOp::QuantizedEmbedding {
+                    codec,
+                    weight_shape,
+                }
+            }
             NodeKind::LayerNorm { eps, .. } => CpuOp::LayerNorm { eps: *eps },
             NodeKind::RmsNorm { eps, .. } => CpuOp::RmsNorm { eps: *eps },
             NodeKind::LayerNormBackward { eps, .. } => CpuOp::LayerNormBackward { eps: *eps },
@@ -2599,10 +2611,9 @@ impl Lowerer {
                 beta2,
                 eps,
                 weight_decay,
-                param,
                 ..
             } => {
-                let implementation = optimizer_implementation(param.dtype);
+                let implementation = OptimizerImplementation::Composed;
                 let fused_exprs = (implementation == OptimizerImplementation::Fused).then(|| {
                     fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay)
                         .into_iter()
@@ -2622,10 +2633,9 @@ impl Lowerer {
                 dampening,
                 nesterov,
                 weight_decay,
-                param,
                 ..
             } => {
-                let implementation = optimizer_implementation(param.dtype);
+                let implementation = OptimizerImplementation::Composed;
                 let fused_exprs = (implementation == OptimizerImplementation::Fused).then(|| {
                     fusion::sgd_exprs(*momentum, *dampening, *nesterov, *weight_decay)
                         .into_iter()
@@ -2661,16 +2671,183 @@ impl Lowerer {
                 unreachable!("zero-command nodes return before operation lowering")
             }
         };
-        self.command(op, inputs, outputs.clone())?;
-        self.prepare_last_command()?;
+        self.realize_command(op, inputs, &outputs, dtype_plan)?;
         self.node_values.insert(node.id, outputs.into_boxed_slice());
         Ok(())
+    }
+
+    fn convert_value(&mut self, source: ValueId, dtype: DType) -> Result<ValueId, String> {
+        let shape = self.values[source.index()].shape.clone();
+        let destination = self.dynamic_value(&shape, dtype, "dtype_conversion")?;
+        self.command(
+            CpuOp::Unary(CpuUnaryOp::Cast { dtype }),
+            vec![source],
+            vec![destination],
+        )?;
+        self.prepare_last_command()?;
+        self.materialized_conversions += 1;
+        self.materialized_conversion_bytes +=
+            shape.iter().product::<usize>() * dtype.size_in_bytes();
+        Ok(destination)
+    }
+
+    fn realize_command(
+        &mut self,
+        op: CpuOp,
+        mut inputs: Vec<ValueId>,
+        outputs: &[ValueId],
+        dtype_plan: &ExecutableDTypePlan,
+    ) -> Result<(), String> {
+        let execution = dtype_plan.execution();
+        let operation = &execution.operations[0];
+        if operation.operands.len() != inputs.len() || operation.results.len() != outputs.len() {
+            return Err(
+                "compile: CPU dtype plan operand/result arity differs from lowered operation"
+                    .into(),
+            );
+        }
+        for (input, contract) in inputs.iter_mut().zip(operation.operands.iter()) {
+            if let OperandInterpretation::ScalarCoercion(conversion) = contract.interpretation {
+                let value = &self.values[input.index()];
+                if !value.shape.is_empty() || value.dtype != conversion.source {
+                    return Err(
+                        "compile: scalar operand differs from its semantic coercion contract"
+                            .into(),
+                    );
+                }
+                *input = self.convert_value(*input, conversion.destination)?;
+            }
+        }
+        match execution.realization {
+            ExecutionRealization::DirectKernel | ExecutionRealization::KernelLocal => {
+                // Kernels convert in registers or their declared algorithm scratch,
+                // then restore each semantic result dtype on store.
+                if execution.realization == ExecutionRealization::KernelLocal
+                    && !matches!(
+                        op,
+                        CpuOp::Randn { .. }
+                            | CpuOp::Uniform { .. }
+                            | CpuOp::Unary(_)
+                            | CpuOp::Binary(_)
+                            | CpuOp::Reduce { .. }
+                            | CpuOp::Where
+                            | CpuOp::LayerNorm { .. }
+                            | CpuOp::LayerNormBackward { .. }
+                            | CpuOp::RmsNorm { .. }
+                            | CpuOp::CrossEntropy { .. }
+                            | CpuOp::CrossEntropyBackward { .. }
+                            | CpuOp::RotaryEmbedding { .. }
+                            | CpuOp::RotaryEmbeddingBackward { .. }
+                            | CpuOp::Conv1d { .. }
+                            | CpuOp::Conv2d { .. }
+                            | CpuOp::ConvTranspose1d { .. }
+                            | CpuOp::ConvTranspose2d { .. }
+                            | CpuOp::Conv1dBackwardW { .. }
+                            | CpuOp::Conv2dBackwardW { .. }
+                            | CpuOp::ShortConv1d
+                            | CpuOp::ShortConv1dBackwardX
+                            | CpuOp::ShortConv1dBackwardW
+                            | CpuOp::ConvState { .. }
+                            | CpuOp::KdaChunk { .. }
+                            | CpuOp::KdaRecurrence { .. }
+                            | CpuOp::KdaBackward { .. }
+                            | CpuOp::AdamW { .. }
+                            | CpuOp::Sgd { .. }
+                            | CpuOp::Cumsum { .. }
+                    )
+                {
+                    return Err(
+                        "compile: CPU operation has no kernel-local dtype realization".into(),
+                    );
+                }
+                if matches!(
+                    op,
+                    CpuOp::Unary(CpuUnaryOp::Inverse | CpuUnaryOp::Det)
+                        | CpuOp::Binary(CpuBinaryOp::Solve)
+                        | CpuOp::Randn { .. }
+                        | CpuOp::Uniform { .. }
+                ) && operation.compute_dtype != Some(DType::F64)
+                {
+                    return Err("compile: CPU algorithm requires its approved F64 recipe".into());
+                }
+                self.command(op, inputs, outputs.to_vec())?;
+                self.prepare_last_command()
+            }
+            ExecutionRealization::MaterializedTransforms => {
+                if !matches!(
+                    op,
+                    CpuOp::Binary(CpuBinaryOp::Matmul)
+                        | CpuOp::Linear
+                        | CpuOp::Sdpa { .. }
+                        | CpuOp::SdpaBackward { .. }
+                ) {
+                    return Err(
+                        "compile: CPU operation has no materialized dtype realization".into(),
+                    );
+                }
+                for (input, contract) in inputs.iter_mut().zip(operation.operands.iter()) {
+                    match contract.preparation {
+                        OperandPreparation::Direct => {}
+                        OperandPreparation::Convert(conversion) => {
+                            if self.values[input.index()].dtype != conversion.source || conversion.destination != DType::F32 {
+                                return Err("compile: CPU operand conversion differs from its dtype plan".into());
+                            }
+                            *input = self.convert_value(*input, conversion.destination)?;
+                        }
+                        OperandPreparation::CanonicalPacked(_) => return Err("compile: CPU materialized legalization cannot decode packed parameters".into()),
+                    }
+                }
+                let mut computed = Vec::with_capacity(outputs.len());
+                for (&output, contract) in outputs.iter().zip(operation.results.iter()) {
+                    computed.push(match contract.completion {
+                        ResultCompletion::Direct => output,
+                        ResultCompletion::ConvertToBoundary(conversion) => {
+                            let shape = self.values[output.index()].shape.clone();
+                            if self.values[output.index()].dtype != conversion.destination
+                                || conversion.source != DType::F32
+                            {
+                                return Err(
+                                    "compile: CPU result conversion differs from its dtype plan"
+                                        .into(),
+                                );
+                            }
+                            self.dynamic_value(&shape, conversion.source, "dtype_compute_output")?
+                        }
+                    });
+                }
+                self.command(op, inputs, computed.clone())?;
+                self.prepare_last_command()?;
+                for ((computed, &output), contract) in computed
+                    .into_iter()
+                    .zip(outputs)
+                    .zip(operation.results.iter())
+                {
+                    if let ResultCompletion::ConvertToBoundary(conversion) = contract.completion {
+                        self.command(
+                            CpuOp::Unary(CpuUnaryOp::Cast {
+                                dtype: conversion.destination,
+                            }),
+                            vec![computed],
+                            vec![output],
+                        )?;
+                        self.prepare_last_command()?;
+                        self.materialized_conversions += 1;
+                        self.materialized_conversion_bytes +=
+                            self.values[output.index()].shape.iter().product::<usize>()
+                                * conversion.destination.size_in_bytes();
+                    }
+                }
+                Ok(())
+            }
+            ExecutionRealization::Decomposition(kind) => match kind {},
+        }
     }
 
     fn finish(
         mut self,
         outputs: Vec<ValueId>,
         driver: &mut CompilerDriver<'_>,
+        capabilities: &CpuDTypeCapabilities,
     ) -> Result<(CpuExecutable, Vec<Value>, Vec<usize>), String> {
         if !self.preloaded_generated.is_empty() {
             return Err("compile: not all prepared generated bindings were lowered".to_string());
@@ -2857,6 +3034,8 @@ impl Lowerer {
         );
         Ok((
             CpuExecutable {
+                target: capabilities.fingerprint().clone(),
+                policy_revision: capabilities.policy_revision(),
                 signature: driver.prepared().signature.clone(),
                 program,
                 physical: physical.into_boxed_slice(),
@@ -2910,142 +3089,16 @@ fn value_from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Result<Value
         DType::U32 => decode!(u32, 4),
         DType::I64 => decode!(i64, 8),
     };
-    Ok(Value(tensor))
+    Ok(Value::dense(tensor))
 }
 
 fn ensure_fusion_dtype(dtype: DType) -> Result<(), String> {
-    if matches!(dtype, DType::F32 | DType::F64) {
+    if dtype.is_float() {
         Ok(())
     } else {
         Err(format!(
             "compile: fused CPU operation does not support dtype {dtype}"
         ))
-    }
-}
-
-fn validate_cpu_support(node: &Node) -> Result<(), String> {
-    let same_dtype = |operation: &str, tensors: &[&Arc<Node>]| {
-        if tensors
-            .windows(2)
-            .all(|pair| pair[0].dtype == pair[1].dtype)
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "compile: {operation} does not support mixed CPU dtypes"
-            ))
-        }
-    };
-    let matmul_dtype = |operation: &str, dtype: DType| {
-        if matches!(dtype, DType::F16 | DType::BF16) {
-            Err(format!(
-                "compile: {operation} does not support CPU dtype {dtype}"
-            ))
-        } else {
-            Ok(())
-        }
-    };
-    let float_dtype = |operation: &str, dtype: DType| {
-        if dtype.is_float() {
-            Ok(())
-        } else {
-            Err(format!(
-                "compile: {operation} requires a floating CPU dtype, got {dtype}"
-            ))
-        }
-    };
-
-    match &node.kind {
-        NodeKind::Arange { step, .. } if *step == 0.0 => {
-            Err("compile: arange step must not be zero".to_string())
-        }
-        NodeKind::Neg { a } if a.dtype == DType::U8 => {
-            Err("compile: neg does not support CPU dtype u8".to_string())
-        }
-        NodeKind::Abs { a }
-        | NodeKind::Sqrt { a }
-        | NodeKind::Exp { a }
-        | NodeKind::Log { a }
-        | NodeKind::Sin { a }
-        | NodeKind::Cos { a }
-        | NodeKind::Tanh { a }
-        | NodeKind::Erf { a }
-        | NodeKind::Gelu { a, .. }
-        | NodeKind::Floor { a }
-        | NodeKind::Ceil { a }
-        | NodeKind::Round { a }
-        | NodeKind::Sign { a }
-        | NodeKind::Pow { a, .. } => float_dtype("unary operation", a.dtype),
-        NodeKind::Add { a, b }
-        | NodeKind::Sub { a, b }
-        | NodeKind::Mul { a, b }
-        | NodeKind::Div { a, b }
-        | NodeKind::Maximum { a, b }
-        | NodeKind::Minimum { a, b } => {
-            if a.dtype == b.dtype
-                || (a.dtype.is_float()
-                    && b.dtype.is_float()
-                    && (a.shape.is_empty() ^ b.shape.is_empty()))
-            {
-                Ok(())
-            } else {
-                Err("compile: binary operation does not support these mixed CPU dtypes".to_string())
-            }
-        }
-        NodeKind::Eq { a, b }
-        | NodeKind::Gt { a, b }
-        | NodeKind::Lt { a, b }
-        | NodeKind::Ge { a, b }
-        | NodeKind::Le { a, b }
-        | NodeKind::Concat { a, b, .. } => same_dtype("operation", &[a, b]),
-        NodeKind::Matmul { a, b } => {
-            same_dtype("matmul", &[a, b])?;
-            matmul_dtype("matmul", a.dtype)
-        }
-        NodeKind::Linear { x, weight, bias } => {
-            same_dtype("linear", &[x, weight, bias])?;
-            matmul_dtype("linear", x.dtype)
-        }
-        NodeKind::Sdpa { q, .. } | NodeKind::SdpaBackward { q, .. } => {
-            matmul_dtype("sdpa", q.dtype)
-        }
-        NodeKind::ChunkedHeadCe { x, .. } | NodeKind::ChunkedHeadCeBackward { x, .. } => {
-            matmul_dtype("chunked_head_ce", x.dtype)
-        }
-        NodeKind::KvAttention { q, .. } if q.dtype != DType::F32 => Err(format!(
-            "compile: kv_attention does not support CPU dtype {}",
-            q.dtype
-        )),
-        NodeKind::RotaryEmbedding { x, .. } if x.dtype != DType::F32 => Err(format!(
-            "compile: rotary_embedding does not support CPU dtype {}",
-            x.dtype
-        )),
-        NodeKind::RotaryEmbeddingBackward { g, .. } if g.dtype != DType::F32 => Err(format!(
-            "compile: rotary_embedding_backward does not support CPU dtype {}",
-            g.dtype
-        )),
-        NodeKind::LayerNorm {
-            x, weight, bias, ..
-        } => {
-            float_dtype("layer_norm", x.dtype)?;
-            same_dtype("layer_norm", &[x, weight, bias])
-        }
-        NodeKind::RmsNorm { x, weight, .. } => {
-            float_dtype("rms_norm", x.dtype)?;
-            if let Some(weight) = weight {
-                same_dtype("rms_norm", &[x, weight])?;
-            }
-            Ok(())
-        }
-        NodeKind::LayerNormBackward { x, weight, g, .. } => {
-            float_dtype("layer_norm_backward", x.dtype)?;
-            same_dtype("layer_norm_backward", &[x, weight, g])
-        }
-        NodeKind::ConvTranspose1d { x, w, .. } | NodeKind::ConvTranspose2d { x, w, .. } => {
-            float_dtype("conv_transpose", x.dtype)?;
-            same_dtype("conv_transpose", &[x, w])
-        }
-        _ => Ok(()),
     }
 }
 
@@ -3088,19 +3141,15 @@ pub fn compile_with_state(
 }
 
 fn validate_generated_payload(node: &Arc<Node>, payload: &Value) -> Result<(), String> {
-    if payload.shape() != node.shape || payload.dtype() != node.dtype {
+    if payload.value_spec() != node.value_spec() {
         return Err(format!(
             "compile: generated binding {} changed shape or dtype",
             node.id
         ));
     }
     let tensor = payload.tensor();
-    if tensor.layout.shape() != node.shape {
-        return Err(format!(
-            "compile: generated binding {} layout shape does not match its node",
-            node.id
-        ));
-    }
+    node.value_spec()
+        .validate_buffer(tensor.dtype(), &tensor.layout, tensor.buffer.byte_len())?;
     let Some(end) = tensor.layout.checked_max_index() else {
         return Err(format!(
             "compile: generated binding {} has an overflowing CPU layout",
@@ -3283,7 +3332,8 @@ fn compile_prepared_internal(
         return Err("compile: CPU state cursor does not match the prepared program".to_string());
     }
     validate_generated_values(index, generated_values)?;
-    let mut driver = CompilerDriver::new(program)?;
+    let capabilities = CpuDTypeCapabilities::default();
+    let mut driver = CompilerDriver::new(program, &capabilities)?;
     let slots = index.slots.to_vec();
     if slots.iter().any(|slot| !slot.device.is_cpu()) {
         return Err("compile: graph contains an unsupported device".to_string());
@@ -3306,15 +3356,17 @@ fn compile_prepared_internal(
         state,
         generated_values,
     );
-    driver.lower(|unit, index, plan| {
+    driver.lower(|unit, index, plan, dtype_plan| {
         match unit {
             LoweringUnit::Node(node) => {
                 let semantic = index
                     .node(node)
                     .ok_or_else(|| format!("compile: dense node {node} is out of range"))?;
-                lowerer.lower(semantic)?;
+                lowerer.lower(semantic, &index.value_storage[node.index()], dtype_plan)?;
             }
-            LoweringUnit::Region(region) => lowerer.lower_region(index, plan, region)?,
+            LoweringUnit::Region(region) => {
+                lowerer.lower_region(index, plan, region, dtype_plan)?
+            }
         }
         Ok(())
     })?;
@@ -3324,9 +3376,14 @@ fn compile_prepared_internal(
         .map(|root| lowerer.dense_value(index, *root))
         .collect::<Result<Vec<_>, _>>()?;
     let artifact_assembly_started = Instant::now();
-    let artifact = lowerer.finish(outputs, &mut driver);
+    driver.record_materialized_conversions(
+        lowerer.materialized_conversions,
+        lowerer.materialized_conversion_bytes,
+    );
+    let artifact = lowerer.finish(outputs, &mut driver, &capabilities);
     driver.record_phase(ARTIFACT_ASSEMBLY_PHASE, artifact_assembly_started.elapsed());
     let (mut executable, generated_bindings, generated_slots) = artifact?;
+    executable.diagnostics.legalization = driver.legalization_diagnostics();
     let publication_started = Instant::now();
     if let Some(state_bytes) = state_bytes {
         executable.memory.report.state_bytes = state_bytes;
@@ -3525,8 +3582,26 @@ fn resolve_values(
                 .ok_or_else(|| format!("execute: generated input slot {slot} is unbound"))?,
         };
         let declaration = &executable.program.values[binding.value.index()];
-        if source.shape() != declaration.shape.as_ref()
-            || source.dtype() != declaration.dtype
+        let expected = effect_torch_runtime::ValueSpec {
+            semantic_dtype: binding.semantic_dtype,
+            logical_shape: &binding.semantic_shape,
+            storage: binding.storage.as_spec(),
+        };
+        if source.shape() != binding.semantic_shape
+            || source.dtype() != binding.semantic_dtype
+            || source.value_spec().storage.representation != expected.storage.representation
+        {
+            return Err(
+                "execute: binding semantic storage contract differs from the compiled value".into(),
+            );
+        }
+        expected.validate_buffer(
+            source.tensor().dtype(),
+            &source.tensor().layout,
+            source.tensor().buffer.byte_len(),
+        )?;
+        if source.tensor().shape() != declaration.shape.as_ref()
+            || source.tensor().dtype() != declaration.dtype
             || source.tensor().layout != declaration.layout
         {
             return Err(format!(
@@ -3559,7 +3634,7 @@ fn resolve_values(
                         "execute: location {index} has {bytes} bytes, expected {expected}"
                     ));
                 }
-                Value(Tensor::from_segment_with_retention(
+                Value::dense(Tensor::from_segment_with_retention(
                     Arc::clone(&segments.owners[segment.index()]),
                     *offset,
                     declaration.shape.to_vec(),
@@ -3571,7 +3646,7 @@ fn resolve_values(
                 let root = values[root.index()]
                     .as_ref()
                     .ok_or_else(|| format!("execute: alias {index} precedes root {root}"))?;
-                Value(Tensor {
+                Value::dense(Tensor {
                     buffer: root.tensor().buffer.clone(),
                     layout: declaration.layout.clone(),
                 })
@@ -3758,26 +3833,8 @@ fn dispatch_command<'a>(
             }
         }
         CpuOp::Binary(kind) => {
-            lanes.clear();
-            let target_dtype = inputs
-                .iter()
-                .find(|input| !input.tensor().shape().is_empty())
-                .map_or(inputs[0].dtype(), Value::dtype);
-            let mut staged = 0usize;
-            for input in inputs {
-                if input.dtype() != target_dtype && input.tensor().shape().is_empty() {
-                    let target = staging_values.get(staged).ok_or_else(|| {
-                        format!("{}: missing scalar cast staging {staged}", op.name())
-                    })?;
-                    cast_staging(input, target)?;
-                    lanes.push(target.clone());
-                    staged += 1;
-                } else {
-                    lanes.push(input.clone());
-                }
-            }
-            let a = lanes[0].tensor();
-            let b = lanes[1].tensor();
+            let a = inputs[0].tensor();
+            let b = inputs[1].tensor();
             match (kind, plan) {
                 (CpuBinaryOp::Add, _) => a.add_into(b, &mut destinations[0]),
                 (CpuBinaryOp::Sub, _) => a.sub_into(b, &mut destinations[0]),
@@ -4558,7 +4615,7 @@ fn execute_reported_with_commit(
             .signature
             .validate_binding_metadata(
                 index,
-                value.dtype(),
+                value.value_spec(),
                 value.tensor().placement(),
                 &value.tensor().layout,
             )
@@ -4777,28 +4834,834 @@ mod tests {
     use std::sync::Barrier;
 
     fn leaf(values: Vec<f32>) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             Tensor::from_vec(values.clone(), vec![values.len()]),
         )))))
         .unwrap()
     }
 
     fn leaf_shape(values: Vec<f32>, shape: Vec<usize>) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             Tensor::from_vec(values, shape),
         )))))
         .unwrap()
     }
 
-    fn leaf_u8_shape(values: Vec<u8>, shape: Vec<usize>) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
-            Tensor::from_vec(values, shape),
+    fn typed_leaf(values: Vec<f32>, shape: Vec<usize>, dtype: DType) -> Arc<Node> {
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
+            Tensor::from_vec(values, shape).cast(dtype),
         )))))
         .unwrap()
+    }
+
+    #[test]
+    fn half_fusion_preserves_every_semantic_rounding_boundary() {
+        for (dtype, large) in [(DType::F16, 2048f32), (DType::BF16, 256f32)] {
+            let base = typed_leaf(vec![large; 3], vec![3], dtype);
+            let increment = typed_leaf(vec![1.; 3], vec![3], dtype);
+            let added = Node::new(NodeKind::Add {
+                a: base.clone(),
+                b: increment,
+            })
+            .unwrap();
+            let result = Node::new(NodeKind::Sub {
+                a: added.clone(),
+                b: base,
+            })
+            .unwrap();
+            for optimize in [false, true] {
+                let compilation = compile(&[result.clone()], options(optimize), 1024).unwrap();
+                let outputs = run(&compilation);
+                assert_eq!(outputs[0].to_f32_vec().unwrap(), vec![0.; 3]);
+                if optimize {
+                    assert!(compilation.executable.program.instructions.iter().any(
+                        |command| matches!(
+                            command.kind.operation(),
+                            Some((CpuOp::FusedElementwise { .. }, _))
+                        )
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_scalar_coercion_is_materialized_before_f32_arithmetic() {
+        for (dtype, fraction_bits) in [(DType::F16, 10), (DType::BF16, 7)] {
+            let tensor = typed_leaf(vec![3.; 3], vec![3], dtype);
+            let scalar = typed_leaf(vec![1. + 2f32.powi(-fraction_bits - 1)], vec![], DType::F32);
+            let result = Node::new(NodeKind::Mul {
+                a: tensor,
+                b: scalar,
+            })
+            .unwrap();
+            for optimize in [false, true] {
+                let compilation = compile(&[result.clone()], options(optimize), 1024).unwrap();
+                assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), vec![3.; 3]);
+                assert_eq!(
+                    compilation
+                        .executable
+                        .diagnostics
+                        .legalization
+                        .materialized_conversions,
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn half_fused_reductions_accumulate_in_f32() {
+        for (dtype, large) in [(DType::F16, 2048f32), (DType::BF16, 256f32)] {
+            for mean in [false, true] {
+                let x = typed_leaf(vec![large, 1., -large], vec![3], dtype);
+                let zero = typed_leaf(vec![0.; 3], vec![3], dtype);
+                let added = Node::new(NodeKind::Add { a: x, b: zero }).unwrap();
+                let root = Node::new(if mean {
+                    NodeKind::Mean {
+                        a: added,
+                        dims: vec![0],
+                        keepdims: false,
+                    }
+                } else {
+                    NodeKind::Sum {
+                        a: added,
+                        dims: vec![0],
+                        keepdims: false,
+                    }
+                })
+                .unwrap();
+                let expected = Value::dense(
+                    Tensor::from_vec(vec![if mean { 1f32 / 3. } else { 1. }], vec![]).cast(dtype),
+                )
+                .to_f32_vec()
+                .unwrap();
+                for optimize in [false, true] {
+                    let compilation = compile(&[root.clone()], options(optimize), 1024).unwrap();
+                    assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), expected);
+                    if optimize {
+                        assert!(compilation.executable.program.instructions.iter().any(
+                            |command| matches!(
+                                command.kind.operation(),
+                                Some((CpuOp::FusedReduce { .. }, _))
+                            )
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_linear_keeps_dot_and_bias_in_f32_and_plans_all_conversions() {
+        for (dtype, large) in [(DType::F16, 2048f32), (DType::BF16, 256f32)] {
+            let x = typed_leaf(vec![large, 1.], vec![1, 2], dtype);
+            let weight = typed_leaf(vec![1., 1.], vec![2, 1], dtype);
+            let bias = typed_leaf(vec![-large], vec![1], dtype);
+            let linear = Node::new(NodeKind::Linear {
+                x: x.clone(),
+                weight: weight.clone(),
+                bias: bias.clone(),
+            })
+            .unwrap();
+            let matmul = Node::new(NodeKind::Matmul { a: x, b: weight }).unwrap();
+            let added = Node::new(NodeKind::Add { a: matmul, b: bias }).unwrap();
+            for optimize in [false, true] {
+                let compilation =
+                    compile(&[linear.clone(), added.clone()], options(optimize), 1024).unwrap();
+                let outputs = run(&compilation);
+                assert_eq!(outputs[0].to_f32_vec().unwrap(), vec![1.]);
+                assert_eq!(outputs[1].to_f32_vec().unwrap(), vec![0.]);
+                let executable = &compilation.executable;
+                let command = executable
+                    .program
+                    .instructions
+                    .iter()
+                    .find(|command| matches!(command.kind.operation(), Some((CpuOp::Linear, _))))
+                    .unwrap();
+                for value in command
+                    .inputs
+                    .iter()
+                    .map(|input| input.value)
+                    .chain(command.outputs.iter().map(|output| output.value))
+                {
+                    assert_eq!(executable.program.values[value.index()].dtype, DType::F32);
+                    assert!(matches!(
+                        executable.memory.locations[value.index()],
+                        Location::Segment { .. }
+                    ));
+                }
+                let cancelled = CancellationFlag::new();
+                cancelled.cancel();
+                assert!(execute(
+                    executable,
+                    &[],
+                    &compilation.generated_bindings,
+                    &cancelled,
+                    None
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn min_max_nan_semantics_match_between_fused_and_independent_operations() {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            for maximum in [false, true] {
+                let a = typed_leaf(vec![f32::NAN, 3., f32::NAN, -0.], vec![4], dtype);
+                let b = typed_leaf(vec![2., f32::NAN, f32::NAN, 0.], vec![4], dtype);
+                let op = if maximum {
+                    NodeKind::Maximum { a, b }
+                } else {
+                    NodeKind::Minimum { a, b }
+                };
+                let root = Node::new(NodeKind::Neg {
+                    a: Node::new(op).unwrap(),
+                })
+                .unwrap();
+                let baseline = run(&compile(&[root.clone()], options(false), 1024).unwrap())[0]
+                    .to_f32_vec()
+                    .unwrap();
+                let optimized = run(&compile(&[root], options(true), 1024).unwrap())[0]
+                    .to_f32_vec()
+                    .unwrap();
+                for (a, b) in baseline.into_iter().zip(optimized) {
+                    assert!(a == b || a.is_nan() && b.is_nan());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_attention_plans_f32_compute_and_all_gradient_boundaries() {
+        for dtype in [DType::F16, DType::BF16] {
+            let q = typed_leaf(vec![1., 0.], vec![1, 1, 2], dtype);
+            let k = typed_leaf(vec![1., 0., 0., 1.], vec![1, 2, 2], dtype);
+            let v = typed_leaf(vec![2., 4., 6., 8.], vec![1, 2, 2], dtype);
+            let g = typed_leaf(vec![1., 1.], vec![1, 1, 2], dtype);
+            let forward = Node::new(NodeKind::Sdpa {
+                q: q.clone(),
+                k: k.clone(),
+                v: v.clone(),
+                scale: 1.,
+                causal: false,
+                window: effect_torch_graph::AttentionWindow::Inherit,
+            })
+            .unwrap();
+            let backward = Node::new(NodeKind::SdpaBackward {
+                q,
+                k,
+                v,
+                g,
+                fwd: forward.clone(),
+                scale: 1.,
+                causal: false,
+                window: effect_torch_graph::AttentionWindow::Inherit,
+            })
+            .unwrap();
+            let roots = std::iter::once(forward)
+                .chain((0..3).map(|index| {
+                    Node::new(NodeKind::SdpaBackwardOut {
+                        of: backward.clone(),
+                        index,
+                    })
+                    .unwrap()
+                }))
+                .collect::<Vec<_>>();
+            for optimize in [false, true] {
+                let compilation = compile(&roots, options(optimize), 1024).unwrap();
+                let outputs = run(&compilation);
+                assert!(outputs.iter().all(|output| output.dtype() == dtype));
+                let p = 1f32.exp() / (1f32.exp() + 1.);
+                let expected = Value::dense(
+                    Tensor::from_vec(
+                        vec![2. * p + 6. * (1. - p), 4. * p + 8. * (1. - p)],
+                        vec![2],
+                    )
+                    .cast(dtype),
+                )
+                .to_f32_vec()
+                .unwrap();
+                assert_eq!(outputs[0].to_f32_vec().unwrap(), expected);
+                assert_eq!(outputs[1].shape(), [1, 1, 2]);
+                assert_eq!(outputs[2].shape(), [1, 2, 2]);
+                assert_eq!(outputs[3].shape(), [1, 2, 2]);
+                assert!(outputs.iter().all(|output| output
+                    .to_f32_vec()
+                    .unwrap()
+                    .iter()
+                    .all(|x| x.is_finite())));
+                assert!(
+                    compilation
+                        .executable
+                        .diagnostics
+                        .legalization
+                        .materialized_conversions
+                        >= 11
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn half_normalization_and_cross_entropy_use_f32_recipes() {
+        for dtype in [DType::F16, DType::BF16] {
+            let x = typed_leaf(vec![-1., 1.], vec![1, 2], dtype);
+            let weight = typed_leaf(vec![1., 1.], vec![2], dtype);
+            let bias = typed_leaf(vec![0., 0.], vec![2], dtype);
+            let normalized = Node::new(NodeKind::LayerNorm {
+                x: x.clone(),
+                weight: weight.clone(),
+                bias,
+                eps: 0.,
+            })
+            .unwrap();
+            let rms = Node::new(NodeKind::RmsNorm {
+                x,
+                weight: Some(weight),
+                eps: 0.,
+            })
+            .unwrap();
+            let logits = typed_leaf(vec![0., 0.], vec![1, 2], dtype);
+            let target = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
+                Tensor::from_vec(vec![1i64], vec![1]),
+            )))))
+            .unwrap();
+            let ce = Node::new(NodeKind::CrossEntropy {
+                logits,
+                target,
+                ignore_index: -100,
+                reduction: CrossEntropyReduction::Mean,
+            })
+            .unwrap();
+            for optimize in [false, true] {
+                let compilation = compile(
+                    &[normalized.clone(), rms.clone(), ce.clone()],
+                    options(optimize),
+                    1024,
+                )
+                .unwrap();
+                let outputs = run(&compilation);
+                assert_eq!(outputs[0].to_f32_vec().unwrap(), vec![-1., 1.]);
+                assert_eq!(outputs[1].to_f32_vec().unwrap(), vec![-1., 1.]);
+                let expected = Value::dense(Tensor::from_vec(vec![2f32.ln()], vec![]).cast(dtype))
+                    .to_f32_vec()
+                    .unwrap();
+                assert_eq!(outputs[2].to_f32_vec().unwrap(), expected);
+                assert!(
+                    compilation
+                        .executable
+                        .diagnostics
+                        .legalization
+                        .kernel_local_legalizations
+                        >= 3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arange_f64_recipe_preserves_attribute_precision_and_boundary_storage() {
+        for (dtype, start) in [
+            (DType::F16, 2048.),
+            (DType::BF16, 256.),
+            (DType::F32, 16777216.),
+            (DType::F64, 16777216.),
+        ] {
+            let root = Node::new(NodeKind::Arange {
+                start,
+                end: -2.,
+                step: -start + 0.75,
+                dtype,
+                device: Device::Cpu(0),
+            })
+            .unwrap();
+            let compilation = compile(&[root], options(true), 1024).unwrap();
+            let output = run(&compilation).remove(0);
+            assert_eq!(output.dtype(), dtype);
+            assert_eq!(output.to_f32_vec().unwrap(), [start as f32, 0.75]);
+            assert_eq!(compilation.executable.constants.len(), 1);
+            assert!(encoded_instructions(&compilation.executable).is_empty());
+            assert_eq!(
+                compilation
+                    .executable
+                    .diagnostics
+                    .legalization
+                    .materialized_conversions,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn lu_f64_recipe_preserves_ill_conditioned_f32_inputs_and_plans_scratch() {
+        // F32 elimination rounds the second pivot to zero. F64 retains -2^-24.
+        let a = leaf_shape(
+            vec![16777216., 16777215., 16777215., 16777214.],
+            vec![1, 2, 2],
+        );
+        let rhs = leaf_shape(vec![1., 0.], vec![1, 2, 1]);
+        let roots = [
+            Node::new(NodeKind::Det { a: a.clone() }).unwrap(),
+            Node::new(NodeKind::Inverse { a: a.clone() }).unwrap(),
+            Node::new(NodeKind::Solve { a, b: rhs }).unwrap(),
+        ];
+        for optimize in [false, true] {
+            let compilation = compile(&roots, options(optimize), 1024).unwrap();
+            let outputs = run(&compilation);
+            assert_eq!(outputs[0].to_f32_vec().unwrap(), [-1.]);
+            assert_eq!(
+                outputs[1].to_f32_vec().unwrap(),
+                [-16777214., 16777215., 16777215., -16777216.]
+            );
+            assert_eq!(outputs[2].to_f32_vec().unwrap(), [-16777214., 16777215.]);
+            let executable = &compilation.executable;
+            let commands = encoded_instructions(executable);
+            assert_eq!(commands.len(), 3);
+            for command in &commands {
+                for scratch in &command.scratch {
+                    let value = &executable.program.values[scratch.value.index()];
+                    assert_eq!(value.dtype, DType::F64);
+                    assert_eq!(
+                        value.declaration.bytes,
+                        value.shape.iter().product::<usize>() * 8
+                    );
+                    assert!(matches!(
+                        value.declaration.storage,
+                        ValueStorage::Planned {
+                            ownership: SegmentOwnership::Workspace,
+                            ..
+                        }
+                    ));
+                }
+            }
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|command| command.scratch.len())
+                    .sum::<usize>(),
+                5
+            );
+            assert_eq!(
+                executable
+                    .diagnostics
+                    .legalization
+                    .kernel_local_legalizations,
+                3
+            );
+            assert_eq!(
+                executable.diagnostics.legalization.materialized_conversions,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn approved_f64_algorithms_do_not_narrow_f64_model_arithmetic() {
+        let input = |value| {
+            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
+                Tensor::from_vec(vec![value], vec![1, 1]),
+            )))))
+            .unwrap()
+        };
+        let epsilon = 2f64.powi(-40);
+        let difference = Node::new(NodeKind::Sub {
+            a: input(1. + epsilon),
+            b: input(1.),
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::Matmul {
+            a: difference,
+            b: input(1.),
+        })
+        .unwrap();
+        for optimize in [false, true] {
+            let prepared = ProgramRequest::from_roots(vec![root.clone()], options(optimize))
+                .prepare()
+                .unwrap();
+            let target = CpuDTypeCapabilities::default();
+            let driver = CompilerDriver::new(&prepared, &target).unwrap();
+            for unit in driver.legalization().units() {
+                for operation in &unit.execution().operations {
+                    assert!(
+                        operation.compute_dtype.is_none()
+                            || operation.compute_dtype == Some(DType::F64)
+                    );
+                    assert!(operation
+                        .results
+                        .iter()
+                        .all(|result| result.execution_dtype == DType::F64));
+                }
+            }
+            let compilation = compile(&[root.clone()], options(optimize), 1024).unwrap();
+            let output = run(&compilation).remove(0);
+            assert_eq!(output.dtype(), DType::F64);
+            let CpuBuffer::F64(values) = &output.tensor().buffer else {
+                panic!("expected f64")
+            };
+            assert_eq!(values.as_slice(), &[epsilon]);
+            assert_eq!(
+                compilation
+                    .executable
+                    .diagnostics
+                    .legalization
+                    .materialized_conversions,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn convolution_kda_and_sgd_compile_with_their_actual_compute_dtype() {
+        for (dtype, large, small) in [
+            (DType::F16, 32768f32, 2f32.powi(-10)),
+            (DType::BF16, 16777216., 1.),
+            (DType::F32, 16777216., 1.),
+            (DType::F64, 16777216., 1.),
+        ] {
+            let conv = Node::new(NodeKind::Conv1d {
+                x: typed_leaf(vec![large, small, -large], vec![1, 3, 1], dtype),
+                w: typed_leaf(vec![1.; 3], vec![1, 3, 1], dtype),
+                stride: 1,
+                padding: 0,
+                dilation: 1,
+                groups: 1,
+            })
+            .unwrap();
+            let kda = Node::new(NodeKind::KdaChunk {
+                q: typed_leaf(vec![1.; 3], vec![1, 1, 3], dtype),
+                k: typed_leaf(vec![large, small, -large], vec![1, 1, 3], dtype),
+                v: typed_leaf(vec![1.], vec![1, 1, 1], dtype),
+                log_decay: typed_leaf(vec![0.; 3], vec![1, 1, 3], dtype),
+                beta: typed_leaf(vec![1.], vec![1, 1, 1], dtype),
+                scale: 1.,
+            })
+            .unwrap();
+            let short = Node::new(NodeKind::ShortConv1d {
+                x: typed_leaf(vec![large, small, -large], vec![1, 3, 1], dtype),
+                weight: typed_leaf(vec![1.; 3], vec![1, 3], dtype),
+            })
+            .unwrap();
+            let cumsum = Node::new(NodeKind::Cumsum {
+                a: typed_leaf(vec![large, small, -large], vec![3], dtype),
+                dim: 0,
+            })
+            .unwrap();
+            let sgd = Node::new(NodeKind::SgdStep {
+                param: typed_leaf(vec![large], vec![1], dtype),
+                grad: typed_leaf(vec![small], vec![1], dtype),
+                velocity: typed_leaf(vec![large], vec![1], dtype),
+                first: typed_leaf(vec![0.], vec![], dtype),
+                lr: typed_leaf(vec![1.], vec![], dtype),
+                momentum: 1.,
+                dampening: 0.,
+                nesterov: true,
+                weight_decay: 0.,
+            })
+            .unwrap();
+            for optimize in [false, true] {
+                let roots = [
+                    conv.clone(),
+                    kda.clone(),
+                    short.clone(),
+                    cumsum.clone(),
+                    sgd.clone(),
+                ];
+                let compilation = compile(&roots, options(optimize), 1024).unwrap();
+                let values = run(&compilation);
+                let expected = if dtype == DType::F64 { small } else { 0. };
+                assert_eq!(values[0].to_f32_vec().unwrap(), [expected]);
+                assert_eq!(values[1].to_f32_vec().unwrap(), [expected]);
+                assert_eq!(values[2].to_f32_vec().unwrap()[2], expected);
+                assert_eq!(values[3].to_f32_vec().unwrap()[2], expected);
+                assert_eq!(values[4].to_f32_vec().unwrap(), [-2. * expected]);
+                if matches!(dtype, DType::F16 | DType::BF16) {
+                    assert_eq!(
+                        compilation
+                            .executable
+                            .diagnostics
+                            .legalization
+                            .kernel_local_legalizations,
+                        5
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_normalization_accumulates_in_f32_and_preserves_f64_execution() {
+        for (dtype, large, small) in [
+            (DType::F16, 32768f32, 2f32.powi(-10)),
+            (DType::BF16, 16777216f32, 1.),
+        ] {
+            let roots = |dtype| {
+                let x = typed_leaf(vec![large, small, -large], vec![1, 3], dtype);
+                let weight = typed_leaf(vec![1.; 3], vec![3], dtype);
+                let bias = typed_leaf(vec![0.; 3], vec![3], dtype);
+                let forward = Node::new(NodeKind::LayerNorm {
+                    x,
+                    weight,
+                    bias,
+                    eps: 0.,
+                })
+                .unwrap();
+                let backward = Node::new(NodeKind::LayerNormBackward {
+                    x: typed_leaf(vec![-1., 1., -1., 1., -1., 1.], vec![3, 2], dtype),
+                    weight: typed_leaf(vec![1.; 2], vec![2], dtype),
+                    g: typed_leaf(vec![large, 0., small, 0., -large, 0.], vec![3, 2], dtype),
+                    eps: 0.,
+                })
+                .unwrap();
+                vec![
+                    forward,
+                    Node::new(NodeKind::LayerNormBackwardOut {
+                        of: backward.clone(),
+                        index: 1,
+                    })
+                    .unwrap(),
+                    Node::new(NodeKind::LayerNormBackwardOut {
+                        of: backward,
+                        index: 2,
+                    })
+                    .unwrap(),
+                ]
+            };
+            let single = run(&compile(&roots(DType::F32), options(false), 1024).unwrap());
+            let double = run(&compile(&roots(DType::F64), options(false), 1024).unwrap());
+            let narrow = |value: &Value| {
+                Value::dense(value.tensor().cast(dtype))
+                    .to_f32_vec()
+                    .unwrap()
+            };
+            for optimize in [false, true] {
+                let actual = run(&compile(&roots(dtype), options(optimize), 1024).unwrap());
+                for (index, value) in actual.iter().enumerate() {
+                    let expected = narrow(&single[index]);
+                    assert_ne!(
+                        expected,
+                        narrow(&double[index]),
+                        "fixture must distinguish F32 from F64, output {index}"
+                    );
+                    assert_eq!(value.to_f32_vec().unwrap(), expected);
+                }
+                assert_eq!(actual[2].to_f32_vec().unwrap(), vec![0., 0.]);
+            }
+        }
+        // BF16's range exposes an F32 square overflow that F64 must preserve.
+        let rms = |dtype| {
+            Node::new(NodeKind::RmsNorm {
+                x: typed_leaf(vec![2f32.powi(64)], vec![1, 1], dtype),
+                weight: None,
+                eps: 0.,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            run(&compile(&[rms(DType::BF16)], options(true), 1024).unwrap())[0]
+                .to_f32_vec()
+                .unwrap(),
+            vec![0.]
+        );
+        assert_eq!(
+            run(&compile(&[rms(DType::F64)], options(true), 1024).unwrap())[0]
+                .to_f32_vec()
+                .unwrap(),
+            vec![1.]
+        );
+    }
+
+    #[test]
+    fn half_cross_entropy_uses_f32_nonlinear_arithmetic() {
+        for (dtype, large) in [(DType::F16, 32768f32), (DType::BF16, 16777216f32)] {
+            let roots = |dtype| {
+                let target = leaf_u32_shape(vec![0], vec![1]);
+                vec![
+                    Node::new(NodeKind::CrossEntropy {
+                        logits: typed_leaf(vec![large; 2], vec![1, 2], dtype),
+                        target: target.clone(),
+                        ignore_index: -100,
+                        reduction: CrossEntropyReduction::Sum,
+                    })
+                    .unwrap(),
+                    Node::new(NodeKind::CrossEntropyBackward {
+                        logits: typed_leaf(vec![0., -17.], vec![1, 2], dtype),
+                        target,
+                        ignore_index: -100,
+                        reduction: CrossEntropyReduction::Sum,
+                    })
+                    .unwrap(),
+                ]
+            };
+            let single = run(&compile(&roots(DType::F32), options(false), 1024).unwrap());
+            let double = run(&compile(&roots(DType::F64), options(false), 1024).unwrap());
+            for optimize in [false, true] {
+                let actual = run(&compile(&roots(dtype), options(optimize), 1024).unwrap());
+                for (index, value) in actual.iter().enumerate() {
+                    let expected = Value::dense(single[index].tensor().cast(dtype))
+                        .to_f32_vec()
+                        .unwrap();
+                    let old = Value::dense(double[index].tensor().cast(dtype))
+                        .to_f32_vec()
+                        .unwrap();
+                    assert_ne!(expected, old, "fixture must distinguish F32 from F64");
+                    assert_eq!(value.to_f32_vec().unwrap(), expected);
+                }
+                assert_eq!(actual[1].to_f32_vec().unwrap()[0], 0.);
+            }
+        }
+    }
+
+    #[test]
+    fn half_rotary_uses_f32_angles_and_preserves_f64_execution() {
+        let offset = (1 << 24) + 1;
+        let rotate = |dtype| {
+            let x = Tensor::from_vec(vec![1f32, 0.], vec![1, 1, 2]).cast(dtype);
+            let mut out = Tensor::empty(x.shape(), dtype);
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                composed::rotary_forward_into(
+                    &x,
+                    &[offset],
+                    10000.,
+                    1.,
+                    RotaryLayout::HalfSplit,
+                    &mut out.destination().unwrap(),
+                )
+                .unwrap();
+            }
+            Value::dense(out)
+        };
+        let single = rotate(DType::F32);
+        let double = rotate(DType::F64);
+        for dtype in [DType::F16, DType::BF16] {
+            let expected = Value::dense(single.tensor().cast(dtype))
+                .to_f32_vec()
+                .unwrap();
+            assert_ne!(
+                expected,
+                Value::dense(double.tensor().cast(dtype))
+                    .to_f32_vec()
+                    .unwrap()
+            );
+            assert_eq!(rotate(dtype).to_f32_vec().unwrap(), expected);
+        }
+        let expected = vec![(offset as f64).cos(), (offset as f64).sin()];
+        let CpuBuffer::F64(actual) = &double.tensor().buffer else {
+            panic!("F64 output required")
+        };
+        assert_eq!(&**actual, expected);
+    }
+
+    #[test]
+    fn packed_outputs_are_rejected_and_quantized_embedding_validates_bindings() {
+        let codec = GgmlKQuant::Q4K;
+        let fixture = crate::quantized::fixtures::fixture(codec);
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![1, 256],
+            dtype: DType::F32,
+            device: Device::Cpu(0),
+            storage: effect_torch_runtime::StorageMetadata::packed(codec),
+        })
+        .unwrap();
+        for optimize in [false, true] {
+            let error = compile(&[input.clone()], options(optimize), 1024)
+                .err()
+                .unwrap();
+            assert!(
+                error.contains("packed program outputs are not supported"),
+                "{error}"
+            );
+        }
+        let root = Node::new(NodeKind::QuantizedEmbedding {
+            indexes: leaf_u32_shape(vec![0], vec![1]),
+            weight: input,
+            padding_index: None,
+        })
+        .unwrap();
+        let compilation = compile(&[root], options(true), 1024).unwrap();
+        let bytes = Value::dense(Tensor::from_vec(
+            fixture.bytes.to_vec(),
+            vec![1, codec.block_bytes()],
+        ));
+        let packed = bytes
+            .clone()
+            .with_packed_storage(codec, vec![1, 256])
+            .unwrap();
+        let outputs = execute(
+            &compilation.executable,
+            &[packed],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outputs[0].dtype(), DType::F32);
+        assert_eq!(outputs[0].shape(), [1, 256]);
+        assert_eq!(
+            outputs[0].value_spec().storage.representation,
+            effect_torch_runtime::StorageRepresentation::Dense
+        );
+        let expected = fixture
+            .expected_groups
+            .iter()
+            .flat_map(|&value| std::iter::repeat_n(value, fixture.group_width))
+            .collect::<Vec<_>>();
+        assert_eq!(outputs[0].to_f32_vec().unwrap(), expected);
+        assert!(execute(
+            &compilation.executable,
+            &[bytes],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn declared_exact_strides_reach_capabilities_and_cpu_lowering() {
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![2],
+            dtype: DType::F32,
+            device: Device::Cpu(0),
+            storage: effect_torch_runtime::StorageMetadata::dense(),
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::Neg { a: input }).unwrap();
+        let initial = ProgramRequest::from_roots(vec![root.clone()], options(false))
+            .prepare()
+            .unwrap();
+        let layout = effect_torch_runtime::Layout::new(vec![2], vec![2], 1);
+        let mut bindings = initial.signature.bindings.to_vec();
+        bindings[0].layout = effect_torch_runtime::BindingLayoutPolicy::Require(
+            effect_torch_runtime::LayoutConstraint::Exact(layout.clone()),
+        );
+        let program = ProgramRequest::new(
+            vec![root],
+            bindings,
+            initial.signature.invocation.clone(),
+            options(false),
+        )
+        .prepare()
+        .unwrap();
+        let compilation = compile_prepared(&program, &[], None).unwrap();
+        let values = Value::dense(Tensor::from_vec(vec![0f32, 3., 0., 5.], vec![4]).view(layout));
+        let output = execute(
+            &compilation.executable,
+            &[values],
+            &[],
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output[0].to_f32_vec().unwrap(), vec![-3., -5.]);
     }
 
     fn leaf_u32_shape(values: Vec<u32>, shape: Vec<usize>) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             Tensor::from_vec(values, shape),
         )))))
         .unwrap()
@@ -4898,13 +5761,16 @@ mod tests {
         for _ in 0..3 {
             packed.extend_from_slice(fixture.bytes);
         }
-        let weight = leaf_u8_shape(packed, vec![3, fixture.bytes.len()]);
+        let weight = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(
+            Value::dense(Tensor::from_vec(packed, vec![3, fixture.bytes.len()]))
+                .with_packed_storage(fixture.codec, vec![3, 256])
+                .unwrap(),
+        ))))
+        .unwrap();
         let root = Node::new(NodeKind::QuantizedLinear {
             x: input,
             weight,
             bias: None,
-            codec: GgmlKQuant::Q4K,
-            weight_shape: [3, 256],
         })
         .unwrap();
         let compilation = compile(&[root], options(false), 1024).unwrap();
@@ -4936,9 +5802,15 @@ mod tests {
             roots.push(
                 Node::new(NodeKind::QuantizedEmbedding {
                     indexes: leaf_u32_shape(vec![0], vec![1]),
-                    weight: leaf_u8_shape(fixture.bytes.to_vec(), vec![1, fixture.bytes.len()]),
-                    codec: fixture.codec,
-                    weight_shape: [1, 256],
+                    weight: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(
+                        Value::dense(Tensor::from_vec(
+                            fixture.bytes.to_vec(),
+                            vec![1, fixture.bytes.len()],
+                        ))
+                        .with_packed_storage(fixture.codec, vec![1, 256])
+                        .unwrap(),
+                    ))))
+                    .unwrap(),
                     padding_index: Some(0),
                 })
                 .unwrap(),
@@ -4972,6 +5844,7 @@ mod tests {
         fn assert_typed(_: &LoweredProgram<CpuInstruction, NativeMemorySpace, CpuLoweredValue>) {}
 
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
@@ -5035,7 +5908,7 @@ mod tests {
 
     #[test]
     fn prepared_compile_does_not_reload_leaf_slots() {
-        let slot = Arc::new(LeafSlot::new(Value(Tensor::from_vec(
+        let slot = Arc::new(LeafSlot::new(Value::dense(Tensor::from_vec(
             vec![1.0f32, 2.0],
             vec![2],
         ))));
@@ -5068,6 +5941,7 @@ mod tests {
             [
                 "graph_index",
                 "optimization",
+                "target_legalization",
                 "lowering",
                 "lowered_program_validation",
                 "memory_planning",
@@ -5093,7 +5967,7 @@ mod tests {
         let mut tensor = Tensor::from_vec(vec![1.0f32, 99.0, 2.0, 99.0], vec![4]);
         let layout = effect_torch_runtime::Layout::new(vec![2], vec![2], 0);
         tensor.layout = layout.clone();
-        let slot = Arc::new(LeafSlot::new(Value(tensor)));
+        let slot = Arc::new(LeafSlot::new(Value::dense(tensor)));
         let leaf = Node::new(NodeKind::Leaf(Arc::clone(&slot))).unwrap();
         let root = Node::new(NodeKind::Neg { a: leaf }).unwrap();
         let program = ProgramRequest::from_roots(
@@ -5176,6 +6050,7 @@ mod tests {
     #[test]
     fn scalar_bindings_are_written_into_planned_invocation_staging() {
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
@@ -5229,7 +6104,7 @@ mod tests {
 
         let output = execute_with_scalars(
             &compilation.executable,
-            &[Value(Tensor::from_vec(vec![1.0f32, 2.0], vec![2]))],
+            &[Value::dense(Tensor::from_vec(vec![1.0f32, 2.0], vec![2]))],
             &compilation.generated_bindings,
             &[3.5],
             &CancellationFlag::new(),
@@ -5243,6 +6118,7 @@ mod tests {
         for batch in [1usize, 3] {
             let input = |slot| {
                 Node::new(NodeKind::Input {
+                    storage: effect_torch_runtime::StorageMetadata::dense(),
                     slot,
                     shape: vec![batch, 1, 2, 4],
                     dtype: DType::F32,
@@ -5343,6 +6219,7 @@ mod tests {
     #[test]
     fn one_plan_executes_concurrently_with_independent_frames() {
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
@@ -5357,7 +6234,7 @@ mod tests {
                 let executable = Arc::clone(&executable);
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
-                    let input = Value(Tensor::from_vec(
+                    let input = Value::dense(Tensor::from_vec(
                         vec![index as f32, index as f32 + 1.0],
                         vec![2],
                     ));
@@ -5380,6 +6257,7 @@ mod tests {
     #[test]
     fn bounded_batch_inputs_are_zero_padded_in_planned_staging() {
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2, 2],
             dtype: DType::F32,
@@ -5416,7 +6294,10 @@ mod tests {
 
         let output = execute_with_scalars(
             &compilation.executable,
-            &[Value(Tensor::from_vec(vec![2.0f32, 3.0], vec![1, 2]))],
+            &[Value::dense(Tensor::from_vec(
+                vec![2.0f32, 3.0],
+                vec![1, 2],
+            ))],
             &compilation.generated_bindings,
             &[],
             &CancellationFlag::new(),
@@ -5622,7 +6503,7 @@ mod tests {
                 &mut tensor.destination().unwrap(),
             )
             .unwrap();
-            Value(tensor).to_f32_vec().unwrap()
+            Value::dense(tensor).to_f32_vec().unwrap()
         };
         assert_eq!(sample(optimized_provenance), sample(unoptimized_provenance));
     }
@@ -5813,13 +6694,11 @@ mod tests {
             device: Device::Metal(0),
         })
         .unwrap();
-        assert!(compile(&[metal], options(false), 1024)
-            .err()
-            .unwrap()
-            .contains("does not support device metal"));
+        let error = compile(&[metal], options(false), 1024).err().unwrap();
+        assert!(error.contains("legalization:"), "{error}");
 
         let half = || {
-            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::ones(&[2, 2], DType::F16),
             )))))
             .unwrap()
@@ -5829,21 +6708,21 @@ mod tests {
             b: half(),
         })
         .unwrap();
-        assert!(compile(&[half_matmul], options(false), 1024)
-            .err()
-            .unwrap()
-            .contains("matmul does not support CPU dtype f16"));
+        assert_eq!(
+            run(&compile(&[half_matmul], options(false), 1024).unwrap())[0]
+                .to_f32_vec()
+                .unwrap(),
+            vec![2.; 4]
+        );
 
         let overflowing = Node::new(NodeKind::Zeros {
             shape: vec![usize::MAX, 2],
             dtype: DType::F32,
             device: Device::Cpu(0),
         })
+        .err()
         .unwrap();
-        assert!(compile(&[overflowing], options(false), 1024)
-            .err()
-            .unwrap()
-            .contains("unsupported overflowing layout"));
+        assert!(overflowing.contains("overflow"));
     }
 
     #[test]
@@ -5871,7 +6750,7 @@ mod tests {
     #[test]
     fn ce_chunk_size_and_optimizer_implementation_are_compile_time_choices() {
         let tensor = |shape: Vec<usize>, value: f32| {
-            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
                 Tensor::full(&shape, value as f64, DType::F32),
             )))))
             .unwrap()
@@ -5918,7 +6797,7 @@ mod tests {
             assert!((optimized - unoptimized).abs() < 1e-6);
         }
 
-        let target = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        let target = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             Tensor::from_vec(vec![0i64, 1], vec![2]),
         )))))
         .unwrap();

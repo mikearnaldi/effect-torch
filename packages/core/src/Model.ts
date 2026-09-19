@@ -77,8 +77,8 @@ export interface ParameterSpec {
   readonly name: string
   /**
    * Declared logical shape, independent of encoded physical storage. The
-   * catalog is descriptive: `forward`, {@link save}, and {@link load} do not
-   * universally compare supplied tensors against it.
+   * catalog is descriptive: `forward` does not universally compare supplied
+   * tensors against it.
    */
   readonly shape: ReadonlyArray<number>
   /** Declarative recipe for creating one fresh parameter value. */
@@ -1386,75 +1386,6 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
       })
   }))
 }
-
-/**
- * Saves a model's parameters to a safetensors file, zipping parameter-spec names
- * with the parameter array into the record {@link Tensor.save} takes.
- * Fails with a {@link ModelError} if the parameter array's length does
- * not match the model's arity. It does not compare tensor shapes or dtypes with
- * {@link Model.parameterSpecs}. Saving borrows parameters and does not clear them.
- *
- * @since 0.1.0
- * @category destructors
- */
-export const save = (
-  model: Model,
-  params: Params,
-  path: string
-): Effect.Effect<void, ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  params.length !== model.parameterSpecs.length
-    ? new ModelError({
-      op: "save",
-      message: `model has ${model.parameterSpecs.length} parameters, got ${params.length}`
-    })
-    : Tensor.save(
-      path,
-      Object.fromEntries(model.parameterSpecs.map((parameter, i) => [parameter.name, params[i]]))
-    )
-
-/**
- * Loads a safetensors file and returns tensors selected by parameter-spec names in
- * parameter-array order. A missing key fails with a {@link ModelError}; extra
- * keys are ignored. This maps names and arity but does not validate the
- * architecture. It leaves shape, dtype, storage, and placement compatibility
- * unchecked until first use.
- *
- * {@link Tensor.load} materializes the entire archive. This function releases
- * unselected tensors before success and releases all imported tensors if
- * validation fails or is interrupted. On success, the selected handles are
- * caller-owned and should be released with
- * {@link Tensor.clear} when no longer needed.
- *
- * @since 0.1.0
- * @category destructors
- */
-export const load = (
-  model: Model,
-  path: string
-): Effect.Effect<ReadonlyArray<Tensor.Concrete>, ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  Effect.flatMap(Tensor.load(path), (record) =>
-    Effect.onExit(
-      Effect.gen(function*() {
-        const params: Array<Tensor.Concrete> = []
-        for (const { name } of model.parameterSpecs) {
-          const param = record[name]
-          if (param === undefined) {
-            return yield* new ModelError({
-              op: "load",
-              message: `missing parameter "${name}" in ${path}`
-            })
-          }
-          params.push(param)
-        }
-        const retained = new Set(params)
-        for (const tensor of Object.values(record)) {
-          if (retained.has(tensor)) continue
-          yield* Tensor.clear(tensor)
-        }
-        return params
-      }),
-      (exit) => Exit.isFailure(exit) ? Tensor.clearAll(Object.values(record)) : Effect.void
-    ))
 
 /**
  * A failure in inference-artifact construction or generation: invalid
@@ -3253,10 +3184,11 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, Infe
  * This does not establish semantic language-model correctness or validate a
  * tokenizer/vocabulary contract.
  *
- * `params` are borrowed and materialized together once with
+ * Dense `params` are borrowed and materialized together once with
  * {@link Tensor.compute}. This samples lazy initializers once and produces a new
- * concrete generation retained as immutable constants by every compiled
- * program. Caller-supplied concrete handles are not consumed and may be cleared
+ * concrete generation. Already-concrete packed parameters are borrowed directly
+ * during compilation. Every compiled program retains its parameters as immutable
+ * constants. Caller-supplied concrete handles are not consumed and may be cleared
  * after this effect succeeds; the artifact's retained generation remains valid.
  * If tracing or pool construction fails or is interrupted, the newly
  * materialized parameter handles are cleared before the failure is returned.
@@ -3286,11 +3218,26 @@ export const inference = (
       ? []
       : resolved.speculation?.proposer.params ?? []
     const targetArity = params.length
+    const sourceParams = [...params, ...proposerSourceParams]
     return yield* Effect.flatMap(
-      Tensor.compute([...params, ...proposerSourceParams]),
-      (allFrozenParams) =>
+      Tensor.compute(sourceParams.filter((parameter) => parameter.storage === undefined)),
+      (materializedParams) =>
         Effect.onExit(
           Effect.gen(function*() {
+            let denseIndex = 0
+            const allFrozenParams: Array<Tensor.Concrete> = []
+            for (const parameter of sourceParams) {
+              if (parameter.storage === undefined) {
+                allFrozenParams.push(materializedParams[denseIndex++]!)
+              } else if (Tensor.isTensor(parameter)) {
+                allFrozenParams.push(parameter)
+              } else {
+                return yield* new InferenceError({
+                  op: "inference",
+                  message: "packed inference parameters must be concrete tensors"
+                })
+              }
+            }
             const frozenParams = allFrozenParams.slice(0, targetArity)
             const proposerParams = resolved.speculation === undefined
               ? undefined
@@ -3337,7 +3284,7 @@ export const inference = (
                 inferenceBackend("inferenceDiagnostics", runtime.extensions.inference.diagnostics(artifact))
             } satisfies InferenceProgram
           }),
-          (exit) => Exit.isFailure(exit) ? Tensor.clearAll(allFrozenParams) : Effect.void
+          (exit) => Exit.isFailure(exit) ? Tensor.clearAll(materializedParams) : Effect.void
         )
     )
   })

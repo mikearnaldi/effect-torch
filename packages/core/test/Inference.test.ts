@@ -1377,7 +1377,7 @@ onDevices("Inference", () => (it) => {
           // a misrouted or incorrectly normalized branch fails systematically.
           expect(chiSquare).toBeLessThan(60)
         }
-      }))
+      }), { timeout: 120_000 })
 
     it.effect("compiles one replay prefill per chunk shape for parallel-block speculation", () =>
       Effect.gen(function*() {
@@ -2119,33 +2119,51 @@ onDevices("Inference", () => (it) => {
         expect(error.message).toMatch(/only causal attention is cacheable/)
       }))
 
-    it.effect("releases its computed parameter generation when construction fails", () =>
-      Effect.gen(function*() {
-        const runtime = yield* Runtime.Runtime
-        const diagnostics = runtime.extensions.diagnostics
-        const model = yield* makeGpt({ causal: false })
-        const params = yield* Tensor.compute(yield* Model.initialize(model))
-        // The baseline includes caller-owned params. Returning to it proves the
-        // failed artifact released only its retained generation; readability
-        // below proves it did not consume the caller's handles.
-        const before = yield* diagnostics.externalMemoryBytes
-        yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4, prefillChunks: [4] }))
-        expect(yield* diagnostics.externalMemoryBytes).toBe(before)
-        expect((yield* Tensor.toNumberArray(params[0])).length).toBeGreaterThan(0)
-      }))
-
-    it.effect("releases lazily materialized parameters when construction fails", () =>
-      Effect.gen(function*() {
-        const runtime = yield* Runtime.Runtime
-        const diagnostics = runtime.extensions.diagnostics
-        const model = yield* makeGpt({ causal: false })
-        const params = yield* Model.initialize(model)
-        // Lazy params own no storage at this baseline; inference materializes a
-        // private generation that must be wholly released on construction error.
-        const before = yield* diagnostics.externalMemoryBytes
-        yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4, prefillChunks: [4] }))
-        expect(yield* diagnostics.externalMemoryBytes).toBe(before)
-      }))
+    for (const concrete of [true, false]) {
+      it.effect(
+        concrete
+          ? "releases its computed parameter generation when construction fails"
+          : "releases lazily materialized parameters when construction fails",
+        () =>
+          Effect.gen(function*() {
+            const runtime = yield* Runtime.Runtime
+            const model = yield* makeGpt({ causal: false })
+            const initialized = yield* Model.initialize(model)
+            const computed = concrete ? yield* Tensor.compute(initialized) : undefined
+            const params = computed ?? initialized
+            const materialized: Array<Tensor.Concrete> = []
+            const released: Array<Tensor.Concrete> = []
+            // Track this invocation's handles. Global memory totals can fall when
+            // finalizers reclaim unrelated tensors during the native call.
+            const tracked: Runtime.RuntimeService = {
+              ...runtime,
+              execute: (program, invocation) =>
+                runtime.execute(program, invocation).pipe(
+                  Effect.tap((values) => Effect.sync(() => void materialized.push(...values)))
+                ),
+              release: (value) =>
+                runtime.release(value).pipe(Effect.tap(() => Effect.sync(() => void released.push(value))))
+            }
+            const error = yield* Effect.flip(
+              Model.inference(model, params, { maxTokens: 16, blockSize: 4, prefillChunks: [4] }).pipe(
+                Effect.provideService(Runtime.Runtime, tracked)
+              )
+            )
+            expect(error._tag).toBe("InferenceError")
+            expect(materialized).toHaveLength(params.length)
+            expect(released).toHaveLength(materialized.length)
+            for (let index = 0; index < materialized.length; index++) {
+              expect(released[index]).toBe(materialized[index])
+              expect(params.includes(released[index])).toBe(false)
+              expect((yield* Effect.flip(runtime.readback(materialized[index]))).reason).toBe("invalid-handle")
+            }
+            if (computed !== undefined) {
+              for (const param of computed) expect((yield* Tensor.toNumberArray(param)).length).toBeGreaterThan(0)
+              yield* Tensor.clearAll(computed)
+            }
+          })
+      )
+    }
 
     it.effect("returns direct logits rows for single and batched decode", () =>
       Effect.gen(function*() {

@@ -83,6 +83,14 @@ export * as Optimizer from "./Optimizer.ts"
 export * as Runtime from "./Runtime.ts"
 
 /**
+ * Safetensors archive inspection, tensor persistence, and named model parameters.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as Safetensors from "./Safetensors.ts"
+
+/**
  * Restorable shuffled epoch sampling of next-token training windows.
  *
  * @since 0.1.0
@@ -91,7 +99,7 @@ export * as Runtime from "./Runtime.ts"
 export * as Sampler from "./Sampler.ts"
 
 /**
- * Lazy tensor graph construction, evaluation, compilation, transfer, and persistence.
+ * Lazy tensor graph construction, evaluation, compilation, and transfer.
  *
  * @since 0.1.0
  * @category modules

@@ -266,6 +266,7 @@ dependencies = [
  "effect-torch-autodiff",
  "effect-torch-graph",
  "effect-torch-runtime",
+ "half",
  "libm",
 ]
 
@@ -282,6 +283,9 @@ version = "0.1.0"
 dependencies = [
  "effect-torch-runtime",
  "napi",
+ "safetensors",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

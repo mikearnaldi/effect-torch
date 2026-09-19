@@ -27,6 +27,8 @@ describe("Metal executable cache keys", () => {
   it("passes the selected ordinal into graph leaves", () => {
     let receivedOrdinal: number | undefined
     class LazyTensorDouble {
+      readonly storage = { representation: "dense" }
+
       static zeros(_shape: Array<number>, _dtype?: NativeDType | null, deviceOrdinal?: number) {
         receivedOrdinal = deviceOrdinal
         return new LazyTensorDouble()
@@ -37,7 +39,8 @@ describe("Metal executable cache keys", () => {
       }
     }
     // SAFETY: This test invokes only LazyTensor.zeros and metadata through the adapter.
-    const native = { LazyTensor: LazyTensorDouble } as NativeAddon
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- The injected addon implements only the native methods exercised by this test.
+    const native = { LazyTensor: LazyTensorDouble } as unknown as NativeAddon
     const runtime = createRuntimeAdapter(native, 2)
 
     Effect.runSync(runtime.node({

@@ -49,6 +49,7 @@ export declare class Executable {
 export declare class LazyTensor {
   get shape(): Array<number>
   get dtype(): string
+  get storage(): NativeStorageMetadata
   get device(): string
   exposures(): Array<NativeExposure>
 }
@@ -84,6 +85,7 @@ export declare class NativeTensor {
   writeBytes(data: Uint8Array): void
   get shape(): Array<number>
   get dtype(): string
+  get storage(): NativeStorageMetadata
   get device(): string
   readback(token?: CancellationToken | undefined | null): Promise<Buffer>
   sample(temperature: number, topK: number, topP: number, seed: number, counter: number, token?: CancellationToken | undefined | null): Promise<number>
@@ -97,12 +99,22 @@ export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<La
 
 export declare function inspectGguf(path: string, token?: CancellationToken | undefined | null): Promise<NativeGgufInspection>
 
+/**
+ * Reads a standalone safetensors header or a Hugging Face index and every
+ * shard header it references without acquiring a CUDA device or allocating.
+ */
+export declare function inspectSafetensors(path: string, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsInspection>
+
 /** Whether a usable CUDA device and `compute_120` NVRTC compiler are present. */
 export declare function isAvailable(): boolean
 
-export declare function loadGgufForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null): Promise<NativeGgufArchive>
+/**
+ * Loads selected GGUF tensors on the requested CUDA device.
+ * Omitted names load all tensors; an empty list loads none.
+ */
+export declare function loadGgufForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeGgufArchive>
 
-export declare function loadTensors(path: string, device: number, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsArchive>
+export declare function loadTensors(path: string, device: number, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeSafetensorsArchive>
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined
@@ -125,6 +137,21 @@ export declare const enum NativeDecodeOutputSelection {
   BatchedLastTokenRow = 'BatchedLastTokenRow'
 }
 
+export interface NativeDTypeLegalizationDiagnostics {
+  targetBackend: string
+  targetArchitecture: string
+  loweringAbiRevision: number
+  policyRevision: number
+  capabilityQueries: number
+  nativeLoweringUnits: number
+  legalizedLoweringUnits: number
+  kernelLocalLegalizations: number
+  materializedConversions: number
+  materializedConversionBytes: number
+  decompositions: number
+  rejectedRegionCandidates: number
+}
+
 export interface NativeExecutableDiagnostics {
   semanticNodesBeforeOptimization: number
   semanticNodesAfterOptimization: number
@@ -133,6 +160,7 @@ export interface NativeExecutableDiagnostics {
   commandCount: number
   synchronizationCount: number
   memory: NativeMemoryDiagnostics
+  legalization: NativeDTypeLegalizationDiagnostics
   compilePhases: Array<NativeCompilePhaseDiagnostics>
 }
 
@@ -222,12 +250,29 @@ export interface NativeSafetensorsEntry {
   tensor: NativeTensor
 }
 
+export interface NativeSafetensorsInspection {
+  entries: Array<NativeSafetensorsTensorInfo>
+  metadata: Record<string, string>
+}
+
+export interface NativeSafetensorsTensorInfo {
+  name: string
+  dtype: string
+  shape: Array<number>
+  byteLength: number
+}
+
 export interface NativeSamplingOptions {
   temperature: number
   topK: number
   topP: number
   seed: number
   counter: number
+}
+
+export interface NativeStorageMetadata {
+  representation: string
+  format?: string | undefined
 }
 
 export declare function saveTensors(path: string, names: Array<string>, tensors: Array<NativeTensor>, metadata: Record<string, string>, token?: CancellationToken | undefined | null): Promise<void>

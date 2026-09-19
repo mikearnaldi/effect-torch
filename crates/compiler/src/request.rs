@@ -323,8 +323,15 @@ pub(crate) fn derive_graph_signature(
             });
         } else {
             let layout = if declaration.device.is_cpu() {
+                let physical_shape = effect_torch_runtime::ValueSpec {
+                    semantic_dtype: declaration.dtype,
+                    logical_shape: &declaration.shape,
+                    storage: declaration.storage.as_spec(),
+                }
+                .canonical_geometry()?
+                .physical_shape;
                 BindingLayoutPolicy::Require(LayoutConstraint::Exact(Layout::contiguous(
-                    declaration.shape.clone(),
+                    physical_shape,
                 )))
             } else {
                 BindingLayoutPolicy::Require(LayoutConstraint::ZeroOffsetContiguous)
@@ -332,6 +339,7 @@ pub(crate) fn derive_graph_signature(
             bindings.push(BindingDecl {
                 shape: declaration.shape.clone(),
                 dtype: declaration.dtype,
+                storage: declaration.storage.clone(),
                 placement: placement(&declaration.device),
                 layout,
                 aliasing: BindingAliasing::MayAlias,
@@ -339,6 +347,59 @@ pub(crate) fn derive_graph_signature(
         }
     }
     Ok(signature_with_contract(index, bindings, invocation))
+}
+
+/// Resolves caller binding layout policies into the graph index side table.
+/// The semantic nodes remain unchanged; capability queries read this prepared ABI.
+pub(crate) fn resolve_binding_storage(
+    index: &mut GraphIndex,
+    signature: &ProgramSignature,
+    state_cursor: Option<StateCursorSlot>,
+) -> Result<(), String> {
+    use effect_torch_runtime::{LayoutConstraintSpec, StorageLayout, StorageMetadata};
+    let mut binding_of_slot = vec![None; index.slots.len()];
+    let mut next_binding = 0;
+    for (slot, declaration) in index.slots.iter().enumerate() {
+        if declaration.scalar || state_cursor.is_some_and(|cursor| cursor.slot as usize == slot) {
+            continue;
+        }
+        let binding = signature
+            .bindings
+            .get(next_binding)
+            .ok_or_else(|| format!("compile: input slot {slot} has no binding declaration"))?;
+        if binding.shape != declaration.shape
+            || binding.dtype != declaration.dtype
+            || binding.storage.representation != declaration.storage.representation
+            || binding.placement.device() != placement(&declaration.device).device()
+        {
+            return Err(format!(
+                "compile: binding {next_binding} does not match semantic input slot {slot}"
+            ));
+        }
+        binding.value_spec().validate()?;
+        binding_of_slot[slot] = Some(next_binding);
+        next_binding += 1;
+    }
+    if next_binding != signature.bindings.len() {
+        return Err("compile: binding declarations exceed semantic tensor inputs".into());
+    }
+    for &(node, slot) in &index.slot_leaves {
+        if let Some(binding) = binding_of_slot[slot as usize] {
+            let value = signature.bindings[binding].value_spec();
+            index.value_storage[node.index()] = StorageMetadata {
+                representation: value.storage.representation,
+                layout: match value.storage.layout_constraint {
+                    LayoutConstraintSpec::Unconstrained => StorageLayout::Unconstrained,
+                    LayoutConstraintSpec::Canonical => StorageLayout::Canonical,
+                    LayoutConstraintSpec::DenseStrided(layout) => {
+                        StorageLayout::DenseStrided(layout.clone())
+                    }
+                    LayoutConstraintSpec::BackendPrivate(abi) => match abi {},
+                },
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Adds output declarations from caller-ordered roots to a signature and
@@ -358,6 +419,7 @@ pub(crate) fn signature_with_contract(
             OutputSignature {
                 shape: node.shape.clone(),
                 dtype: node.dtype,
+                storage: node.storage.clone(),
                 placement: placement(&node.device),
             }
         })
@@ -439,6 +501,7 @@ mod tests {
             (Device::Metal(0), "metal:0", Some("shared")),
         ] {
             let input = Node::new(NodeKind::Input {
+                storage: effect_torch_runtime::StorageMetadata::dense(),
                 slot: 0,
                 shape: vec![2],
                 dtype: DType::F32,
@@ -508,6 +571,7 @@ mod tests {
         })
         .unwrap();
         let tensor_1 = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 1,
             shape: vec![1],
             dtype: DType::I64,
@@ -521,6 +585,7 @@ mod tests {
         })
         .unwrap();
         let tensor_3 = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 3,
             shape: vec![3],
             dtype: DType::F32,
@@ -561,6 +626,7 @@ mod tests {
     fn state_cursor_is_internal_runtime_metadata_not_a_caller_argument() {
         for tensor in [false, true] {
             let caller = Node::new(NodeKind::Input {
+                storage: effect_torch_runtime::StorageMetadata::dense(),
                 slot: 0,
                 shape: vec![2],
                 dtype: DType::F32,
@@ -569,6 +635,7 @@ mod tests {
             .unwrap();
             let cursor = if tensor {
                 Node::new(NodeKind::Input {
+                    storage: effect_torch_runtime::StorageMetadata::dense(),
                     slot: 1,
                     shape: vec![3],
                     dtype: DType::I64,

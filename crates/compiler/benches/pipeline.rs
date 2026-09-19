@@ -18,6 +18,40 @@ use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// This benchmark measures selection against a fixed synthetic target.
+struct BenchmarkTarget {
+    fingerprint: effect_torch_compiler::TargetFingerprint,
+}
+impl effect_torch_compiler::TargetDTypeCapabilities for BenchmarkTarget {
+    fn device(&self) -> &Device {
+        &Device::Cpu(0)
+    }
+    fn fingerprint(&self) -> &effect_torch_compiler::TargetFingerprint {
+        &self.fingerprint
+    }
+    fn policy_revision(&self) -> u64 {
+        1
+    }
+    fn storage_support(
+        &self,
+        _: &effect_torch_compiler::ValueSpec<'_>,
+    ) -> effect_torch_compiler::StorageSupport {
+        effect_torch_compiler::StorageSupport::Supported
+    }
+    fn classify_node(
+        &self,
+        spec: &effect_torch_compiler::OperationDTypeSpec<'_>,
+    ) -> effect_torch_compiler::DTypeDisposition {
+        effect_torch_compiler::DTypeDisposition::Native(spec.native_execution())
+    }
+    fn classify_region(
+        &self,
+        spec: &effect_torch_compiler::RegionDTypeSpec<'_>,
+    ) -> effect_torch_compiler::DTypeDisposition {
+        effect_torch_compiler::DTypeDisposition::Native(spec.native_execution())
+    }
+}
+
 const DEFAULT_ITERATIONS: usize = 7;
 
 /// Parameterized benchmark workloads. `Stack50k` and `Stack100k` run only in
@@ -234,6 +268,7 @@ fn input(next_slot: &mut u32, shape: &[usize]) -> Arc<Node> {
         .checked_add(1)
         .expect("benchmark input slot overflow");
     node(NodeKind::Input {
+        storage: effect_torch_runtime::StorageMetadata::dense(),
         slot,
         shape: shape.to_vec(),
         dtype: DType::F32,
@@ -464,7 +499,14 @@ fn measure_once(workload: Workload, size: usize) -> Result<Sample, String> {
     let index = GraphIndex::new(&roots)?;
     let index_ns = index_started.elapsed().as_nanos();
     let optimization_started = Instant::now();
-    let plan = OptimizationPlan::select(&index, &CompileOptions::default())?;
+    let target = BenchmarkTarget {
+        fingerprint: effect_torch_compiler::TargetFingerprint::new(
+            effect_torch_compiler::TargetBackend::Cpu,
+            "compiler-benchmark",
+            1,
+        ),
+    };
+    let plan = OptimizationPlan::select(&index, &CompileOptions::default(), &target)?;
     let optimization_ns = optimization_started.elapsed().as_nanos();
     let analysis_ns = analysis_started.elapsed().as_nanos();
 

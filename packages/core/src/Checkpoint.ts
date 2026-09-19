@@ -34,6 +34,7 @@
  */
 import { Data, Effect, Exit } from "effect"
 import type * as Runtime from "./Runtime.ts"
+import * as Safetensors from "./Safetensors.ts"
 import type * as Sampler from "./Sampler.ts"
 import * as Tensor from "./Tensor.ts"
 import type * as Trainer from "./Trainer.ts"
@@ -114,7 +115,7 @@ export interface CheckpointWithSampler<S> extends Checkpoint<S> {
  *
  * `path` is handled by the selected runtime's direct safetensors extension.
  * The write materializes all entries together. It then performs
- * {@link Tensor.save}'s ordered best-effort cleanup and attempts to release
+ * {@link Safetensors.save}'s ordered best-effort cleanup and attempts to release
  * each temporary independently. `trained` remains untouched. Atomic replacement
  * and durability depend on the backend; this function does not guarantee them.
  * In particular, interruption or failure does not portably imply that the
@@ -133,7 +134,7 @@ export const save = <S, EL, RL, ED, RD, EO, RO>(
 ): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const entries = yield* trainerEntries(trainer, trained)
-    yield* Tensor.save(path, entries)
+    yield* Safetensors.save(path, entries)
   })
 
 /**
@@ -168,7 +169,7 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
     entries[SAMPLER_LENGTH_KEY] = yield* Tensor.full([], state.config.length, { dtype: "u32" })
     entries[SAMPLER_BLOCK_KEY] = yield* Tensor.full([], state.config.block, { dtype: "u32" })
     entries[SAMPLER_BATCH_KEY] = yield* Tensor.full([], state.config.batch, { dtype: "u32" })
-    yield* Tensor.save(path, entries)
+    yield* Safetensors.save(path, entries)
   })
 
 /**
@@ -269,7 +270,7 @@ const withLoadedTensors = <A, E, R>(
   use: (tensors: Record<string, Tensor.Concrete>) => Effect.Effect<A, E, R>,
   retain: (value: A) => ReadonlyArray<Tensor.Concrete>
 ): Effect.Effect<A, E | Tensor.TensorError, R | Runtime.Runtime> =>
-  Effect.flatMap(Tensor.load(path), (tensors) =>
+  Effect.flatMap(Safetensors.load(path), (tensors) =>
     Effect.onExit(
       Effect.gen(function*() {
         const value = yield* use(tensors)

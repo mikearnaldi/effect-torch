@@ -86,23 +86,30 @@ type GgufLoadDouble = (
 ) => Promise<{
   entries: Array<{
     descriptor: NativeGgufTensorDescriptor
-    tensor: { clear(): void; device: string; dtype: string; shape: Array<number> }
+    tensor: {
+      clear(): void
+      device: string
+      dtype: string
+      shape: Array<number>
+      storage?: { representation: string; format?: string }
+    }
   }>
 }>
 
-const makeNativeAddonDouble = (loadGguf: GgufLoadDouble): NativeAddon => {
-  class Token {
-    cancelled = false
-    cancel() {
-      this.cancelled = true
-    }
+class Token {
+  cancelled = false
+  cancel() {
+    this.cancelled = true
   }
+}
+
+const makeNativeAddonDouble = (loadGguf: GgufLoadDouble): NativeAddon => {
   const addon = { CancellationToken: Token, loadGguf }
   // SAFETY: GGUF ownership tests use only the typed loadGguf and CancellationToken fields.
   return addon as NativeAddon
 }
 
-it.effect("loads GGUF payloads and rejects codec mismatches for matching physical shapes", () =>
+it.effect("loads logical packed GGUF tensors and rejects codec mismatches for matching physical shapes", () =>
   withFixture((file) =>
     Effect.gen(function*() {
       const runtime = yield* Runtime.Runtime
@@ -112,9 +119,11 @@ it.effect("loads GGUF payloads and rejects codec mismatches for matching physica
       const q4 = archive.entries.find((entry) => entry.descriptor.name === "q4")!
 
       expect([...new Float32Array(yield* runtime.readback(dense.tensor))]).toEqual([1.5, -2.25])
-      expect([...new Uint8Array(yield* runtime.readback(q2.tensor))]).toEqual(
-        Array.from({ length: 1008 }, (_, index) => index % 251)
-      )
+      expect(q2.tensor.shape).toEqual(q2.descriptor.logicalShape)
+      expect(q2.tensor.dtype).toBe("f32")
+      expect(q2.tensor.storage?.encoding).toBe("Q2_K")
+      const packedReadback = yield* Effect.flip(runtime.readback(q2.tensor))
+      expect(packedReadback.message).toContain("packed")
       expect(q2.descriptor.physicalShape).toEqual([1, 1008])
       expect(q4.descriptor.physicalShape).toEqual([1, 1008])
 
@@ -156,7 +165,11 @@ it.effect("loads GGUF payloads and rejects codec mismatches for matching physica
       const repeated = yield* Effect.flip(runtime.compile({ roots: [input, conflicting] }))
       expect(repeated.message).toContain("conflicting logical declarations")
 
-      const executable = yield* runtime.compile({ roots: [input] })
+      const rootError = yield* Effect.flip(runtime.compile({ roots: [input] }))
+      expect(rootError.message).toContain("packed program outputs")
+      const indexes = yield* runtime.node({ op: "zeros", inputs: [], attributes: { shape: [1], dtype: "u32" } })
+      const embedded = yield* runtime.node({ op: "quantizedEmbedding", inputs: [indexes, input], attributes: {} })
+      const executable = yield* runtime.compile({ roots: [embedded] })
       const mismatch = yield* Effect.flip(runtime.execute(executable, {
         bindings: [q4.tensor],
         scalars: [],
@@ -164,16 +177,16 @@ it.effect("loads GGUF payloads and rejects codec mismatches for matching physica
       }))
       expect(mismatch.message).toContain("does not match its compiled logical declaration")
 
-      const [identity] = yield* runtime.execute(executable, {
+      const [result] = yield* runtime.execute(executable, {
         bindings: [q2.tensor],
         scalars: [],
         runtimeValues: {}
       })
-      expect(identity.storage?.encoding).toBe("Q2_K")
-      expect([...new Uint8Array(yield* runtime.readback(identity))]).toEqual(
-        Array.from({ length: 1008 }, (_, index) => index % 251)
-      )
-      yield* runtime.release(identity)
+      expect(result.storage).toBeUndefined()
+      expect(result.shape).toEqual(q2.tensor.shape)
+      expect(result.dtype).toBe("f32")
+      expect(new Float32Array(yield* runtime.readback(result)).length).toBe(3072)
+      yield* runtime.release(result)
 
       const scalar = yield* runtime.node({
         op: "scalarInput",
@@ -190,15 +203,19 @@ it.effect("loads GGUF payloads and rejects codec mismatches for matching physica
         inputs: [q2.tensor],
         attributes: { slot: 1, shape: q2.descriptor.logicalShape, dtype: "f32", storage: q2Storage }
       })
-      const interleaved = yield* runtime.compile({ roots: [scalar, shifted, shiftedAgain] })
+      const first = yield* runtime.node({ op: "quantizedEmbedding", inputs: [indexes, shifted], attributes: {} })
+      const second = yield* runtime.node({ op: "quantizedEmbedding", inputs: [indexes, shiftedAgain], attributes: {} })
+      const interleaved = yield* runtime.compile({ roots: [scalar, first, second] })
       const values = yield* runtime.execute(interleaved, {
         bindings: [q2.tensor],
         scalars: [7],
         runtimeValues: {}
       })
       expect([...new Float32Array(yield* runtime.readback(values[0]!))]).toEqual([7])
-      expect(values[1]!.storage?.encoding).toBe("Q2_K")
-      expect(values[2]!.storage?.encoding).toBe("Q2_K")
+      expect(values[1]!.storage).toBeUndefined()
+      expect(values[2]!.storage).toBeUndefined()
+      expect(values[1]!.shape).toEqual([1, 3072])
+      expect(values[2]!.shape).toEqual([1, 3072])
       for (const value of values) yield* runtime.release(value)
       for (const entry of archive.entries) yield* runtime.release(entry.tensor)
     })
@@ -266,4 +283,63 @@ it.effect("clears a late GGUF result after interrupting I/O", () =>
     yield* Effect.promise(() => Promise.resolve())
 
     expect(clear).toHaveBeenCalledTimes(1)
+  }))
+
+it.effect("rejects invalid native packed metadata and clears unpublished GGUF tensors", () =>
+  Effect.gen(function*() {
+    const descriptor: NativeGgufTensorDescriptor = {
+      name: "q2",
+      format: "Q2_K",
+      logicalShape: [1, 3072],
+      logicalDtype: "f32",
+      physicalShape: [1, 1008],
+      physicalDtype: "u8"
+    }
+    const invalidMetadata = [
+      { shape: [1, 1008], dtype: "u8", storage: { representation: "dense" } },
+      { shape: [1, 3072], dtype: "f32", storage: { representation: "dense" } },
+      { shape: [1, 3072], dtype: "f32", storage: { representation: "packed", format: "Q4_K" } },
+      { shape: [1, 3072], dtype: "f32", storage: { representation: "packed", format: "Q7_K" } },
+      { shape: [1, 3072], dtype: "f32", storage: { representation: "vendor", format: "Q2_K" } },
+      { shape: [1, 3072], dtype: "f32", storage: { representation: "dense", format: "Q2_K" } },
+      { shape: [1, 3071], dtype: "f32", storage: { representation: "packed", format: "Q2_K" } }
+    ]
+    for (const metadata of invalidMetadata) {
+      const clear = vi.fn()
+      const tensor = { ...metadata, device: "cpu", clear }
+      const runtime = createRuntimeAdapter(makeNativeAddonDouble(async () => ({ entries: [{ descriptor, tensor }] })))
+      const error = yield* Effect.flip(runtime.extensions.gguf.load("invalid-metadata.gguf"))
+      expect(error.reason).toBe("io-failed")
+      expect(error.message).toMatch(/logical declaration|storage representation|packed tensor geometry/)
+      expect(clear).toHaveBeenCalledTimes(1)
+    }
+  }))
+
+it.effect("passes logical F32 inputs and packed storage to the native graph", () =>
+  Effect.gen(function*() {
+    const shape = [2, 256]
+    const storage = { encoding: "Q4_K", physicalShape: [2, 144], physicalDtype: "u8" } as const
+    const nativeStorage = { representation: "packed", format: "Q4_K" }
+    const input = vi.fn(() => ({ metadata: () => [shape, "f32"], storage: nativeStorage }))
+    // SAFETY: This test exercises only LazyTensor.input and the returned metadata.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- The injected addon implements only the native methods exercised by this test.
+    const native = { CancellationToken: Token, LazyTensor: { input } } as unknown as NativeAddon
+    const runtime = createRuntimeAdapter(native)
+    const handle = yield* runtime.node({
+      op: "input",
+      inputs: [],
+      attributes: { slot: 0, shape, dtype: "f32", storage }
+    })
+    expect(input).toHaveBeenCalledWith(0, shape, "f32", nativeStorage)
+    expect(handle.shape).toEqual(shape)
+    expect(handle.dtype).toBe("f32")
+    expect(handle.storage).toEqual(storage)
+
+    input.mockReturnValue({ metadata: () => [[2, 144], "u8"], storage: nativeStorage })
+    const error = yield* Effect.flip(runtime.node({
+      op: "input",
+      inputs: [],
+      attributes: { slot: 1, shape, dtype: "f32", storage }
+    }))
+    expect(error.message).toMatch(/logical declaration|packed tensor geometry/)
   }))

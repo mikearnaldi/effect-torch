@@ -3,7 +3,18 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Checkpoint, Gradient, LearningRate, Loss, Model, Optimizer, Sampler, Tensor, Trainer } from "../src/index.ts"
+import {
+  Checkpoint,
+  Gradient,
+  LearningRate,
+  Loss,
+  Model,
+  Optimizer,
+  Safetensors,
+  Sampler,
+  Tensor,
+  Trainer
+} from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
@@ -17,14 +28,14 @@ onDevices("Checkpoint", () => (it) => {
       const dir = yield* tmpdir
       const file = path.join(dir, "model.safetensors")
       // every dtype that runs on every device (f64 is CPU-only hardware-wise)
-      yield* Tensor.save(file, {
+      yield* Safetensors.save(file, {
         "w.f32": yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2]),
         "w.f16": yield* Tensor.cast(yield* Tensor.fromTypedArray(new Float32Array([5, 6]), [2]), "f16"),
         "w.i64": yield* Tensor.fromTypedArray(new BigInt64Array([7n, 8n, 9n]), [3]),
         "w.u8": yield* Tensor.fromTypedArray(new Uint8Array([10, 11]), [2]),
         "w.u32": yield* Tensor.fromTypedArray(new Uint32Array([12]), [1])
       })
-      const loaded = yield* Tensor.load(file)
+      const loaded = yield* Safetensors.load(file)
       expect(Object.keys(loaded).sort()).toEqual(["w.f16", "w.f32", "w.i64", "w.u32", "w.u8"])
       expect(loaded["w.f32"].dtype).toBe("f32")
       expect(loaded["w.f32"].shape).toEqual([2, 2])
@@ -45,11 +56,11 @@ onDevices("Checkpoint", () => (it) => {
       const file = path.join(dir, "lazy.safetensors")
       const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
       const y = yield* Tensor.fromTypedArray(floats([4, 5, 6]), [3])
-      yield* Tensor.save(file, {
+      yield* Safetensors.save(file, {
         sum: yield* Tensor.add(x, y),
         product: yield* Tensor.mul(x, y)
       })
-      const loaded = yield* Tensor.load(file)
+      const loaded = yield* Safetensors.load(file)
       expect(yield* values(loaded["sum"])).toEqual([5, 7, 9])
       expect(yield* values(loaded["product"])).toEqual([4, 10, 18])
     }))
@@ -59,8 +70,8 @@ onDevices("Checkpoint", () => (it) => {
       const dir = yield* tmpdir
       const file = path.join(dir, "views.safetensors")
       const source = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
-      yield* Tensor.save(file, { transposed: yield* Tensor.transpose(source, [1, 0]) })
-      const loaded = yield* Tensor.load(file)
+      yield* Safetensors.save(file, { transposed: yield* Tensor.transpose(source, [1, 0]) })
+      const loaded = yield* Safetensors.load(file)
       expect(loaded.transposed.shape).toEqual([3, 2])
       expect(yield* values(loaded.transposed)).toEqual([1, 4, 2, 5, 3, 6])
     }))
@@ -69,10 +80,10 @@ onDevices("Checkpoint", () => (it) => {
     Effect.gen(function*() {
       const dir = yield* tmpdir
       const file = path.join(dir, "ops.safetensors")
-      yield* Tensor.save(file, {
+      yield* Safetensors.save(file, {
         x: yield* Tensor.fromTypedArray(floats([1, 2]), [2])
       })
-      const loaded = yield* Tensor.load(file)
+      const loaded = yield* Safetensors.load(file)
       const doubled = yield* Tensor.add(loaded["x"], loaded["x"])
       expect(yield* values(doubled)).toEqual([2, 4])
     }))
@@ -89,8 +100,8 @@ onDevices("Checkpoint", () => (it) => {
       const lr = yield* Tensor.full([], 0.1, { dtype: "f32" })
       const next = yield* optimizer.step([p], [gp], state, lr)
       const [m, v] = yield* Tensor.compute(next.stateRoots)
-      yield* Tensor.save(file, { "m.0": m, "v.0": v })
-      const loaded = yield* Tensor.load(file)
+      yield* Safetensors.save(file, { "m.0": m, "v.0": v })
+      const loaded = yield* Safetensors.load(file)
       expect(yield* values(loaded["m.0"])).toEqual(yield* values(m))
       expect(yield* values(loaded["v.0"])).toEqual(yield* values(v))
     }))
@@ -187,10 +198,10 @@ onDevices("Checkpoint", () => (it) => {
       yield* Checkpoint.saveWithSampler(base, trainer, trained, sampler)
       const corrupt = (name: string, mutate: (entries: Record<string, Tensor.Any>) => void) =>
         Effect.gen(function*() {
-          const entries = { ...yield* Tensor.load(base) }
+          const entries = { ...yield* Safetensors.load(base) }
           mutate(entries)
           const file = path.join(dir, name)
-          yield* Tensor.save(file, entries)
+          yield* Safetensors.save(file, entries)
           return file
         })
       const expectCheckpointError = (file: string, text: string) =>
@@ -275,7 +286,7 @@ onDevices("Checkpoint", () => (it) => {
 
   it.effect("fails with TensorError on a missing file", () =>
     Effect.gen(function*() {
-      const error = yield* Effect.flip(Tensor.load("/nonexistent/model.safetensors"))
+      const error = yield* Effect.flip(Safetensors.load("/nonexistent/model.safetensors"))
       expect(error._tag).toBe("TensorError")
       expect(error.op).toBe("load")
     }))
@@ -283,7 +294,7 @@ onDevices("Checkpoint", () => (it) => {
   it.effect("fails with TensorError on an unwritable path", () =>
     Effect.gen(function*() {
       const error = yield* Effect.flip(
-        Tensor.save("/nonexistent/dir/model.safetensors", {
+        Safetensors.save("/nonexistent/dir/model.safetensors", {
           x: yield* Tensor.fromTypedArray(floats([1]), [1])
         })
       )

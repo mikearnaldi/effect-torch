@@ -5,11 +5,11 @@
 //! strided layouts. The kernel indexes through their strides instead of
 //! materializing contiguous copies.
 //!
-//! [`MatmulAlgorithm::Naive`] is the only current algorithm. Its row-major
-//! `m × k × n` loop accumulates directly into the destination.
+//! [`MatmulAlgorithm::Naive`] accumulates directly into the destination.
+//! [`MatmulAlgorithm::HalfF32`] uses one F32 register accumulator per output.
 //! Floating-point dtypes accumulate with fused multiply-add. Integer dtypes
 //! (`u8`, `u32`, `i64`) use wrapping-free plain `c + a * b` semantics in
-//! their own type. Planning rejects `f16` and `bf16` matmul.
+//! their own type. Half operands widen to F32 and round each output once.
 
 use super::tensor::{CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
@@ -19,6 +19,7 @@ use effect_torch_runtime::{DType, Layout};
 pub enum MatmulAlgorithm {
     /// Direct triple loop over the (possibly strided) operand layouts.
     Naive,
+    HalfF32,
 }
 
 /// Exact resources and algorithm selected for one matmul invocation.
@@ -181,11 +182,48 @@ fn validate_matmul(
         }
     }
     match (requirements.algorithm, a.dtype()) {
+        (MatmulAlgorithm::HalfF32, DType::F16 | DType::BF16) => Ok(()),
         (MatmulAlgorithm::Naive, DType::F32 | DType::F64 | DType::U8 | DType::U32 | DType::I64) => {
             Ok(())
         }
         _ => Err("matmul: algorithm and dtype do not match exact requirements".into()),
     }
+}
+
+fn half_into<T: Elem>(
+    a: &[T],
+    a_layout: &Layout,
+    b: &[T],
+    b_layout: &Layout,
+    destination: &mut CpuDestination<'_>,
+    requirements: &MatmulRequirements,
+    widen: impl Fn(T) -> f32,
+    narrow: impl Fn(f32) -> T,
+) -> Result<(), String> {
+    let a_row = a_layout.strides()[a_layout.rank() - 2];
+    let a_col = a_layout.strides()[a_layout.rank() - 1];
+    let b_row = b_layout.strides()[b_layout.rank() - 2];
+    let b_col = b_layout.strides()[b_layout.rank() - 1];
+    let batch_rank = requirements.output.shape.len() - 2;
+    destination.write_current::<T, _>("matmul", |output| {
+        for batch in 0..requirements.batch {
+            let a_offset = batch_offset(a_layout, &requirements.output.shape[..batch_rank], batch);
+            let b_offset = batch_offset(b_layout, &requirements.output.shape[..batch_rank], batch);
+            for row in 0..requirements.m {
+                for column in 0..requirements.n {
+                    let mut accumulator = 0f32;
+                    for inner in 0..requirements.k {
+                        accumulator = widen(a[a_offset + row * a_row + inner * a_col]).mul_add(
+                            widen(b[b_offset + inner * b_row + column * b_col]),
+                            accumulator,
+                        );
+                    }
+                    output[(batch * requirements.m + row) * requirements.n + column] =
+                        narrow(accumulator);
+                }
+            }
+        }
+    })
 }
 
 fn naive_into<T>(
@@ -243,8 +281,7 @@ impl Tensor {
         let batch = checked_product(&output_shape[..rank - 2])?;
         let algorithm = match self.dtype() {
             DType::F32 | DType::F64 | DType::U8 | DType::U32 | DType::I64 => MatmulAlgorithm::Naive,
-            DType::F16 => return Err("f16 matmul is not supported on the CPU backend"),
-            DType::BF16 => return Err("bf16 matmul is not supported on the CPU backend"),
+            DType::F16 | DType::BF16 => MatmulAlgorithm::HalfF32,
         };
         Ok(MatmulRequirements {
             output: checked_requirement(&output_shape, self.dtype())?,
@@ -285,6 +322,26 @@ impl Tensor {
     ) -> Result<(), String> {
         validate_matmul(self, rhs, destination, scratch, requirements)?;
         match (requirements.algorithm, &self.buffer, &rhs.buffer) {
+            (MatmulAlgorithm::HalfF32, CpuBuffer::F16(a), CpuBuffer::F16(b)) => half_into(
+                a,
+                &self.layout,
+                b,
+                &rhs.layout,
+                destination,
+                requirements,
+                half::f16::to_f32,
+                half::f16::from_f32,
+            ),
+            (MatmulAlgorithm::HalfF32, CpuBuffer::BF16(a), CpuBuffer::BF16(b)) => half_into(
+                a,
+                &self.layout,
+                b,
+                &rhs.layout,
+                destination,
+                requirements,
+                half::bf16::to_f32,
+                half::bf16::from_f32,
+            ),
             (MatmulAlgorithm::Naive, CpuBuffer::F32(a), CpuBuffer::F32(b)) => naive_into(
                 a,
                 &self.layout,
@@ -478,19 +535,25 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_half_matmul_is_fallible() {
-        let a = Tensor::from_vec(vec![half::f16::ZERO; 4], vec![2, 2]);
-        let b = Tensor::from_vec(vec![half::f16::ZERO; 4], vec![2, 2]);
-        assert_eq!(
-            a.try_matmul(&b).err(),
-            Some("f16 matmul is not supported on the CPU backend")
-        );
-
-        let a = Tensor::from_vec(vec![half::bf16::ZERO; 4], vec![2, 2]);
-        let b = Tensor::from_vec(vec![half::bf16::ZERO; 4], vec![2, 2]);
-        assert_eq!(
-            a.try_matmul(&b).err(),
-            Some("bf16 matmul is not supported on the CPU backend")
-        );
+    fn half_matmul_accumulates_in_f32_under_allocation_guard() {
+        for (dtype, large) in [(DType::F16, 2048f32), (DType::BF16, 256f32)] {
+            let a = Tensor::from_vec(vec![large, 1., -large], vec![1, 3]).cast(dtype);
+            let b = Tensor::ones(&[3, 1], dtype);
+            let requirements = a.matmul_requirements(&b).unwrap();
+            assert_eq!(requirements.algorithm, MatmulAlgorithm::HalfF32);
+            let mut output = Tensor::empty(&[1, 1], dtype);
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                a.matmul_into(
+                    &b,
+                    &mut output.destination().unwrap(),
+                    &mut [],
+                    &requirements,
+                )
+                .unwrap();
+            }
+            let output = output.cast(DType::F32);
+            assert_eq!(f32::slice_of(&output).unwrap(), &[1.]);
+        }
     }
 }

@@ -46,7 +46,7 @@
 //! an explicit worklist instead of recursion. This prevents long chains from
 //! overflowing worker-thread stacks. The crate contains no `unsafe` code.
 
-use effect_torch_runtime::{DType, GgmlKQuant};
+use effect_torch_runtime::{DType, GgmlKQuant, StorageMetadata, StorageRepresentation, ValueSpec};
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
@@ -115,6 +115,17 @@ pub struct NodeMetadata {
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub device: Device,
+    pub storage: StorageMetadata,
+}
+
+impl NodeMetadata {
+    pub fn value_spec(&self) -> ValueSpec<'_> {
+        ValueSpec {
+            semantic_dtype: self.dtype,
+            logical_shape: &self.shape,
+            storage: self.storage.as_spec(),
+        }
+    }
 }
 
 /// A user tensor stored in a graph leaf.
@@ -126,6 +137,7 @@ pub trait LeafValue: Any + Send + Sync {
     fn shape(&self) -> Vec<usize>;
     fn dtype(&self) -> DType;
     fn device(&self) -> Device;
+    fn storage(&self) -> StorageMetadata;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -173,6 +185,7 @@ impl LeafSlot {
             shape: value.shape(),
             dtype: value.dtype(),
             device: value.device(),
+            storage: value.storage(),
         })
     }
 }
@@ -272,9 +285,9 @@ fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> Result<Vec<usize>, Stri
             k.shape, v.shape
         ));
     }
-    if !matches!(q.dtype, DType::F32 | DType::F64 | DType::BF16) {
+    if !q.dtype.is_float() {
         return Err(format!(
-            "{op}: dtype must be f32, f64 or bf16, got {:?}",
+            "{op}: dtype must be floating point, got {:?}",
             q.dtype
         ));
     }
@@ -335,9 +348,9 @@ fn kda_check(
             beta.shape
         ));
     }
-    if !matches!(q.dtype, DType::F32 | DType::F64 | DType::BF16) {
+    if !q.dtype.is_float() {
         return Err(format!(
-            "{op}: dtype must be f32, f64 or bf16, got {:?}",
+            "{op}: dtype must be floating point, got {:?}",
             q.dtype
         ));
     }
@@ -402,11 +415,8 @@ fn head_ce_check(
             target.dtype
         ));
     }
-    if !matches!(x.dtype, DType::F32 | DType::F64 | DType::BF16) {
-        return Err(format!(
-            "{op}: x must be f32, f64 or bf16, got {:?}",
-            x.dtype
-        ));
+    if !x.dtype.is_float() {
+        return Err(format!("{op}: x must be floating point, got {:?}", x.dtype));
     }
     if weight.dtype != x.dtype || bias.dtype != x.dtype {
         return Err(format!(
@@ -552,6 +562,7 @@ pub enum NodeKind {
         shape: Vec<usize>,
         dtype: DType,
         device: Device,
+        storage: StorageMetadata,
     },
     ScalarInput {
         slot: u32,
@@ -1106,26 +1117,22 @@ pub enum NodeKind {
     },
     /// A linear layer with packed K-quant weights. It multiplies f32
     /// `x [.., columns]` by the dequantized
-    /// `weight_shape = [rows, columns]` matrix and adds an optional f32 bias
+    /// logical `weight.shape = [rows, columns]` matrix and adds an optional f32 bias
     /// `[rows]`. The f32 output has shape `[.., rows]`. `weight` is the
-    /// packed u8 tensor `[rows, encoded_row_bytes]`.
+    /// logical f32 value with validated packed GGML storage.
     QuantizedLinear {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Option<Arc<Node>>,
-        codec: GgmlKQuant,
-        weight_shape: [usize; 2],
     },
     /// An embedding lookup over a packed K-quant table. The i64 or u32
     /// `indexes` may have any shape and select rows of the dequantized
-    /// `weight_shape = [rows, columns]` table. The f32 output has shape
+    /// logical `weight.shape = [rows, columns]` table. The f32 output has shape
     /// `[..indexes, columns]`. When set, `padding_index` zeroes that row's
     /// output and gradient.
     QuantizedEmbedding {
         indexes: Arc<Node>,
         weight: Arc<Node>,
-        codec: GgmlKQuant,
-        weight_shape: [usize; 2],
         padding_index: Option<usize>,
     },
     /// A 1-D convolution with x `[N, C_in, L]` and
@@ -1324,6 +1331,7 @@ pub struct Node {
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub device: Device,
+    pub storage: StorageMetadata,
     pub kind: NodeKind,
 }
 
@@ -1359,6 +1367,20 @@ impl Drop for Node {
 }
 
 impl Node {
+    /// Complete semantic value and boundary storage contract.
+    pub fn value_spec(&self) -> ValueSpec<'_> {
+        ValueSpec {
+            semantic_dtype: self.dtype,
+            logical_shape: &self.shape,
+            storage: self.storage.as_spec(),
+        }
+    }
+
+    /// Derives packed format and logical matrix dimensions from the weight value.
+    pub fn packed_matrix(&self) -> Result<(GgmlKQuant, [usize; 2]), String> {
+        self.value_spec().packed_matrix()
+    }
+
     /// Validates `kind` and returns a shared node with cached metadata. See
     /// [`NodeKind::metadata`] for operand shape, dtype, and device checks.
     /// Unlike direct struct construction, this function guarantees a fresh id
@@ -1370,6 +1392,7 @@ impl Node {
             shape: metadata.shape,
             dtype: metadata.dtype,
             device: metadata.device,
+            storage: metadata.storage,
             kind,
         }))
     }
@@ -1399,22 +1422,30 @@ fn broadcast_shapes(a: &[usize], b: &[usize]) -> std::result::Result<Vec<usize>,
 
 // A 0-d float operand never promotes a float tensor's dtype. A scalar-tensor
 // operation keeps the tensor's dtype and casts the scalar to it during
-// evaluation, matching PyTorch's scalar promotion rules. Integer dtype
-// mismatches keep the existing first-operand rule.
-fn scalar_aware_binary_dtype(a: &Node, b: &Node) -> DType {
-    if a.dtype != b.dtype
-        && a.dtype.is_float()
-        && b.dtype.is_float()
-        && a.shape.is_empty() != b.shape.is_empty()
-    {
-        if a.shape.is_empty() {
-            b.dtype
-        } else {
-            a.dtype
-        }
-    } else {
-        a.dtype
+// evaluation, matching PyTorch's scalar promotion rules. Other dtype
+// mismatches require an explicit cast.
+fn scalar_aware_binary_dtype(a: &Node, b: &Node) -> Result<DType, String> {
+    if a.dtype == b.dtype {
+        return Ok(a.dtype);
     }
+    if a.dtype.is_float() && b.dtype.is_float() && a.shape.is_empty() != b.shape.is_empty() {
+        return Ok(if a.shape.is_empty() { b.dtype } else { a.dtype });
+    }
+    Err(format!(
+        "dtype mismatch: {} and {}; insert an explicit cast",
+        a.dtype, b.dtype
+    ))
+}
+
+fn require_same_dtype(operation: &str, values: &[&Arc<Node>]) -> Result<(), String> {
+    if let Some(first) = values.first() {
+        if values.iter().any(|value| value.dtype != first.dtype) {
+            return Err(format!(
+                "{operation}: operands must share a dtype; insert an explicit cast"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> {
@@ -1456,10 +1487,31 @@ impl NodeKind {
     /// compiler rewrites. The final check, `check_dtype_device`, validates
     /// device and dtype support.
     pub fn metadata(&self) -> Result<NodeMetadata, String> {
+        // Only dedicated packed operations may consume a packed value, as weight operand 1.
+        for (role, child) in node_children(self).iter().enumerate() {
+            child.value_spec().validate()?;
+            if matches!(
+                child.storage.representation,
+                StorageRepresentation::Packed(_)
+            ) && !(role == 1
+                && matches!(
+                    self,
+                    Self::QuantizedLinear { .. } | Self::QuantizedEmbedding { .. }
+                ))
+            {
+                return Err(format!("operand {role}: packed storage is unsupported by dense arithmetic, aliases, and views"));
+            }
+        }
+        let storage = match self {
+            Self::Input { storage, .. } => storage.clone(),
+            _ => StorageMetadata::unconstrained(),
+        };
         let (shape, dtype, device) = match self {
             NodeKind::Leaf(slot) => {
                 let metadata = slot.metadata().map_err(|e| e.to_string())?;
-                (metadata.shape, metadata.dtype, metadata.device)
+                metadata.value_spec().validate()?;
+                check_dtype_device(metadata.dtype, &metadata.device)?;
+                return Ok(metadata);
             }
             NodeKind::Input {
                 shape,
@@ -1469,12 +1521,23 @@ impl NodeKind {
             } => (shape.clone(), *dtype, device.clone()),
             NodeKind::ScalarInput { dtype, device, .. } => (vec![], *dtype, device.clone()),
             NodeKind::FromBytes {
+                data,
                 shape,
                 dtype,
                 device,
-                ..
+            } => {
+                let expected = ValueSpec::dense(*dtype, shape)
+                    .canonical_geometry()?
+                    .byte_len;
+                if data.len() != expected {
+                    return Err(format!(
+                        "from_bytes: expected {expected} raw bytes for {dtype}, received {}",
+                        data.len()
+                    ));
+                }
+                (shape.clone(), *dtype, device.clone())
             }
-            | NodeKind::Zeros {
+            NodeKind::Zeros {
                 shape,
                 dtype,
                 device,
@@ -1530,18 +1593,21 @@ impl NodeKind {
             | NodeKind::Maximum { a, b }
             | NodeKind::Minimum { a, b } => (
                 broadcast_shapes(&a.shape, &b.shape)?,
-                scalar_aware_binary_dtype(a, b),
+                scalar_aware_binary_dtype(a, b)?,
                 a.device.clone(),
             ),
             NodeKind::Eq { a, b }
             | NodeKind::Gt { a, b }
             | NodeKind::Lt { a, b }
             | NodeKind::Ge { a, b }
-            | NodeKind::Le { a, b } => (
-                broadcast_shapes(&a.shape, &b.shape)?,
-                DType::U8,
-                a.device.clone(),
-            ),
+            | NodeKind::Le { a, b } => {
+                scalar_aware_binary_dtype(a, b)?;
+                (
+                    broadcast_shapes(&a.shape, &b.shape)?,
+                    DType::U8,
+                    a.device.clone(),
+                )
+            }
             NodeKind::Neg { a }
             | NodeKind::Abs { a }
             | NodeKind::Sqrt { a }
@@ -1693,9 +1759,9 @@ impl NodeKind {
                 if logits.shape[rank - 1] == 0 {
                     return Err("cross_entropy: class dimension must be non-empty".to_string());
                 }
-                if !matches!(logits.dtype, DType::F32 | DType::F64 | DType::BF16) {
+                if !logits.dtype.is_float() {
                     return Err(format!(
-                        "cross_entropy: logits must be f32, f64 or bf16, got {:?}",
+                        "cross_entropy: logits must be floating point, got {:?}",
                         logits.dtype
                     ));
                 }
@@ -2006,9 +2072,9 @@ impl NodeKind {
                 if d % 2 != 0 {
                     return Err(format!("rotary_embedding: head dim must be even, got {d}"));
                 }
-                if !matches!(x.dtype, DType::F32 | DType::BF16) {
+                if !x.dtype.is_float() {
                     return Err(format!(
-                        "rotary_embedding: dtype must be f32 or bf16, got {:?}",
+                        "rotary_embedding: dtype must be floating point, got {:?}",
                         x.dtype
                     ));
                 }
@@ -2027,34 +2093,16 @@ impl NodeKind {
                 (shape.clone(), g.dtype, g.device.clone())
             }
             NodeKind::Linear { x, weight, bias } => {
+                require_same_dtype("linear", &[x, weight, bias])?;
                 let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
                 (out, x.dtype, x.device.clone())
             }
-            NodeKind::QuantizedLinear {
-                x,
-                weight,
-                bias,
-                codec,
-                weight_shape: [rows, columns],
-            } => {
-                if x.shape.len() < 2 || x.shape.last() != Some(columns) {
+            NodeKind::QuantizedLinear { x, weight, bias } => {
+                let (_, [rows, columns]) = weight.packed_matrix()?;
+                if x.shape.len() < 2 || x.shape.last() != Some(&columns) {
                     return Err(format!(
                         "quantized_linear: expected input [.., {columns}], got {:?}",
                         x.shape
-                    ));
-                }
-                let encoded_row_bytes = codec.encoded_row_bytes(*columns).ok_or_else(|| {
-                    format!(
-                        "quantized_linear: logical row width {columns} is invalid for {}",
-                        codec.name()
-                    )
-                })?;
-                if weight.shape != [*rows, encoded_row_bytes] || weight.dtype != DType::U8 {
-                    return Err(format!(
-                        "quantized_linear: expected packed {} weight [{rows}, {encoded_row_bytes}] u8, got {:?} {:?}",
-                        codec.name(),
-                        weight.shape,
-                        weight.dtype
                     ));
                 }
                 if x.dtype != DType::F32 {
@@ -2069,7 +2117,7 @@ impl NodeKind {
                     );
                 }
                 if let Some(bias) = bias {
-                    if bias.shape != [*rows]
+                    if bias.shape != [rows]
                         || bias.dtype != DType::F32
                         || !bias.device.same_device(&x.device)
                     {
@@ -2079,30 +2127,15 @@ impl NodeKind {
                     }
                 }
                 let mut out = x.shape.clone();
-                *out.last_mut().expect("validated input rank") = *rows;
+                *out.last_mut().expect("validated input rank") = rows;
                 (out, DType::F32, x.device.clone())
             }
             NodeKind::QuantizedEmbedding {
                 indexes,
                 weight,
-                codec,
-                weight_shape: [rows, columns],
                 padding_index,
             } => {
-                let encoded_row_bytes = codec.encoded_row_bytes(*columns).ok_or_else(|| {
-                    format!(
-                        "quantized_embedding: logical row width {columns} is invalid for {}",
-                        codec.name()
-                    )
-                })?;
-                if weight.shape != [*rows, encoded_row_bytes] || weight.dtype != DType::U8 {
-                    return Err(format!(
-                        "quantized_embedding: expected packed {} weight [{rows}, {encoded_row_bytes}] u8, got {:?} {:?}",
-                        codec.name(),
-                        weight.shape,
-                        weight.dtype
-                    ));
-                }
+                let (_, [rows, columns]) = weight.packed_matrix()?;
                 if !matches!(indexes.dtype, DType::I64 | DType::U32) {
                     return Err(format!(
                         "quantized_embedding: indexes must be i64 or u32, got {:?}",
@@ -2115,18 +2148,19 @@ impl NodeKind {
                             .to_string(),
                     );
                 }
-                if padding_index.is_some_and(|index| index >= *rows) {
+                if padding_index.is_some_and(|index| index >= rows) {
                     return Err(format!(
                         "quantized_embedding: padding index is outside 0..{rows}"
                     ));
                 }
                 let mut out = indexes.shape.clone();
-                out.push(*columns);
+                out.push(columns);
                 (out, DType::F32, indexes.device.clone())
             }
             NodeKind::LayerNorm {
                 x, weight, bias, ..
             } => {
+                require_same_dtype("layer_norm", &[x, weight, bias])?;
                 let rank = x.shape.len();
                 let k = weight.shape.len();
                 if rank < k || x.shape[rank - k..] != weight.shape[..] || bias.shape != weight.shape
@@ -2157,6 +2191,7 @@ impl NodeKind {
                 (x.shape.clone(), x.dtype, x.device.clone())
             }
             NodeKind::LayerNormBackward { x, weight, g, .. } => {
+                require_same_dtype("layer_norm_backward", &[x, weight, g])?;
                 let rank = x.shape.len();
                 let k = weight.shape.len();
                 if rank < k || x.shape[rank - k..] != weight.shape[..] || g.shape != x.shape {
@@ -2342,6 +2377,7 @@ impl NodeKind {
                 (shape, a.dtype, a.device.clone())
             }
             NodeKind::Concat { a, b, dim } => {
+                require_same_dtype("concat", &[a, b])?;
                 if a.shape.len() != b.shape.len() || *dim >= a.shape.len() {
                     return Err(format!(
                         "concat: rank/dim mismatch, {:?} vs {:?} along dim {dim}",
@@ -2380,6 +2416,7 @@ impl NodeKind {
                 (shape.clone(), a.dtype, a.device.clone())
             }
             NodeKind::Matmul { a, b } => {
+                require_same_dtype("matmul", &[a, b])?;
                 if a.shape.len() < 2 || b.shape.len() < 2 {
                     return Err(format!(
                         "matmul: expected tensors of rank >= 2, got {:?} and {:?}",
@@ -2524,10 +2561,17 @@ impl NodeKind {
             return Err(format!("node operands must use device {device}"));
         }
         check_dtype_device(dtype, &device)?;
+        ValueSpec {
+            semantic_dtype: dtype,
+            logical_shape: &shape,
+            storage: storage.as_spec(),
+        }
+        .validate()?;
         Ok(NodeMetadata {
             shape,
             dtype,
             device,
+            storage,
         })
     }
 }
@@ -2803,7 +2847,9 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             shape,
             dtype,
             device,
+            storage,
         } => NodeKind::Input {
+            storage: storage.clone(),
             slot: *slot,
             shape: shape.clone(),
             dtype: *dtype,
@@ -3174,30 +3220,18 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             weight: f(weight),
             bias: f(bias),
         },
-        NodeKind::QuantizedLinear {
-            x,
-            weight,
-            bias,
-            codec,
-            weight_shape,
-        } => NodeKind::QuantizedLinear {
+        NodeKind::QuantizedLinear { x, weight, bias } => NodeKind::QuantizedLinear {
             x: f(x),
             weight: f(weight),
             bias: bias.as_ref().map(f),
-            codec: *codec,
-            weight_shape: *weight_shape,
         },
         NodeKind::QuantizedEmbedding {
             indexes,
             weight,
-            codec,
-            weight_shape,
             padding_index,
         } => NodeKind::QuantizedEmbedding {
             indexes: f(indexes),
             weight: f(weight),
-            codec: *codec,
-            weight_shape: *weight_shape,
             padding_index: *padding_index,
         },
         NodeKind::Conv1d {
@@ -3463,6 +3497,7 @@ mod tests {
     fn node_operands_must_use_the_same_ordinal() {
         let input = |slot, ordinal| {
             Node::new(NodeKind::Input {
+                storage: StorageMetadata::dense(),
                 slot,
                 shape: vec![1],
                 dtype: DType::F32,
@@ -3496,6 +3531,7 @@ mod tests {
         shape: Vec<usize>,
         dtype: DType,
         device: Device,
+        storage: StorageMetadata,
     }
 
     impl LeafValue for TestLeaf {
@@ -3511,6 +3547,10 @@ mod tests {
             self.device.clone()
         }
 
+        fn storage(&self) -> StorageMetadata {
+            self.storage.clone()
+        }
+
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -3519,6 +3559,7 @@ mod tests {
     #[test]
     fn semantic_nodes_own_authoritative_metadata_and_traversal() {
         let a = Node::new(NodeKind::Input {
+            storage: StorageMetadata::dense(),
             slot: 0,
             shape: vec![2, 1],
             dtype: DType::F32,
@@ -3526,6 +3567,7 @@ mod tests {
         })
         .unwrap();
         let b = Node::new(NodeKind::Input {
+            storage: StorageMetadata::dense(),
             slot: 1,
             shape: vec![1, 3],
             dtype: DType::F32,
@@ -3554,6 +3596,7 @@ mod tests {
     #[test]
     fn leaf_ownership_is_cleared_once_and_invalidates_graph_construction() {
         let slot = Arc::new(LeafSlot::new(TestLeaf {
+            storage: StorageMetadata::dense(),
             shape: vec![4],
             dtype: DType::F32,
             device: Device::Cpu(0),
@@ -3580,6 +3623,7 @@ mod tests {
     #[test]
     fn last_token_row_validates_rank_and_row_contract() {
         let input = Node::new(NodeKind::Input {
+            storage: StorageMetadata::dense(),
             slot: 0,
             shape: vec![1, 7, 16],
             dtype: DType::F32,
@@ -3601,6 +3645,7 @@ mod tests {
         for shape in [vec![7, 16], vec![2, 7, 16], vec![1, 7, 16, 1]] {
             let error = Node::new(NodeKind::LastTokenRow {
                 a: Node::new(NodeKind::Input {
+                    storage: StorageMetadata::dense(),
                     slot: 0,
                     shape: shape.clone(),
                     dtype: DType::F32,
@@ -3620,6 +3665,7 @@ mod tests {
     #[test]
     fn quantized_nodes_validate_packed_geometry_and_preserve_logical_outputs() {
         let input = Node::new(NodeKind::Input {
+            storage: StorageMetadata::dense(),
             slot: 0,
             shape: vec![2, 256],
             dtype: DType::F32,
@@ -3627,9 +3673,10 @@ mod tests {
         })
         .unwrap();
         let packed = Node::new(NodeKind::Input {
+            storage: StorageMetadata::packed(GgmlKQuant::Q4K),
             slot: 1,
-            shape: vec![3, 144],
-            dtype: DType::U8,
+            shape: vec![3, 256],
+            dtype: DType::F32,
             device: Device::Cpu(0),
         })
         .unwrap();
@@ -3637,8 +3684,6 @@ mod tests {
             x: input,
             weight: packed.clone(),
             bias: None,
-            codec: GgmlKQuant::Q4K,
-            weight_shape: [3, 256],
         })
         .unwrap();
         assert_eq!(linear.shape, [2, 3]);
@@ -3646,6 +3691,7 @@ mod tests {
         assert_eq!(node_children(&linear.kind).len(), 2);
 
         let indexes = Node::new(NodeKind::Input {
+            storage: StorageMetadata::dense(),
             slot: 2,
             shape: vec![2, 4],
             dtype: DType::U32,
@@ -3655,8 +3701,6 @@ mod tests {
         let embedding = Node::new(NodeKind::QuantizedEmbedding {
             indexes,
             weight: packed.clone(),
-            codec: GgmlKQuant::Q4K,
-            weight_shape: [3, 256],
             padding_index: Some(2),
         })
         .unwrap();
@@ -3666,12 +3710,198 @@ mod tests {
         let invalid = Node::new(NodeKind::QuantizedEmbedding {
             indexes: embedding,
             weight: packed,
-            codec: GgmlKQuant::Q5K,
-            weight_shape: [3, 256],
             padding_index: None,
         })
         .err()
         .unwrap();
-        assert!(invalid.contains("expected packed Q5_K weight [3, 176] u8"));
+        assert!(invalid.contains("indexes must be i64 or u32"));
+    }
+
+    fn typed(shape: &[usize], dtype: DType) -> Arc<Node> {
+        Node::new(NodeKind::Input {
+            slot: 0,
+            shape: shape.to_vec(),
+            dtype,
+            device: Device::Cpu(0),
+            storage: StorageMetadata::dense(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn packed_leaf_metadata_survives_clear_without_retaining_storage() {
+        let slot = Arc::new(LeafSlot::new(TestLeaf {
+            shape: vec![3, 256],
+            dtype: DType::F32,
+            device: Device::Cpu(0),
+            storage: StorageMetadata::packed(GgmlKQuant::Q4K),
+        }));
+        let leaf = Node::new(NodeKind::Leaf(slot.clone())).unwrap();
+        assert!(slot.clear());
+        assert!(slot.get::<TestLeaf>().is_err());
+        assert_eq!(leaf.packed_matrix().unwrap(), (GgmlKQuant::Q4K, [3, 256]));
+        assert_eq!(
+            leaf.value_spec().canonical_geometry().unwrap().byte_len,
+            432
+        );
+        assert!(Node::new(NodeKind::Leaf(slot)).is_err());
+    }
+
+    #[test]
+    fn packed_metadata_is_authoritative_and_dense_consumers_reject_it() {
+        let packed = Node::new(NodeKind::Input {
+            slot: 1,
+            shape: vec![3, 256],
+            dtype: DType::F32,
+            device: Device::Cpu(0),
+            storage: StorageMetadata::packed(GgmlKQuant::Q4K),
+        })
+        .unwrap();
+        assert_eq!(packed.packed_matrix().unwrap(), (GgmlKQuant::Q4K, [3, 256]));
+        let remapped = Node::new(remap_children(&packed.kind, &|child| child.clone())).unwrap();
+        assert_eq!(remapped.value_spec(), packed.value_spec());
+        let dense = typed(&[3, 256], DType::F32);
+        for kind in [
+            NodeKind::Add {
+                a: packed.clone(),
+                b: dense,
+            },
+            NodeKind::Cast {
+                a: packed.clone(),
+                dtype: DType::F32,
+            },
+            NodeKind::Reshape {
+                a: packed.clone(),
+                shape: vec![768],
+            },
+            NodeKind::Permute {
+                a: packed.clone(),
+                dims: vec![1, 0],
+            },
+            NodeKind::Expose {
+                a: packed.clone(),
+                name: "packed".into(),
+            },
+            NodeKind::StopGradient { a: packed.clone() },
+        ] {
+            assert!(Node::new(kind).err().unwrap().contains("packed storage"));
+        }
+        let raw_u8 = typed(&[3, 144], DType::U8);
+        assert!(Node::new(NodeKind::QuantizedLinear {
+            x: typed(&[2, 256], DType::F32),
+            weight: raw_u8,
+            bias: None
+        })
+        .err()
+        .unwrap()
+        .contains("packed GGML"));
+        assert!(Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![3, 255],
+            dtype: DType::F32,
+            device: Device::Cpu(0),
+            storage: StorageMetadata::packed(GgmlKQuant::Q4K)
+        })
+        .is_err());
+        assert!(Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![3, 256],
+            dtype: DType::U8,
+            device: Device::Cpu(0),
+            storage: StorageMetadata::packed(GgmlKQuant::Q4K)
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_tensor_dtypes_require_casts_but_float_scalars_keep_tensor_dtype() {
+        for (left, right) in [
+            (DType::F16, DType::F32),
+            (DType::BF16, DType::F16),
+            (DType::U8, DType::U32),
+            (DType::I64, DType::F32),
+        ] {
+            let a = typed(&[2, 2], left);
+            let b = typed(&[2, 2], right);
+            assert!(Node::new(NodeKind::Add {
+                a: a.clone(),
+                b: b.clone()
+            })
+            .is_err());
+            assert!(Node::new(NodeKind::Eq {
+                a: a.clone(),
+                b: b.clone()
+            })
+            .is_err());
+            assert!(Node::new(NodeKind::Matmul {
+                a: a.clone(),
+                b: b.clone()
+            })
+            .is_err());
+            assert!(Node::new(NodeKind::Concat { a, b, dim: 0 }).is_err());
+        }
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            let tensor = typed(&[2], dtype);
+            let scalar = typed(&[], DType::F64);
+            for (a, b) in [(tensor.clone(), scalar.clone()), (scalar, tensor)] {
+                assert_eq!(Node::new(NodeKind::Add { a, b }).unwrap().dtype, dtype);
+            }
+        }
+        assert!(Node::new(NodeKind::Add {
+            a: typed(&[], DType::F32),
+            b: typed(&[], DType::F64)
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn half_float_attention_cross_entropy_and_rotary_are_semantic_operations() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let q = typed(&[1, 2, 3, 4], dtype);
+            assert!(sdpa_check("sdpa", &q, &q, &q).is_ok());
+            let ce = Node::new(NodeKind::CrossEntropy {
+                logits: typed(&[2, 3], dtype),
+                target: typed(&[2], DType::I64),
+                ignore_index: -100,
+                reduction: CrossEntropyReduction::Mean,
+            })
+            .unwrap();
+            assert_eq!(ce.dtype, dtype);
+            let rotary = Node::new(NodeKind::RotaryEmbedding {
+                x: typed(&[1, 3, 4], dtype),
+                seq_len: 3,
+                theta: 10000.0,
+                offset: PositionOffset::Absolute,
+                layout: RotaryLayout::HalfSplit,
+            })
+            .unwrap();
+            assert_eq!(rotary.dtype, dtype);
+        }
+    }
+
+    #[test]
+    fn half_from_bytes_uses_two_byte_raw_storage() {
+        for dtype in [DType::F16, DType::BF16] {
+            let bits = vec![0x01, 0x00, 0x00, 0x80, 0x01, 0x7e];
+            let node = Node::new(NodeKind::FromBytes {
+                data: bits.clone(),
+                shape: vec![3],
+                dtype,
+                device: Device::Cpu(0),
+            })
+            .unwrap();
+            assert_eq!(node.value_spec().canonical_geometry().unwrap().byte_len, 6);
+            let NodeKind::FromBytes { data, .. } = &node.kind else {
+                unreachable!()
+            };
+            assert_eq!(data, &bits);
+            assert!(Node::new(NodeKind::FromBytes {
+                data: vec![0; 12],
+                shape: vec![3],
+                dtype,
+                device: Device::Cpu(0)
+            })
+            .is_err());
+        }
     }
 }

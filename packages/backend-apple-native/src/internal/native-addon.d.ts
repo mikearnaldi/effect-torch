@@ -31,6 +31,7 @@ export declare class Executable {
 export declare class LazyTensor {
   get shape(): Array<number>
   get dtype(): string
+  get storage(): NativeStorageMetadata
   metadata(): [Array<number>, string]
   static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
   static ones(shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
@@ -42,7 +43,7 @@ export declare class LazyTensor {
   static constant(value: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
   static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
   static fromMaterialized(tensor: NativeTensor): LazyTensor
-  static input(slot: number, shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static input(slot: number, shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null, storage?: NativeStorageMetadata | undefined | null): LazyTensor
   static scalarInput(slot: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
   add(other: LazyTensor): LazyTensor
   sub(other: LazyTensor): LazyTensor
@@ -87,8 +88,8 @@ export declare class LazyTensor {
   layerNorm(weight: LazyTensor, bias: LazyTensor, eps: number): LazyTensor
   rmsNorm(weight: LazyTensor | undefined | null, eps: number): LazyTensor
   linear(weight: LazyTensor, bias: LazyTensor): LazyTensor
-  quantizedLinear(weight: LazyTensor, bias: LazyTensor | undefined | null, encoding: string, rows: number, columns: number): LazyTensor
-  quantizedEmbedding(weight: LazyTensor, encoding: string, rows: number, columns: number, paddingIndex?: number | undefined | null): LazyTensor
+  quantizedLinear(weight: LazyTensor, bias?: LazyTensor | undefined | null): LazyTensor
+  quantizedEmbedding(weight: LazyTensor, paddingIndex?: number | undefined | null): LazyTensor
   conv1d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   log(): LazyTensor
@@ -173,6 +174,7 @@ export declare class NativeTensor {
    * handle or a lazy graph built from it returns a typed error.
    */
   clear(): void
+  get storage(): NativeStorageMetadata
   get shape(): Array<number>
   get dtype(): string
   get device(): string
@@ -193,18 +195,23 @@ export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<La
 /** Parses and validates a GGUF file without loading tensor payloads. */
 export declare function inspectGguf(path: string, token?: CancellationToken | undefined | null): Promise<NativeGgufInspection>
 
+export declare function inspectSafetensors(path: string, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsInspection>
+
 export declare function isAvailable(): boolean
 
 export declare function isDeviceAvailable(deviceOrdinal: number): boolean
 
-/** Parses a GGUF file and loads every supported tensor into Metal storage. */
-export declare function loadGguf(path: string, token?: CancellationToken | undefined | null): Promise<NativeGgufArchive>
+/**
+ * Parses a GGUF file and loads selected tensors into Metal storage.
+ * Omitted names load all tensors; an empty list loads none.
+ */
+export declare function loadGguf(path: string, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeGgufArchive>
 
-export declare function loadGgufForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null): Promise<NativeGgufArchive>
+export declare function loadGgufForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeGgufArchive>
 
-export declare function loadTensors(path: string, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsArchive>
+export declare function loadTensors(path: string, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeSafetensorsArchive>
 
-export declare function loadTensorsForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsArchive>
+export declare function loadTensorsForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeSafetensorsArchive>
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined
@@ -237,6 +244,21 @@ export declare const enum NativeDType {
   BF16 = 'bf16'
 }
 
+export interface NativeDTypeLegalizationDiagnostics {
+  targetBackend: string
+  targetArchitecture: string
+  loweringAbiRevision: number
+  policyRevision: number
+  capabilityQueries: number
+  nativeLoweringUnits: number
+  legalizedLoweringUnits: number
+  kernelLocalLegalizations: number
+  materializedConversions: number
+  materializedConversionBytes: number
+  decompositions: number
+  rejectedRegionCandidates: number
+}
+
 export interface NativeExecutableDiagnostics {
   semanticNodesBeforeOptimization: number
   semanticNodesAfterOptimization: number
@@ -245,10 +267,11 @@ export interface NativeExecutableDiagnostics {
   commandCount: number
   synchronizationCount: number
   memory: NativeMemoryDiagnostics
+  legalization: NativeDTypeLegalizationDiagnostics
   compilePhases: Array<NativeCompilePhaseDiagnostics>
 }
 
-/** Complete loaded archive returned atomically to JavaScript. */
+/** Selected archive entries returned atomically to JavaScript. */
 export interface NativeGgufArchive {
   entries: Array<NativeGgufLoadedEntry>
 }
@@ -444,6 +467,18 @@ export interface NativeSafetensorsEntry {
   tensor: NativeTensor
 }
 
+export interface NativeSafetensorsInspection {
+  entries: Array<NativeSafetensorsTensorInfo>
+  metadata: Record<string, string>
+}
+
+export interface NativeSafetensorsTensorInfo {
+  name: string
+  dtype: string
+  shape: Array<number>
+  byteLength: number
+}
+
 export interface NativeSamplingOptions {
   temperature: number
   topK: number
@@ -463,6 +498,11 @@ export interface NativeSharedTargetBinding {
 export interface NativeStageInputBinding {
   slot: number
   value: NativeValueRef
+}
+
+export interface NativeStorageMetadata {
+  representation: string
+  format?: string | undefined
 }
 
 export interface NativeTargetHiddenTap {

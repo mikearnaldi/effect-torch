@@ -70,13 +70,14 @@ use crate::{
 #[cfg(test)]
 use effect_torch_compiler::ProgramRequest;
 use effect_torch_compiler::{
-    build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport, DenseNodeId,
-    DiagnosticsInput, EnvironmentOptions, Expr, GeneratedBinding, GraphIndex, InstructionEffects,
-    LoweredInstruction, LoweredProgram, LoweredValue, LoweringUnit, MemoryPlannerConfig,
-    NativeRegion, OptimizationPlan, OutputDecl, PreparedProgram, ProgramSlot, RegionId,
-    StateCursorSlot, ValueDecl, ValueStorage, ValueUse, ARTIFACT_ASSEMBLY_PHASE,
-    COMPILE_SUBMISSION_PHASE, PHYSICAL_PLANNING_PHASE, PIPELINE_PREPARATION_PHASE,
-    PUBLICATION_PHASE,
+    build_executable_diagnostics, legalize_region_expressions, CompileOptions, CompilerDriver,
+    CompilerWorkReport, DenseConversionContract, DenseNodeId, DiagnosticsInput, EnvironmentOptions,
+    ExecutableDTypePlan, ExecutionRealization, Expr, GeneratedBinding, GraphIndex,
+    InstructionEffects, LoweredInstruction, LoweredProgram, LoweredValue, LoweringUnit,
+    MemoryPlannerConfig, NativeRegion, OperandInterpretation, OperandPreparation, OptimizationPlan,
+    OutputDecl, PreparedProgram, ProgramSlot, RegionId, ResultCompletion, StateCursorSlot,
+    ValueDecl, ValueStorage, ValueUse, ARTIFACT_ASSEMBLY_PHASE, COMPILE_SUBMISSION_PHASE,
+    PHYSICAL_PLANNING_PHASE, PIPELINE_PREPARATION_PHASE, PUBLICATION_PHASE,
 };
 use effect_torch_graph::{
     node_children, CrossEntropyReduction, Device, KvAttentionMode, PositionOffset, RotaryLayout,
@@ -344,8 +345,11 @@ pub(super) enum MetalBindingSource {
 }
 
 /// One tensor input binding: the program value and where it reads from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MetalBinding {
+    pub semantic_shape: Vec<usize>,
+    pub semantic_dtype: DType,
+    pub storage: effect_torch_runtime::StorageMetadata,
     pub value: ValueId,
     pub source: MetalBindingSource,
 }
@@ -1348,7 +1352,9 @@ fn plan_command_resources(
                     | MetalBinaryOp::Ge
                     | MetalBinaryOp::Le
             );
-            let requirements = if compare {
+            let requirements = if a.dtype == b.dtype && !a.dtype.is_float() {
+                Vec::new()
+            } else if compare {
                 let mut requirements = Vec::new();
                 if a.dtype != DType::F32 {
                     requirements.push(crate::ops::ScratchRequirement {
@@ -1394,7 +1400,8 @@ fn plan_command_resources(
                     });
                     b_dtype = a_dtype;
                 }
-                if !(a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::BF16)) {
+                if !(a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::F16 | DType::BF16))
+                {
                     if a_dtype != DType::F32 {
                         requirements.push(crate::ops::ScratchRequirement {
                             shape: a.shape.to_vec(),
@@ -1429,16 +1436,10 @@ fn plan_command_resources(
             resources.scratch = ops_scratch("binary", requirements);
         }
         MetalOp::Where => {
-            let condition = input(0)?;
             let a = input(1)?;
             let b = input(2)?;
             if a.dtype != b.dtype {
                 return Err("compile: where branch dtypes must match".to_string());
-            }
-            if condition.dtype != a.dtype {
-                resources
-                    .scratch
-                    .push(scratch("where_condition", &condition.shape, a.dtype));
             }
         }
         MetalOp::Argmax { dim } | MetalOp::Argmin { dim } => {
@@ -2157,7 +2158,7 @@ fn plan_command_resources(
         }
         MetalOp::Reduce { .. } => {
             let source = input(0)?;
-            if !matches!(source.dtype, DType::F32 | DType::BF16) {
+            if source.dtype.is_float() && !matches!(source.dtype, DType::F32 | DType::BF16) {
                 resources
                     .scratch
                     .push(scratch("reduce_input_f32", &source.shape, DType::F32));
@@ -2622,6 +2623,8 @@ struct Lowerer<'a> {
     state_cursor: Option<ValueId>,
     padded_slot: Option<u32>,
     optimizer_scalar_packs: HashMap<Vec<ValueId>, ValueId>,
+    materialized_conversions: usize,
+    materialized_conversion_bytes: usize,
 }
 
 impl<'a> Lowerer<'a> {
@@ -2697,6 +2700,8 @@ impl<'a> Lowerer<'a> {
             state_cursor: None,
             padded_slot,
             optimizer_scalar_packs: HashMap::new(),
+            materialized_conversions: 0,
+            materialized_conversion_bytes: 0,
         }
     }
 
@@ -2892,8 +2897,8 @@ impl<'a> Lowerer<'a> {
 
     fn constant(&mut self, node: &Arc<Node>, payload: Value) -> Result<(), String> {
         let value = self.value(
-            &node.shape,
-            node.dtype,
+            payload.0.layout.shape(),
+            payload.0.dtype,
             MetalValueStorage::Constant,
             "constant",
         )?;
@@ -2997,11 +3002,21 @@ impl<'a> Lowerer<'a> {
         index: &GraphIndex,
         plan: &OptimizationPlan,
         region_id: RegionId,
+        dtype_plan: &ExecutableDTypePlan,
     ) -> Result<(), String> {
+        if !matches!(
+            dtype_plan.execution().realization,
+            ExecutionRealization::DirectKernel | ExecutionRealization::KernelLocal
+        ) {
+            return Err(
+                "compile: Metal regions require a direct or kernel-local dtype recipe".to_string(),
+            );
+        }
         let region = plan
             .regions
             .get(region_id.index())
             .ok_or_else(|| format!("compile: optimization region {region_id} is out of range"))?;
+        let expressions = legalize_region_expressions(region, dtype_plan)?;
         let (op, inputs, outputs) = match region {
             NativeRegion::Elementwise(region) => {
                 if !region.device.is_metal() {
@@ -3015,7 +3030,7 @@ impl<'a> Lowerer<'a> {
                         "compile: fused Metal operation requires at least one input".to_string()
                     );
                 }
-                if !matches!(region.dtype, DType::F32 | DType::BF16) {
+                if !matches!(region.dtype, DType::F32 | DType::F16 | DType::BF16) {
                     return Err(format!(
                         "compile: fused operation does not support Metal dtype {}",
                         region.dtype
@@ -3031,7 +3046,7 @@ impl<'a> Lowerer<'a> {
                             .map(|strides| strides.to_vec())
                             .collect(),
                         shape: region.shape.clone(),
-                        exprs: vec![region.output.expression.clone()].into_boxed_slice(),
+                        exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -3049,7 +3064,7 @@ impl<'a> Lowerer<'a> {
                         "compile: fused Metal operation requires at least one input".to_string()
                     );
                 }
-                if !matches!(region.dtype, DType::F32 | DType::BF16) {
+                if !matches!(region.dtype, DType::F32 | DType::F16 | DType::BF16) {
                     return Err(format!(
                         "compile: fused operation does not support Metal dtype {}",
                         region.dtype
@@ -3065,7 +3080,7 @@ impl<'a> Lowerer<'a> {
                             .map(|strides| strides.to_vec())
                             .collect(),
                         in_shape: region.input_shape.clone(),
-                        expr: region.expression.clone(),
+                        expr: expressions[0].clone(),
                         op: region.op,
                         dims: region.dims.clone(),
                         keepdims: region.keepdims,
@@ -3087,7 +3102,7 @@ impl<'a> Lowerer<'a> {
                         "compile: fused Metal operation requires at least one input".to_string()
                     );
                 }
-                if !matches!(region.dtype, DType::F32 | DType::BF16) {
+                if !matches!(region.dtype, DType::F32 | DType::F16 | DType::BF16) {
                     return Err(format!(
                         "compile: fused operation does not support Metal dtype {}",
                         region.dtype
@@ -3108,11 +3123,7 @@ impl<'a> Lowerer<'a> {
                             .map(|strides| strides.to_vec())
                             .collect(),
                         shape: region.shape.clone(),
-                        exprs: region
-                            .outputs
-                            .iter()
-                            .map(|output| output.expression.clone())
-                            .collect(),
+                        exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -3180,7 +3191,7 @@ impl<'a> Lowerer<'a> {
                         eps: region.options.eps,
                         weight_decay: region.options.weight_decay,
                         implementation: OptimizerImplementation::Fused,
-                        exprs: region.expressions.clone(),
+                        exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -3208,7 +3219,7 @@ impl<'a> Lowerer<'a> {
                 (
                     MetalOp::AdamWGroup {
                         parameters: region.parameter_inputs.len(),
-                        exprs: region.expressions.clone(),
+                        exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -3243,7 +3254,7 @@ impl<'a> Lowerer<'a> {
                         nesterov: region.options.nesterov,
                         weight_decay: region.options.weight_decay,
                         implementation: OptimizerImplementation::Fused,
-                        exprs: region.expressions.clone(),
+                        exprs: expressions.clone(),
                     },
                     inputs,
                     outputs,
@@ -3254,7 +3265,46 @@ impl<'a> Lowerer<'a> {
         self.bind_region_outputs(index, plan, region_id, region, &outputs)
     }
 
-    fn lower(&mut self, node: &Arc<Node>) -> Result<(), String> {
+    fn convert_value(
+        &mut self,
+        source: ValueId,
+        conversion: DenseConversionContract,
+    ) -> Result<ValueId, String> {
+        let metadata = &self.values[source.index()];
+        if metadata.dtype != conversion.source {
+            return Err(format!(
+                "compile: Metal conversion source dtype {} differs from planned {}",
+                metadata.dtype, conversion.source
+            ));
+        }
+        let shape = metadata.shape.to_vec();
+        let converted =
+            self.dynamic_value(&shape, conversion.destination, "dtype_operand_conversion")?;
+        self.operation_command(
+            MetalOp::Unary(MetalUnaryOp::Cast {
+                dtype: conversion.destination,
+            }),
+            vec![source],
+            vec![converted],
+        )?;
+        self.materialized_conversions += 1;
+        self.materialized_conversion_bytes +=
+            shape.iter().product::<usize>() * conversion.destination.size_in_bytes();
+        Ok(converted)
+    }
+
+    fn lower(&mut self, node: &Arc<Node>, dtype_plan: &ExecutableDTypePlan) -> Result<(), String> {
+        let execution = dtype_plan.execution();
+        if !matches!(
+            execution.realization,
+            ExecutionRealization::DirectKernel | ExecutionRealization::MaterializedTransforms
+        ) || execution.operations.len() != 1
+        {
+            return Err(
+                "compile: Metal node requires a direct or materialized dtype recipe".to_string(),
+            );
+        }
+        let recipe = &execution.operations[0];
         if !node.device.is_metal() {
             return Err(format!(
                 "compile: Metal lowering does not support device {}",
@@ -3271,7 +3321,6 @@ impl<'a> Lowerer<'a> {
                     node.id
                 )
             })?;
-        validate_metal_support(node)?;
 
         match &node.kind {
             NodeKind::Leaf(_) => {
@@ -3303,15 +3352,19 @@ impl<'a> Lowerer<'a> {
                 }
                 let generated = u32::try_from(self.generated.len())
                     .map_err(|_| "compile: too many generated bindings".to_string())?;
+                let geometry = node.value_spec().canonical_geometry()?;
                 let value = self.value(
-                    &node.shape,
-                    node.dtype,
+                    &geometry.physical_shape,
+                    geometry.physical_dtype,
                     MetalValueStorage::External,
                     format!("generated_binding_{generated}"),
                 )?;
                 self.generated.push(payload);
                 self.generated_order.push(semantic_position);
                 self.bindings.push(MetalBinding {
+                    semantic_shape: node.shape.clone(),
+                    semantic_dtype: node.dtype,
+                    storage: node.storage.clone(),
                     value,
                     source: MetalBindingSource::Generated(generated),
                 });
@@ -3344,9 +3397,10 @@ impl<'a> Lowerer<'a> {
                             && self.state_schema.is_some_and(|schema| {
                                 node.shape.first() == Some(&schema.graph_batch)
                             });
+                        let geometry = node.value_spec().canonical_geometry()?;
                         let value = self.value(
-                            &node.shape,
-                            node.dtype,
+                            &geometry.physical_shape,
+                            geometry.physical_dtype,
                             if matches!(
                                 source,
                                 MetalDeclaredSource::StateCursor | MetalDeclaredSource::Scalar(_)
@@ -3371,6 +3425,9 @@ impl<'a> Lowerer<'a> {
                                     .push(MetalPaddedBinding { value, source });
                             } else {
                                 self.bindings.push(MetalBinding {
+                                    semantic_shape: node.shape.clone(),
+                                    semantic_dtype: node.dtype,
+                                    storage: node.storage.clone(),
                                     value,
                                     source: MetalBindingSource::Declared(source),
                                 });
@@ -3383,7 +3440,10 @@ impl<'a> Lowerer<'a> {
                     }
                 };
                 let declaration = &self.values[value.index()];
-                if declaration.shape.as_ref() != node.shape || declaration.dtype != node.dtype {
+                let geometry = node.value_spec().canonical_geometry()?;
+                if declaration.shape.as_ref() != geometry.physical_shape
+                    || declaration.dtype != geometry.physical_dtype
+                {
                     return Err(format!(
                         "compile: slot {slot} is used with conflicting signatures"
                     ));
@@ -3397,10 +3457,10 @@ impl<'a> Lowerer<'a> {
                 return self.constant(node, crate::value::value_from_bytes(data, shape, *dtype)?);
             }
             NodeKind::Zeros { shape, dtype, .. } => {
-                return self.constant(node, Value(metal_ops::fill(shape, 0.0, *dtype)?));
+                return self.constant(node, Value::dense(metal_ops::fill(shape, 0.0, *dtype)?));
             }
             NodeKind::Ones { shape, dtype, .. } => {
-                return self.constant(node, Value(metal_ops::fill(shape, 1.0, *dtype)?));
+                return self.constant(node, Value::dense(metal_ops::fill(shape, 1.0, *dtype)?));
             }
             NodeKind::Full {
                 shape,
@@ -3408,7 +3468,7 @@ impl<'a> Lowerer<'a> {
                 dtype,
                 ..
             } => {
-                return self.constant(node, Value(metal_ops::fill(shape, *value, *dtype)?));
+                return self.constant(node, Value::dense(metal_ops::fill(shape, *value, *dtype)?));
             }
             NodeKind::Arange {
                 start,
@@ -3417,10 +3477,13 @@ impl<'a> Lowerer<'a> {
                 dtype,
                 ..
             } => {
-                return self.constant(node, Value(metal_ops::arange(*start, *end, *step, *dtype)?));
+                return self.constant(
+                    node,
+                    Value::dense(metal_ops::arange(*start, *end, *step, *dtype)?),
+                );
             }
             NodeKind::Eye { n, dtype, .. } => {
-                return self.constant(node, Value(metal_ops::eye(*n, *dtype)?));
+                return self.constant(node, Value::dense(metal_ops::eye(*n, *dtype)?));
             }
             NodeKind::SdpaBackwardOut { of, index }
             | NodeKind::ChunkedHeadCeBackwardOut { of, index }
@@ -3463,6 +3526,32 @@ impl<'a> Lowerer<'a> {
             .iter()
             .map(|child| self.child_value(child))
             .collect::<Result<Vec<_>, _>>()?;
+        for operand in &recipe.operands {
+            let input = inputs
+                .get_mut(operand.index as usize)
+                .ok_or("compile: Metal dtype plan references a missing operand")?;
+            if let OperandInterpretation::ScalarCoercion(conversion) = operand.interpretation {
+                if !self.values[input.index()].shape.is_empty() {
+                    return Err(
+                        "compile: Metal scalar coercion requires a scalar operand".to_string()
+                    );
+                }
+                *input = self.convert_value(*input, conversion)?;
+            }
+            match operand.preparation {
+                OperandPreparation::Convert(conversion) => {
+                    *input = self.convert_value(*input, conversion)?;
+                }
+                OperandPreparation::Direct => {
+                    if self.values[input.index()].dtype != operand.execution_dtype {
+                        return Err(
+                            "compile: Metal direct operand dtype differs from its plan".to_string()
+                        );
+                    }
+                }
+                OperandPreparation::CanonicalPacked(_) => {}
+            }
+        }
         let native_sdpa = |dtype| matches!(dtype, DType::F32 | DType::F16 | DType::BF16);
         if let NodeKind::SdpaBackward { fwd, q, .. } = &node.kind {
             if native_sdpa(q.dtype) {
@@ -3529,6 +3618,16 @@ impl<'a> Lowerer<'a> {
                 self.dynamic_value(shape, *dtype, &format!("{}_output_{index}", node.id))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        let semantic_outputs = outputs;
+        let mut outputs = semantic_outputs.clone();
+        for result in &recipe.results {
+            if let ResultCompletion::ConvertToBoundary(conversion) = result.completion {
+                let shape = &output_metadata[result.index as usize].0;
+                outputs[result.index as usize] =
+                    self.dynamic_value(shape, conversion.source, "dtype_result_conversion")?;
+            }
+        }
 
         let implementation = |_dtype: DType| MetalImplementation::Native;
         let optimizer = |dtype: DType| {
@@ -3695,22 +3794,20 @@ impl<'a> Lowerer<'a> {
             NodeKind::Linear { x, .. } => MetalOp::Linear {
                 implementation: implementation(x.dtype),
             },
-            NodeKind::QuantizedLinear {
-                codec,
-                weight_shape,
-                ..
-            } => MetalOp::QuantizedLinear {
-                codec: *codec,
-                weight_shape: *weight_shape,
-            },
-            NodeKind::QuantizedEmbedding {
-                codec,
-                weight_shape,
-                ..
-            } => MetalOp::QuantizedEmbedding {
-                codec: *codec,
-                weight_shape: *weight_shape,
-            },
+            NodeKind::QuantizedLinear { weight, .. } => {
+                let (codec, weight_shape) = weight.packed_matrix()?;
+                MetalOp::QuantizedLinear {
+                    codec,
+                    weight_shape,
+                }
+            }
+            NodeKind::QuantizedEmbedding { weight, .. } => {
+                let (codec, weight_shape) = weight.packed_matrix()?;
+                MetalOp::QuantizedEmbedding {
+                    codec,
+                    weight_shape,
+                }
+            }
             NodeKind::LayerNorm { x, eps, .. } => MetalOp::LayerNorm {
                 eps: *eps,
                 implementation: implementation(x.dtype),
@@ -3915,7 +4012,24 @@ impl<'a> Lowerer<'a> {
             }
         };
         self.operation_command(op, inputs, outputs.clone())?;
-        self.node_values.insert(node.id, outputs.into_boxed_slice());
+        for result in &recipe.results {
+            if let ResultCompletion::ConvertToBoundary(conversion) = result.completion {
+                let position = result.index as usize;
+                self.operation_command(
+                    MetalOp::Unary(MetalUnaryOp::Cast {
+                        dtype: conversion.destination,
+                    }),
+                    vec![outputs[position]],
+                    vec![semantic_outputs[position]],
+                )?;
+                self.materialized_conversions += 1;
+                self.materialized_conversion_bytes +=
+                    output_metadata[position].0.iter().product::<usize>()
+                        * conversion.destination.size_in_bytes();
+            }
+        }
+        self.node_values
+            .insert(node.id, semantic_outputs.into_boxed_slice());
         Ok(())
     }
 
@@ -4952,7 +5066,7 @@ impl<'a> Lowerer<'a> {
                         crate::ops::warm_binary(
                             &a.shape, a.dtype, &b.shape, b.dtype, operation, compare,
                         )?;
-                        if compare {
+                        if compare && a.dtype.is_float() {
                             crate::kernels::warm_cast(&a.shape, a.dtype, DType::F32)?;
                             crate::kernels::warm_cast(&b.shape, b.dtype, DType::F32)?;
                             crate::kernels::warm_cast(
@@ -4960,7 +5074,7 @@ impl<'a> Lowerer<'a> {
                                 DType::F32,
                                 DType::U8,
                             )?;
-                        } else {
+                        } else if a.dtype.is_float() {
                             let mut a_dtype = a.dtype;
                             let mut b_dtype = b.dtype;
                             if a_dtype != b_dtype
@@ -4980,7 +5094,9 @@ impl<'a> Lowerer<'a> {
                                 crate::kernels::warm_cast(&b.shape, b_dtype, a_dtype)?;
                                 b_dtype = a_dtype;
                             }
-                            if a_dtype != b_dtype || !matches!(a_dtype, DType::F32 | DType::BF16) {
+                            if a_dtype != b_dtype
+                                || !matches!(a_dtype, DType::F32 | DType::F16 | DType::BF16)
+                            {
                                 crate::kernels::warm_cast(&a.shape, a_dtype, DType::F32)?;
                                 crate::kernels::warm_cast(&b.shape, b_dtype, DType::F32)?;
                                 crate::kernels::warm_cast(
@@ -5063,12 +5179,11 @@ impl<'a> Lowerer<'a> {
                     }
                     MetalOp::Where => {
                         let condition = &self.values[command.inputs[0].index()];
-                        let branch = &self.values[command.inputs[1].index()];
-                        crate::kernels::warm_cast(&condition.shape, condition.dtype, branch.dtype)?;
                         crate::ops::warm_where(
                             &self.values[command.inputs[0].index()].shape,
                             &self.values[command.inputs[1].index()].shape,
                             &self.values[command.inputs[2].index()].shape,
+                            condition.dtype,
                             self.values[command.inputs[1].index()].dtype,
                         )?;
                         pipeline_count += 1;
@@ -5210,7 +5325,9 @@ impl<'a> Lowerer<'a> {
                     MetalOp::Reduce { op, dims, keepdims } => {
                         let input = &self.values[command.inputs[0].index()];
                         let output = &self.values[command.outputs[0].index()];
-                        crate::kernels::warm_cast(&input.shape, input.dtype, DType::F32)?;
+                        if input.dtype.is_float() {
+                            crate::kernels::warm_cast(&input.shape, input.dtype, DType::F32)?;
+                        }
                         crate::ops::warm_reduce(
                             &input.shape,
                             input.dtype,
@@ -5224,7 +5341,9 @@ impl<'a> Lowerer<'a> {
                                 MetalReduceOp::Prod => fusion::ReduceOp::Prod,
                             },
                         )?;
-                        crate::kernels::warm_cast(&output.shape, DType::F32, output.dtype)?;
+                        if input.dtype.is_float() {
+                            crate::kernels::warm_cast(&output.shape, DType::F32, output.dtype)?;
+                        }
                         pipeline_count += 1;
                     }
                     MetalOp::Conv1d {
@@ -5427,6 +5546,7 @@ fn validate_generated_binding_metadata<'a>(
     }
     if node.shape != binding.shape
         || node.dtype != binding.dtype
+        || node.storage != binding.storage
         || !node.device.same_device(&binding.device)
         || !binding.device.is_metal()
     {
@@ -5444,6 +5564,7 @@ fn validate_generated_binding_value(
 ) -> Result<(), String> {
     if payload.shape() != binding.shape
         || payload.dtype() != binding.dtype
+        || payload.storage().representation != binding.storage.representation
         || !payload.device().same_device(&binding.device)
         || !payload.device().is_metal()
     {
@@ -5466,7 +5587,7 @@ fn validate_generated_binding_value(
     }
     let bytes = tensor
         .layout
-        .checked_byte_size(payload.dtype())
+        .checked_byte_size(tensor.dtype)
         .ok_or_else(|| {
             format!(
                 "compile: generated binding {} has an overflowing layout",
@@ -5531,42 +5652,6 @@ pub(super) fn load_generated_bindings(index: &GraphIndex) -> Result<Vec<Value>, 
             Ok(payload)
         })
         .collect()
-}
-
-/// Rejects graph nodes the Metal backend cannot execute (unsupported
-/// linalg, zero-step arange) or dtypes the KDA/short-conv kernels gate
-/// on. Fail loud at compile time, never degrade silently.
-fn validate_metal_support(node: &Node) -> Result<(), String> {
-    match &node.kind {
-        NodeKind::Inverse { .. } => Err("compile: inverse is not supported on Metal".to_string()),
-        NodeKind::Det { .. } => Err("compile: det is not supported on Metal".to_string()),
-        NodeKind::Solve { .. } => Err("compile: solve is not supported on Metal".to_string()),
-        NodeKind::Arange { step, .. } if *step == 0.0 => {
-            Err("compile: arange step must not be zero".to_string())
-        }
-        NodeKind::KdaChunk { q, .. }
-        | NodeKind::KdaRecurrence { q, .. }
-        | NodeKind::KdaBackward { q, .. }
-            if !matches!(q.dtype, DType::F32 | DType::BF16) =>
-        {
-            Err(format!(
-                "compile: KDA does not support Metal dtype {}",
-                q.dtype
-            ))
-        }
-        NodeKind::ShortConv1d { x, .. }
-        | NodeKind::ShortConv1dBackwardX { x, .. }
-        | NodeKind::ShortConv1dBackwardW { x, .. }
-        | NodeKind::ConvState { x, .. }
-            if !matches!(x.dtype, DType::F32 | DType::BF16) =>
-        {
-            Err(format!(
-                "compile: short convolution does not support Metal dtype {}",
-                x.dtype
-            ))
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Compiles graph roots into a stateless Metal executable (test
@@ -5636,7 +5721,8 @@ pub(super) fn compile_prepared_with_state(
         schema.validate()?;
     }
     validate_prepared_generated_bindings(index, generated_bindings)?;
-    let mut driver = CompilerDriver::new(program)?;
+    let capabilities = crate::dtype::MetalDTypeCapabilities::snapshot(device::MetalDevice::get());
+    let mut driver = CompilerDriver::new(program, &capabilities)?;
     let slots = index.slots.to_vec();
     let selected_device = Device::Metal(device::MetalDevice::get().ordinal());
     if index
@@ -5667,18 +5753,24 @@ pub(super) fn compile_prepared_with_state(
         &slots,
     );
     let lowering_result = (|| {
-        driver.lower(|unit, index, plan| {
+        driver.lower(|unit, index, plan, dtype_plan| {
             match unit {
                 LoweringUnit::Node(node) => {
                     let semantic = index
                         .node(node)
                         .ok_or_else(|| format!("compile: dense node {node} is out of range"))?;
-                    lowerer.lower(semantic)?;
+                    lowerer.lower(semantic, dtype_plan)?;
                 }
-                LoweringUnit::Region(region) => lowerer.lower_region(index, plan, region)?,
+                LoweringUnit::Region(region) => {
+                    lowerer.lower_region(index, plan, region, dtype_plan)?
+                }
             }
             Ok(())
         })?;
+        driver.record_materialized_conversions(
+            lowerer.materialized_conversions,
+            lowerer.materialized_conversion_bytes,
+        );
         let outputs = index
             .roots
             .iter()
@@ -5703,6 +5795,7 @@ pub(super) fn compile_prepared_with_state(
         generated_bindings,
         generated_order,
     };
+    let legalization_diagnostics = driver.legalization_diagnostics();
     let compiler_work = driver.finish_with_phase(
         &compilation.executable.program,
         PUBLICATION_PHASE,
@@ -5710,6 +5803,7 @@ pub(super) fn compile_prepared_with_state(
     );
     let executable = Arc::get_mut(&mut compilation.executable)
         .expect("newly published Metal executable must be uniquely owned");
+    executable.diagnostics.legalization = legalization_diagnostics;
     executable.diagnostics.compile_phases = compiler_work.compile_phases.clone();
     executable.compiler_work = compiler_work;
     Ok(compilation)
@@ -6474,9 +6568,9 @@ pub(super) fn route_leading_row(value: &Value, row: usize) -> Result<(Value, boo
         dtype: tensor.dtype,
     };
     if view.layout.offset() == 0 && view.layout.is_contiguous() {
-        Ok((Value(view), false))
+        Ok((Value::dense(view), false))
     } else {
-        Ok((Value(metal_ops::contiguous(&view)?), true))
+        Ok((Value::dense(metal_ops::contiguous(&view)?), true))
     }
 }
 
@@ -6623,7 +6717,12 @@ fn prepare_execution(
         let tensor = value.as_metal()?;
         executable
             .signature
-            .validate_binding_metadata(index, value.dtype(), tensor.placement(), &tensor.layout)
+            .validate_binding_metadata(
+                index,
+                value.value_spec(),
+                tensor.placement(),
+                &tensor.layout,
+            )
             .map_err(|error| format!("execute: {error}"))?;
     }
     let mut values: Vec<Option<Value>> = std::iter::repeat_with(|| None)
@@ -6641,8 +6740,19 @@ fn prepare_execution(
                 .get(slot as usize)
                 .ok_or_else(|| format!("generated input slot {slot} is unbound"))?,
         };
+        if source.shape() != binding.semantic_shape
+            || source.dtype() != binding.semantic_dtype
+            || source.storage().representation != binding.storage.representation
+        {
+            return Err(format!(
+                "binding for value {} does not match its semantic storage contract",
+                binding.value
+            ));
+        }
         let declaration = &executable.program.values[binding.value.index()];
-        if source.shape() != declaration.shape.as_ref() || source.dtype() != declaration.dtype {
+        if source.0.layout.shape() != declaration.shape.as_ref()
+            || source.0.dtype != declaration.dtype
+        {
             return Err(format!(
                 "binding for value {} does not match its compiled signature",
                 binding.value
@@ -6699,7 +6809,7 @@ fn prepare_execution(
                     .segments
                     .get(segment.index())
                     .ok_or_else(|| format!("Metal segment {segment} was not acquired"))?;
-                Some(Value(crate::run::MetalTensor {
+                Some(Value::dense(crate::run::MetalTensor {
                     buffer: Arc::new(device::Buffer::suballoc_with_retention(
                         root,
                         *offset,
@@ -6717,7 +6827,7 @@ fn prepare_execution(
                     .ok_or_else(|| format!("Metal alias root {root} is unresolved"))?
                     .as_metal()?;
                 let bytes = tensor_bytes(&declaration.shape, declaration.dtype, "alias")?;
-                Some(Value(crate::run::MetalTensor {
+                Some(Value::dense(crate::run::MetalTensor {
                     buffer: Arc::new(device::Buffer::suballoc(
                         &source.buffer,
                         *byte_offset,
@@ -8702,7 +8812,7 @@ fn execute_op_into(
                 MetalReduceOp::Min => fusion::ReduceOp::Min,
                 MetalReduceOp::Prod => fusion::ReduceOp::Prod,
             };
-            if matches!(source.dtype, DType::F32 | DType::BF16) {
+            if !source.dtype.is_float() || matches!(source.dtype, DType::F32 | DType::BF16) {
                 metal_ops::reduce_into(source, dims, *keepdims, operation, output(0)?.as_metal()?)
             } else {
                 metal_ops::cast_into(source, scratch_tensors[0])?;
@@ -8971,7 +9081,7 @@ mod tests {
 
     #[test]
     fn routed_leading_rows_use_view_then_device_copy() {
-        let source = Value(crate::run::MetalTensor::from_f32(
+        let source = Value::dense(crate::run::MetalTensor::from_f32(
             device::MetalDevice::get(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             vec![2, 3],
@@ -9000,14 +9110,14 @@ mod tests {
     }
 
     fn leaf_shape(values: Vec<f32>, shape: Vec<usize>) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             crate::run::MetalTensor::from_f32(device::MetalDevice::get(), values, shape),
         )))))
         .unwrap()
     }
 
     fn leaf_u32(values: &[u32], shape: Vec<usize>) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             crate::run::MetalTensor {
                 buffer: device::MetalDevice::get().alloc_with_data_u32(values),
                 layout: effect_torch_runtime::Layout::contiguous(shape),
@@ -9018,7 +9128,7 @@ mod tests {
     }
 
     fn leaf_u8(values: &[u8], shape: Vec<usize>) -> Arc<Node> {
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             crate::run::MetalTensor {
                 buffer: device::MetalDevice::get().upload_bytes(values),
                 layout: effect_torch_runtime::Layout::contiguous(shape),
@@ -9033,7 +9143,7 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             crate::run::MetalTensor {
                 buffer: device::MetalDevice::get().upload_bytes(&bytes),
                 layout: effect_torch_runtime::Layout::contiguous(shape),
@@ -9185,6 +9295,21 @@ mod tests {
         }));
     }
 
+    fn pack_leaf(node: Arc<Node>, codec: GgmlKQuant, shape: [usize; 2]) -> Arc<Node> {
+        let NodeKind::Leaf(slot) = &node.kind else {
+            panic!("expected test leaf")
+        };
+        let value = slot
+            .get::<Value>()
+            .unwrap()
+            .with_packed_storage(codec, shape.to_vec())
+            .unwrap();
+        Node::new(NodeKind::Leaf(Arc::new(effect_torch_graph::LeafSlot::new(
+            value,
+        ))))
+        .unwrap()
+    }
+
     fn scalar(value: f32) -> Arc<Node> {
         Node::new(NodeKind::Reshape {
             a: leaf(vec![value]),
@@ -9247,10 +9372,12 @@ mod tests {
                 let bias = (vectors == 1).then(|| leaf_shape(vec![0.25, -0.5], vec![2]));
                 let root = Node::new(NodeKind::QuantizedLinear {
                     x: leaf_shape(input_values.clone(), vec![vectors, columns]),
-                    weight: leaf_u8(&packed, vec![2, fixture.bytes.len() * 2]),
+                    weight: pack_leaf(
+                        leaf_u8(&packed, vec![2, fixture.bytes.len() * 2]),
+                        fixture.codec,
+                        [2, columns],
+                    ),
                     bias,
-                    codec: fixture.codec,
-                    weight_shape: [2, columns],
                 })
                 .unwrap();
                 let compilation = compile_graph(&[root], false);
@@ -9306,10 +9433,12 @@ mod tests {
                 .collect::<Vec<_>>();
             let root = Node::new(NodeKind::QuantizedLinear {
                 x: leaf_shape(input_values.clone(), vec![vectors, columns]),
-                weight: leaf_u8(&packed, vec![rows, encoded_row_bytes]),
+                weight: pack_leaf(
+                    leaf_u8(&packed, vec![rows, encoded_row_bytes]),
+                    fixture.codec,
+                    [rows, columns],
+                ),
                 bias: None,
-                codec: fixture.codec,
-                weight_shape: [rows, columns],
             })
             .unwrap();
             let compilation = compile_graph(&[root], false);
@@ -9349,10 +9478,12 @@ mod tests {
                 .collect::<Vec<_>>();
             Node::new(NodeKind::QuantizedLinear {
                 x: input.clone(),
-                weight: leaf_u8(&packed, vec![rows, fixture.bytes.len() * (columns / 256)]),
+                weight: pack_leaf(
+                    leaf_u8(&packed, vec![rows, fixture.bytes.len() * (columns / 256)]),
+                    fixture.codec,
+                    [rows, columns],
+                ),
                 bias: None,
-                codec: fixture.codec,
-                weight_shape: [rows, columns],
             })
             .unwrap()
         };
@@ -9408,10 +9539,12 @@ mod tests {
                 .collect::<Vec<_>>();
             Node::new(NodeKind::QuantizedLinear {
                 x,
-                weight: leaf_u8(&packed, vec![2, encoded_row_bytes]),
+                weight: pack_leaf(
+                    leaf_u8(&packed, vec![2, encoded_row_bytes]),
+                    codec,
+                    [2, columns],
+                ),
                 bias: bias.then(|| leaf_shape(vec![0.25, -0.5], vec![2])),
-                codec,
-                weight_shape: [2, columns],
             })
             .unwrap()
         };
@@ -9469,10 +9602,12 @@ mod tests {
             .collect::<Vec<_>>();
         let first = Node::new(NodeKind::QuantizedLinear {
             x: input,
-            weight: leaf_u8(&wide, vec![columns, encoded_row_bytes]),
+            weight: pack_leaf(
+                leaf_u8(&wide, vec![columns, encoded_row_bytes]),
+                GgmlKQuant::Q4K,
+                [columns, columns],
+            ),
             bias: None,
-            codec: GgmlKQuant::Q4K,
-            weight_shape: [columns, columns],
         })
         .unwrap();
         let compilation = compile_graph(
@@ -9509,13 +9644,12 @@ mod tests {
                     roots.push(
                         Node::new(NodeKind::QuantizedLinear {
                             x: input.clone(),
-                            weight: leaf_u8(
-                                &packed,
-                                vec![rows, fixture.bytes.len() * (columns / 256)],
+                            weight: pack_leaf(
+                                leaf_u8(&packed, vec![rows, fixture.bytes.len() * (columns / 256)]),
+                                fixture.codec,
+                                [rows, columns],
                             ),
                             bias: None,
-                            codec: fixture.codec,
-                            weight_shape: [rows, columns],
                         })
                         .unwrap(),
                     );
@@ -9566,9 +9700,11 @@ mod tests {
                 };
                 let root = Node::new(NodeKind::QuantizedEmbedding {
                     indexes,
-                    weight: leaf_u8(&packed, vec![3, fixture.bytes.len()]),
-                    codec: fixture.codec,
-                    weight_shape: [3, 256],
+                    weight: pack_leaf(
+                        leaf_u8(&packed, vec![3, fixture.bytes.len()]),
+                        fixture.codec,
+                        [3, 256],
+                    ),
                     padding_index: None,
                 })
                 .unwrap();
@@ -9592,17 +9728,21 @@ mod tests {
         let q6 = &fixtures[4];
         let linear = Node::new(NodeKind::QuantizedLinear {
             x: leaf_shape(vec![1.0; 256], vec![1, 256]),
-            weight: leaf_u8(&q2.bytes, vec![1, q2.bytes.len()]),
+            weight: pack_leaf(
+                leaf_u8(&q2.bytes, vec![1, q2.bytes.len()]),
+                q2.codec,
+                [1, 256],
+            ),
             bias: None,
-            codec: q2.codec,
-            weight_shape: [1, 256],
         })
         .unwrap();
         let embedding = Node::new(NodeKind::QuantizedEmbedding {
             indexes: leaf_u32(&[0], vec![1]),
-            weight: leaf_u8(&q6.bytes, vec![1, q6.bytes.len()]),
-            codec: q6.codec,
-            weight_shape: [1, 256],
+            weight: pack_leaf(
+                leaf_u8(&q6.bytes, vec![1, q6.bytes.len()]),
+                q6.codec,
+                [1, 256],
+            ),
             padding_index: None,
         })
         .unwrap();
@@ -9687,9 +9827,11 @@ mod tests {
         ] {
             let root = Node::new(NodeKind::QuantizedEmbedding {
                 indexes,
-                weight: leaf_u8(&fixture.bytes, vec![1, fixture.bytes.len()]),
-                codec: fixture.codec,
-                weight_shape: [1, 256],
+                weight: pack_leaf(
+                    leaf_u8(&fixture.bytes, vec![1, fixture.bytes.len()]),
+                    fixture.codec,
+                    [1, 256],
+                ),
                 padding_index: None,
             })
             .unwrap();
@@ -9710,10 +9852,12 @@ mod tests {
 
         let root = Node::new(NodeKind::QuantizedLinear {
             x: leaf_shape(vec![1.0; 256], vec![1, 256]),
-            weight: leaf_u8(&fixture.bytes, vec![1, fixture.bytes.len()]),
+            weight: pack_leaf(
+                leaf_u8(&fixture.bytes, vec![1, fixture.bytes.len()]),
+                fixture.codec,
+                [1, 256],
+            ),
             bias: None,
-            codec: fixture.codec,
-            weight_shape: [1, 256],
         })
         .unwrap();
         let compilation = compile_graph(&[root], false);
@@ -9759,6 +9903,7 @@ mod tests {
     #[test]
     fn scalar_bindings_are_written_into_planned_invocation_staging() {
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
@@ -9808,7 +9953,7 @@ mod tests {
             SegmentOwnership::InvocationStaging
         );
 
-        let input = Value(crate::run::MetalTensor::from_f32(
+        let input = Value::dense(crate::run::MetalTensor::from_f32(
             device::MetalDevice::get(),
             vec![1.0, 2.0],
             vec![2],
@@ -9829,6 +9974,7 @@ mod tests {
         for batch in [1usize, 3] {
             let input = |slot| {
                 Node::new(NodeKind::Input {
+                    storage: effect_torch_runtime::StorageMetadata::dense(),
                     slot,
                     shape: vec![batch, 1, 2, 4],
                     dtype: DType::F32,
@@ -9919,8 +10065,85 @@ mod tests {
     }
 
     #[test]
+    fn prepared_input_layout_policies_fail_before_metal_publication() {
+        use effect_torch_runtime::{
+            BindingLayoutPolicy as Policy, Layout, LayoutConstraint as Constraint,
+        };
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![2, 2],
+            dtype: DType::F32,
+            device: Device::Metal(0),
+            storage: effect_torch_runtime::StorageMetadata::dense(),
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::Neg { a: input }).unwrap();
+        let initial = ProgramRequest::from_roots(vec![root.clone()], options(false))
+            .prepare()
+            .unwrap();
+        let prepare = |layout| {
+            let mut bindings = initial.signature.bindings.clone();
+            bindings[0].layout = layout;
+            ProgramRequest::new(
+                vec![root.clone()],
+                bindings,
+                initial.signature.invocation.clone(),
+                options(false),
+            )
+            .prepare()
+            .unwrap()
+        };
+        for layout in [
+            Policy::Require(Constraint::AnyStrided),
+            Policy::Require(Constraint::Contiguous),
+            Policy::Require(Constraint::Exact(Layout::new(vec![2, 2], vec![2, 1], 1))),
+            Policy::Require(Constraint::Exact(
+                Layout::contiguous(vec![2, 2]).permute(&[1, 0]),
+            )),
+            Policy::Canonicalize {
+                target: Layout::contiguous(vec![2, 2]),
+            },
+        ] {
+            let program = prepare(layout.clone());
+            let error = compile_prepared_with_state(&program, &[], None)
+                .err()
+                .expect("unsupported layout must fail compilation");
+            assert!(
+                error.contains("unsupported on metal") && error.contains("Layout"),
+                "{layout:?}: {error}"
+            );
+        }
+        for layout in [
+            Policy::Require(Constraint::ZeroOffsetContiguous),
+            Policy::Require(Constraint::Exact(Layout::contiguous(vec![2, 2]))),
+        ] {
+            let program = prepare(layout);
+            assert_eq!(
+                program.index.value_storage[program.index.roots[0].index()],
+                effect_torch_runtime::StorageMetadata::unconstrained()
+            );
+            let compilation = compile_prepared_with_state(&program, &[], None).unwrap();
+            let value = Value::dense(crate::run::MetalTensor::from_f32(
+                device::MetalDevice::get(),
+                vec![1., 2., 3., 4.],
+                vec![2, 2],
+            ));
+            let outputs = execute_with_scalars(
+                &compilation.executable,
+                &[value],
+                &[],
+                &[],
+                &CancellationFlag::new(),
+            )
+            .unwrap();
+            assert_eq!(outputs[0].to_f32_vec().unwrap(), [-1., -2., -3., -4.]);
+        }
+    }
+
+    #[test]
     fn declared_strided_binding_is_rejected_by_the_metal_signature_contract() {
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2, 2],
             dtype: DType::F32,
@@ -9944,7 +10167,7 @@ mod tests {
         input.layout = input.layout.permute(&[1, 0]);
         let error = execute_with_scalars(
             &compilation.executable,
-            &[Value(input)],
+            &[Value::dense(input)],
             &compilation.generated_bindings,
             &[],
             &CancellationFlag::new(),
@@ -9958,6 +10181,7 @@ mod tests {
     #[test]
     fn bounded_batch_inputs_are_zero_padded_in_planned_staging() {
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2, 2],
             dtype: DType::F32,
@@ -9999,7 +10223,7 @@ mod tests {
             schema,
             slots: Vec::new(),
         };
-        let input = Value(crate::run::MetalTensor::from_f32(
+        let input = Value::dense(crate::run::MetalTensor::from_f32(
             device::MetalDevice::get(),
             vec![2.0, 3.0],
             vec![1, 2],
@@ -10154,6 +10378,364 @@ mod tests {
             second[1].to_f32_vec().unwrap()
         );
         assert_ne!(first_values, second[0].to_f32_vec().unwrap());
+    }
+
+    fn half_leaf(values: Vec<f32>, shape: Vec<usize>, dtype: DType) -> Arc<Node> {
+        let device = device::MetalDevice::get();
+        let source = crate::run::MetalTensor::from_f32(device, values, shape);
+        let tensor = crate::kernels::cast(device, &source, dtype).unwrap();
+        Node::new(NodeKind::Leaf(Arc::new(effect_torch_graph::LeafSlot::new(
+            Value::dense(tensor),
+        ))))
+        .unwrap()
+    }
+
+    #[test]
+    fn integer_cursor_addition_preserves_large_values_and_wraps_exactly() {
+        let root = Node::new(NodeKind::Add {
+            a: leaf_i64(&[(1_i64 << 40) + 1, i64::MAX, 16_777_217], vec![3]),
+            b: leaf_i64(&[1], vec![]),
+        })
+        .unwrap();
+        for optimize in [false, true] {
+            let compilation = compile_graph(std::slice::from_ref(&root), optimize);
+            let outputs = run(&compilation);
+            let tensor = outputs[0].as_metal().unwrap();
+            let actual = unsafe {
+                std::slice::from_raw_parts(tensor.buffer.contents_ptr().cast::<i64>(), 3)
+            };
+            assert_eq!(actual, &[(1_i64 << 40) + 2, i64::MIN, 16_777_218]);
+            assert_eq!(
+                compilation
+                    .executable
+                    .compiler_work
+                    .materialized_conversions,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn integer_graphs_keep_exact_arithmetic_comparisons_and_reductions() {
+        let a = leaf_i64(&[16_777_217, i64::MAX, i64::MIN, -3], vec![2, 2]);
+        let b = leaf_i64(&[1, -2], vec![2]);
+        let sub = Node::new(NodeKind::Sub {
+            a: a.clone(),
+            b: b.clone(),
+        })
+        .unwrap();
+        let mul = Node::new(NodeKind::Mul { a: a.clone(), b }).unwrap();
+        let condition = Node::new(NodeKind::Gt {
+            a: a.clone(),
+            b: leaf_i64(&[16_777_216], vec![]),
+        })
+        .unwrap();
+        let selected = Node::new(NodeKind::Where {
+            cond: condition.clone(),
+            a: sub.clone(),
+            b: mul.clone(),
+        })
+        .unwrap();
+        let min = Node::new(NodeKind::Min {
+            a: a.clone(),
+            dims: vec![1],
+            keepdims: false,
+        })
+        .unwrap();
+        let max = Node::new(NodeKind::Max {
+            a,
+            dims: vec![0],
+            keepdims: true,
+        })
+        .unwrap();
+        let all = Node::new(NodeKind::Min {
+            a: condition,
+            dims: vec![0, 1],
+            keepdims: false,
+        })
+        .unwrap();
+        for optimize in [false, true] {
+            let compilation = compile_graph(
+                &[
+                    sub.clone(),
+                    mul.clone(),
+                    selected.clone(),
+                    min.clone(),
+                    max.clone(),
+                    all.clone(),
+                ],
+                optimize,
+            );
+            let outputs = run(&compilation);
+            let read = |index: usize| {
+                let tensor = outputs[index].as_metal().unwrap();
+                unsafe {
+                    std::slice::from_raw_parts(
+                        tensor
+                            .buffer
+                            .contents_ptr()
+                            .cast::<i64>()
+                            .add(tensor.layout.offset()),
+                        tensor.numel(),
+                    )
+                    .to_vec()
+                }
+            };
+            assert_eq!(read(0), [16_777_216, i64::MIN + 1, i64::MAX, -1]);
+            assert_eq!(read(1), [16_777_217, 2, i64::MIN, 6]);
+            assert_eq!(read(2), [16_777_216, i64::MIN + 1, i64::MIN, 6]);
+            assert_eq!(read(3), [16_777_217, i64::MIN]);
+            assert_eq!(read(4), [16_777_217, i64::MAX]);
+            assert_eq!(outputs[5].to_f32_vec().unwrap(), [0.0]);
+            assert_eq!(
+                compilation
+                    .executable
+                    .compiler_work
+                    .materialized_conversions,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_coercion_rounds_before_half_comparisons_in_both_orders() {
+        for (dtype, midpoint) in [(DType::BF16, 1.00390625), (DType::F16, 1.00048828125)] {
+            let tensor = half_leaf(vec![1.0], vec![1], dtype);
+            let scalar = Node::new(NodeKind::Full {
+                shape: vec![],
+                value: midpoint,
+                dtype: DType::F32,
+                device: Device::Metal(0),
+            })
+            .unwrap();
+            for (a, b) in [(tensor.clone(), scalar.clone()), (scalar, tensor)] {
+                let eq = Node::new(NodeKind::Eq {
+                    a: a.clone(),
+                    b: b.clone(),
+                })
+                .unwrap();
+                let lt = Node::new(NodeKind::Lt { a, b }).unwrap();
+                for optimize in [false, true] {
+                    let compilation = compile_graph(&[eq.clone(), lt.clone()], optimize);
+                    let outputs = run(&compilation);
+                    assert_eq!(
+                        outputs[0].to_f32_vec().unwrap(),
+                        [1.0],
+                        "{dtype:?}, optimize={optimize}"
+                    );
+                    assert_eq!(
+                        outputs[1].to_f32_vec().unwrap(),
+                        [0.0],
+                        "{dtype:?}, optimize={optimize}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn operand_conversion_rejects_a_wrong_typed_source_before_emitting_commands() {
+        let root = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![],
+            dtype: DType::F32,
+            device: Device::Metal(0),
+            storage: effect_torch_runtime::StorageMetadata::dense(),
+        })
+        .unwrap();
+        let program = ProgramRequest::from_roots(vec![root], options(false))
+            .prepare()
+            .unwrap();
+        let mut lowerer = Lowerer::new(
+            &program.index,
+            &[],
+            program.options.clone(),
+            1024,
+            program.options.environment.into(),
+            None,
+            &program.index.slots,
+        );
+        let source = lowerer.dynamic_value(&[], DType::F32, "source").unwrap();
+        let error = lowerer
+            .convert_value(
+                source,
+                DenseConversionContract::new(DType::BF16, DType::F32),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("source dtype f32 differs from planned bf16"),
+            "{error}"
+        );
+        assert!(lowerer.instructions.is_empty());
+        assert_eq!(lowerer.values.len(), 1);
+        assert_eq!(lowerer.materialized_conversions, 0);
+    }
+
+    #[test]
+    fn bf16_cast_chain_preserves_subnormals_in_both_optimization_modes() {
+        let input = leaf(
+            [
+                0u32, 0x80000000, 0x00008000, 0x00008001, 0x00018000, 0x80008000, 0x80008001,
+            ]
+            .into_iter()
+            .map(f32::from_bits)
+            .collect(),
+        );
+        let narrow = Node::new(NodeKind::Cast {
+            a: input,
+            dtype: DType::BF16,
+        })
+        .unwrap();
+        let wide = Node::new(NodeKind::Cast {
+            a: narrow,
+            dtype: DType::F32,
+        })
+        .unwrap();
+        for optimize in [false, true] {
+            let compilation = compile_graph(&[wide.clone()], optimize);
+            let outputs = run(&compilation);
+            assert_eq!(
+                outputs[0]
+                    .to_f32_vec()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+                [0, 0x80000000, 0, 0x00010000, 0x00020000, 0x80000000, 0x80010000],
+                "optimize={optimize}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_coercion_rounds_before_half_arithmetic() {
+        for (dtype, scalar_value) in [(DType::BF16, 1.00390625), (DType::F16, 1.00048828125)] {
+            let product = Node::new(NodeKind::Mul {
+                a: half_leaf(vec![3.0], vec![1], dtype),
+                b: Node::new(NodeKind::Full {
+                    shape: vec![],
+                    value: scalar_value,
+                    dtype: DType::F32,
+                    device: Device::Metal(0),
+                })
+                .unwrap(),
+            })
+            .unwrap();
+            let chain = Node::new(NodeKind::Add {
+                a: product.clone(),
+                b: half_leaf(vec![0.0], vec![1], dtype),
+            })
+            .unwrap();
+            for root in [product, chain] {
+                for optimize in [false, true] {
+                    assert_eq!(
+                        run(&compile_graph(std::slice::from_ref(&root), optimize))[0]
+                            .to_f32_vec()
+                            .unwrap(),
+                        [3.0]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_fusion_preserves_every_semantic_rounding_boundary() {
+        for (dtype, witness) in [(DType::F16, 2048.0), (DType::BF16, 256.0)] {
+            let input = half_leaf(vec![witness; 4], vec![2, 2], dtype);
+            let one = half_leaf(vec![1.0; 2], vec![1, 2], dtype);
+            let sum = Node::new(NodeKind::Add {
+                a: input.clone(),
+                b: one,
+            })
+            .unwrap();
+            let difference = Node::new(NodeKind::Sub {
+                a: sum.clone(),
+                b: input,
+            })
+            .unwrap();
+            let reduced = Node::new(NodeKind::Sum {
+                a: difference.clone(),
+                dims: vec![1],
+                keepdims: false,
+            })
+            .unwrap();
+            for roots in [
+                vec![difference.clone()],
+                vec![sum.clone(), difference.clone()],
+                vec![reduced],
+            ] {
+                let optimized = compile_graph(&roots, true);
+                let unoptimized = compile_graph(&roots, false);
+                let actual = run(&optimized);
+                let expected = run(&unoptimized);
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.dtype(), dtype);
+                    assert_eq!(actual.to_f32_vec().unwrap(), expected.to_f32_vec().unwrap());
+                }
+                assert!(actual
+                    .last()
+                    .unwrap()
+                    .to_f32_vec()
+                    .unwrap()
+                    .iter()
+                    .all(|value| *value == 0.0));
+                if roots.len() == 1 {
+                    assert!(
+                        optimized
+                            .executable
+                            .commands()
+                            .iter()
+                            .any(|command| matches!(
+                                operation(command).0,
+                                MetalOp::FusedElementwise { .. } | MetalOp::FusedReduce { .. }
+                            )),
+                        "dtype={dtype:?}"
+                    );
+                }
+                assert!(unoptimized
+                    .executable
+                    .program
+                    .values
+                    .iter()
+                    .any(|value| value.dtype == DType::F32));
+            }
+        }
+    }
+
+    #[test]
+    fn half_linear_epilogues_round_linear_output_before_consuming_it() {
+        for (dtype, witness, fraction) in [
+            (DType::F16, 2048.0, 0.00048828125),
+            (DType::BF16, 256.0, 0.00390625),
+        ] {
+            let linear = |weights: Vec<f32>| {
+                Node::new(NodeKind::Linear {
+                    x: half_leaf(vec![1.0, 1.0], vec![1, 2], dtype),
+                    weight: half_leaf(weights, vec![2, 1], dtype),
+                    bias: half_leaf(vec![0.0], vec![1], dtype),
+                })
+                .unwrap()
+            };
+            let residual = Node::new(NodeKind::Add {
+                a: linear(vec![witness, 1.0]),
+                b: half_leaf(vec![-witness], vec![1, 1], dtype),
+            })
+            .unwrap();
+            let activation = Node::new(NodeKind::Gelu {
+                a: linear(vec![1.0, fraction]),
+                approximate: false,
+            })
+            .unwrap();
+            for root in [residual, activation] {
+                let optimized = compile_graph(std::slice::from_ref(&root), true);
+                let unoptimized = compile_graph(std::slice::from_ref(&root), false);
+                assert_eq!(
+                    run(&optimized)[0].to_f32_vec().unwrap(),
+                    run(&unoptimized)[0].to_f32_vec().unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -10623,6 +11205,7 @@ mod tests {
             [
                 "graph_index",
                 "optimization",
+                "target_legalization",
                 "lowering",
                 "lowered_program_validation",
                 "memory_planning",
@@ -10639,11 +11222,9 @@ mod tests {
 
     #[test]
     fn constant_weights_retain_leaf_storage_without_generated_bindings() {
-        let slot = Arc::new(LeafSlot::new(Value(crate::run::MetalTensor::from_f32(
-            device::MetalDevice::get(),
-            vec![1.0, 2.0],
-            vec![2],
-        ))));
+        let slot = Arc::new(LeafSlot::new(Value::dense(
+            crate::run::MetalTensor::from_f32(device::MetalDevice::get(), vec![1.0, 2.0], vec![2]),
+        )));
         let leaf = Node::new(NodeKind::Leaf(Arc::clone(&slot))).unwrap();
         let root = Node::new(NodeKind::Neg { a: leaf }).unwrap();
         let mut compile_options = options(false);
@@ -11121,7 +11702,7 @@ mod tests {
             misses
         );
 
-        let target = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+        let target = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value::dense(
             crate::run::MetalTensor {
                 buffer: device::MetalDevice::get().upload_bytes(&0i64.to_le_bytes()),
                 layout: effect_torch_runtime::Layout::contiguous(vec![1]),
@@ -12196,6 +12777,7 @@ mod tests {
     #[test]
     fn one_plan_executes_concurrently_with_independent_submissions() {
         let input = Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
@@ -12210,7 +12792,7 @@ mod tests {
                 let executable = executable.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let input = Value(crate::run::MetalTensor::from_f32(
+                    let input = Value::dense(crate::run::MetalTensor::from_f32(
                         device::MetalDevice::get(),
                         vec![index as f32, index as f32 + 1.0],
                         vec![2],

@@ -16,6 +16,8 @@
 //! export one allocation twice. Release builds omit this registry, so callers
 //! must export each leaked allocation exactly once.
 
+pub mod safetensors;
+
 use effect_torch_runtime::CancellationFlag;
 use napi::{Error, Result, Status};
 #[cfg(debug_assertions)]

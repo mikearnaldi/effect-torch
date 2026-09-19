@@ -65,6 +65,16 @@ pub struct CompilerWorkReport {
     pub selected_regions: usize,
     pub lowered_values: usize,
     pub lowered_instructions: usize,
+    pub capability_queries: usize,
+    pub native_lowering_units: usize,
+    pub legalized_lowering_units: usize,
+    pub kernel_local_legalizations: usize,
+    pub materialized_conversions: usize,
+    pub materialized_conversion_bytes: usize,
+    pub decompositions: usize,
+    pub rejected_region_candidates: usize,
+    pub unsupported_independent_units: usize,
+    pub legalization: effect_torch_runtime::DTypeLegalizationDiagnostics,
     pub compile_phases: Box<[CompilePhaseTiming]>,
 }
 
@@ -97,7 +107,31 @@ impl CompilerWorkReport {
             lowered_values: lowered.values.len(),
             lowered_instructions: lowered.instructions.len(),
             compile_phases: Box::new([]),
+            ..Self::default()
         }
+    }
+
+    /// Attaches validated target planning and emitted conversion counts.
+    pub fn with_legalization(mut self, work: crate::LegalizationWork) -> Self {
+        self.capability_queries = work.capability_queries;
+        self.native_lowering_units = work.native_lowering_units;
+        self.legalized_lowering_units = work.legalized_lowering_units;
+        self.kernel_local_legalizations = work.kernel_local_legalizations;
+        self.materialized_conversions = work.materialized_conversions;
+        self.materialized_conversion_bytes = work.materialized_conversion_bytes;
+        self.decompositions = work.decompositions;
+        self.rejected_region_candidates = work.rejected_region_candidates;
+        self.unsupported_independent_units = work.unsupported_independent_units;
+        self
+    }
+
+    /// Attaches the target identity and legalization summary for publication.
+    pub fn with_legalization_diagnostics(
+        mut self,
+        diagnostics: effect_torch_runtime::DTypeLegalizationDiagnostics,
+    ) -> Self {
+        self.legalization = diagnostics;
+        self
     }
 
     /// Overrides the pass-scan list when a backend uses finer attribution than
@@ -149,6 +183,7 @@ where
         command_count: input.command_count,
         synchronization_count: input.synchronization_count,
         memory: memory.report.clone(),
+        legalization: effect_torch_runtime::DTypeLegalizationDiagnostics::default(),
         compile_phases: input.compile_phases.into_boxed_slice(),
     }
 }

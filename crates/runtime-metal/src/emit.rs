@@ -9,9 +9,9 @@
 //! - Each kernel clamps its thread position to `n - 1`. This makes padded
 //!   grids safe without divergent control flow. Past `u32::MAX` elements,
 //!   the index widens to `ulong` over a 2-D grid of width [`WIDE`].
-//! - The IR only models float math. f32 lanes load and store directly. bf16
-//!   lanes convert at the boundary with `float(...)` and `bfloat(...)`. Any
-//!   other storage dtype is an emitter bug handled by `unreachable!`.
+//! - F32, F16, and BF16 lanes compute in F32. Typed `Cast` and `RoundTo`
+//!   expressions preserve the checked semantic boundaries between operations.
+//!   Reductions accumulate in F32 and round their final result to storage.
 //! - Per-input lane offsets are constant arithmetic on output coordinates. A
 //!   layout change therefore produces a different kernel and pipeline key.
 //! - Buffer bindings are `in0..inK`, optional `scs` for packed f32 scalars,
@@ -20,6 +20,7 @@
 //!   source round-trips exactly and does not depend on locale formatting.
 
 use super::device::MetalDevice;
+use super::kernels::BF16_CONVERSION_MSL;
 use crate::fusion::{Expr, ReduceOp};
 
 /// Threadgroup width (and grid padding quantum) for all flat fused
@@ -63,11 +64,12 @@ fn gid_decl(n: usize) -> (String, String) {
     }
 }
 
-// bf16 kernels load into float, compute in float, and store as bfloat.
-// The fusion IR only models float math, so dtype support affects loads and stores.
+// Storage types are separate from the F32 arithmetic carrier. Semantic rounding
+// inside a fused region is emitted from the checked typed expressions.
 fn storage_ty(dtype: crate::runtime::dtype::DType) -> &'static str {
     match dtype {
         crate::runtime::dtype::DType::F32 => "float",
+        crate::runtime::dtype::DType::F16 => "half",
         crate::runtime::dtype::DType::BF16 => "bfloat",
         other => unreachable!("emit: unsupported storage dtype {other:?}"),
     }
@@ -76,7 +78,8 @@ fn storage_ty(dtype: crate::runtime::dtype::DType) -> &'static str {
 fn load_expr(access: String, dtype: crate::runtime::dtype::DType) -> String {
     match dtype {
         crate::runtime::dtype::DType::F32 => access,
-        crate::runtime::dtype::DType::BF16 => format!("float({access})"),
+        crate::runtime::dtype::DType::F16 => format!("float({access})"),
+        crate::runtime::dtype::DType::BF16 => format!("et_bf16_to_float({access})"),
         other => unreachable!("emit: unsupported storage dtype {other:?}"),
     }
 }
@@ -84,7 +87,8 @@ fn load_expr(access: String, dtype: crate::runtime::dtype::DType) -> String {
 fn store_expr(value: &str, dtype: crate::runtime::dtype::DType) -> String {
     match dtype {
         crate::runtime::dtype::DType::F32 => value.to_string(),
-        crate::runtime::dtype::DType::BF16 => format!("bfloat({value})"),
+        crate::runtime::dtype::DType::F16 => format!("half({value})"),
+        crate::runtime::dtype::DType::BF16 => format!("et_bf16_from_float({value})"),
         other => unreachable!("emit: unsupported storage dtype {other:?}"),
     }
 }
@@ -189,7 +193,10 @@ fn emit_expr_ssa(
                     stack.push((b, false));
                     stack.push((a, false));
                 }
-                Expr::Neg(a)
+                Expr::Cast(a, _)
+                | Expr::RoundTo(a, _)
+                | Expr::Semantic(a, _, _)
+                | Expr::Neg(a)
                 | Expr::Sqrt(a)
                 | Expr::Exp(a)
                 | Expr::Sin(a)
@@ -210,6 +217,26 @@ fn emit_expr_ssa(
         }
         let rhs = match node {
             Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => unreachable!(),
+            Expr::Cast(_, dtype) | Expr::RoundTo(_, dtype) => {
+                let value = results.pop().expect("emit conversion operand");
+                let ty = match dtype {
+                    crate::runtime::dtype::DType::F32 => "float",
+                    crate::runtime::dtype::DType::F16 => "half",
+                    crate::runtime::dtype::DType::BF16 => "bfloat",
+                    crate::runtime::dtype::DType::U8 => "uchar",
+                    crate::runtime::dtype::DType::U32 => "uint",
+                    crate::runtime::dtype::DType::I64 => "long",
+                    crate::runtime::dtype::DType::F64 => {
+                        unreachable!("F64 was rejected by Metal legalization")
+                    }
+                };
+                if *dtype == crate::runtime::dtype::DType::BF16 {
+                    format!("et_bf16_to_float(et_bf16_from_float({value}))")
+                } else {
+                    format!("float({ty}({value}))")
+                }
+            }
+            Expr::Semantic(..) => unreachable!("semantic expression was not legalized"),
             Expr::Add(..) => binary!(results, "({} + {})"),
             Expr::Sub(..) => binary!(results, "({} - {})"),
             Expr::Mul(..) => binary!(results, "({} * {})"),
@@ -332,7 +359,7 @@ pub fn emit_elementwise(
     let num_inputs = lane_strides.len();
     let num_outputs = exprs.len();
     let ty = storage_ty(dtype);
-    let mut src = format!("{PREAMBLE}{ACT_FNS}");
+    let mut src = format!("{PREAMBLE}{BF16_CONVERSION_MSL}{ACT_FNS}");
     src.push_str(&format!("kernel void {name}(\n"));
     let mut idx = 0usize;
     let mut params: Vec<String> = Vec::new();
@@ -393,7 +420,7 @@ pub fn emit_reduce(
     let out_n: usize = out_shape.iter().product();
     let contig_out = contiguous_strides(out_shape);
     let ty = storage_ty(dtype);
-    let mut src = format!("{PREAMBLE}{ACT_FNS}");
+    let mut src = format!("{PREAMBLE}{BF16_CONVERSION_MSL}{ACT_FNS}");
     src.push_str(&format!("kernel void {name}(\n"));
     let mut params: Vec<String> = Vec::new();
     let mut idx = 0usize;
@@ -547,6 +574,44 @@ mod tests {
     }
 
     #[test]
+    fn typed_rounding_is_emitted_between_fused_operations() {
+        for (dtype, rounded, input) in [
+            (
+                crate::runtime::dtype::DType::F16,
+                "float(half(t0))",
+                "float(in0[clamped])",
+            ),
+            (
+                crate::runtime::dtype::DType::BF16,
+                "et_bf16_to_float(et_bf16_from_float(t0))",
+                "et_bf16_to_float(in0[clamped])",
+            ),
+        ] {
+            let expression = Expr::Sub(
+                Box::new(Expr::RoundTo(
+                    Box::new(Expr::Add(
+                        Box::new(Expr::Input(0)),
+                        Box::new(Expr::Input(1)),
+                    )),
+                    dtype,
+                )),
+                Box::new(Expr::Input(0)),
+            );
+            let source = emit_elementwise(
+                &[expression],
+                &[vec![1], vec![0]],
+                &[4],
+                4,
+                0,
+                "typed_rounding",
+                dtype,
+            );
+            assert!(source.contains(&format!("float t1 = {rounded};")));
+            assert!(source.contains(&format!("float t2 = (t1 - {input});")));
+        }
+    }
+
+    #[test]
     fn reduce_source_shape() {
         let expr = Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Input(0)));
         let src = emit_reduce(
@@ -584,9 +649,9 @@ mod tests {
             crate::runtime::dtype::DType::BF16,
         );
         assert!(selected_src.contains(
-            "        float t0 = (float(in0[0u + (r % 2)]) != 0.0f ? float(in1[0u + (r % 2)]) : float(in2[0u + (r % 2)]));\n        acc += t0;"
+            "        float t0 = (et_bf16_to_float(in0[0u + (r % 2)]) != 0.0f ? et_bf16_to_float(in1[0u + (r % 2)]) : et_bf16_to_float(in2[0u + (r % 2)]));\n        acc += t0;"
         ));
-        assert!(selected_src.contains("out[clamped] = bfloat(acc);"));
+        assert!(selected_src.contains("out[clamped] = et_bf16_from_float(acc);"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-extern "C" __global__ void conv_f64(
+__device__ void conv_f64(
     unsigned int op,
     const double *x,
     const double *w,
@@ -104,12 +104,12 @@ extern "C" __global__ void conv_f64(
     out[index] = cast_dtype(total, dtype);
 }
 
-extern "C" __global__ void linalg_f64(
+__device__ void linalg_f64(
     unsigned int op,
     const double *a,
     const double *b,
     double *out,
-    double *workspace,
+    double *workspace, unsigned int *status,
     unsigned int batches,
     unsigned int n,
     unsigned int rhs,
@@ -133,6 +133,7 @@ extern "C" __global__ void linalg_f64(
         unsigned int selected = pivot;
         for (unsigned int row = pivot + 1; row < n; ++row) if (fabs(matrix[row * n + pivot]) > fabs(matrix[selected * n + pivot])) selected = row;
         if (matrix[selected * n + pivot] == 0.0) {
+            if (op != 1) atomicCAS(status, 0U, 3U);
             if (op == 1) out[batch] = 0.0;
             else for (unsigned long long i = 0; i < right_size; ++i) out[batch * right_size + i] = 0.0 / 0.0;
             return;
@@ -160,7 +161,7 @@ extern "C" __global__ void linalg_f64(
     else for (unsigned long long i = 0; i < right_size; ++i) out[batch * right_size + i] = cast_dtype(right[i], dtype);
 }
 
-extern "C" __global__ void linear_f64(
+__device__ void linear_f64(
     const double *x,
     const double *weight,
     const double *bias,
@@ -174,7 +175,27 @@ extern "C" __global__ void linear_f64(
     if (index >= len) return;
     unsigned int row = index / n_width;
     unsigned int column = index % n_width;
-    double value = bias[column];
+    double value = bias ? bias[column] : 0.0;
     for (unsigned int k = 0; k < k_width; ++k) value += x[row * k_width + k] * weight[k * n_width + column];
     out[index] = cast_dtype(value, dtype);
+}
+
+// Adds a bias in F32 and performs the single rounding to the declared output
+// dtype. The GEMM accumulates into an F32 temporary so bias is applied before
+// the BF16 rounding boundary. Used by the native row-major BF16 GEMM path.
+__device__ void linear_bias_f64(
+    const void *accumulator,
+    const void *bias,
+    unsigned int bias_dtype,
+    void *out,
+    unsigned int output_dtype,
+    unsigned int accumulator_dtype,
+    unsigned int len,
+    unsigned int columns
+) {
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= len) return;
+    double value = et_load<double>((et_u64)accumulator, accumulator_dtype, index);
+    if (bias) value += et_load<double>((et_u64)bias, bias_dtype, index % columns);
+    et_store((et_u64)out, output_dtype, index, value);
 }

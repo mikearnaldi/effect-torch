@@ -156,7 +156,8 @@ kernel void et_gemm(
     }}
     if (i < M && j < N) {{
         const ulong d_idx = d_batch + (ulong)i * N + j;
-        const float v = acc{bias_add}{res_add};
+        const float linear = float({ty}(acc{bias_add}));
+        const float v = linear{res_add};
         {store}
     }}
 }}
@@ -571,7 +572,8 @@ kernel void et_gemm_mma(
         const uint i = m0 + r, j = n0 + c;
         if (i < M && j < N) {{
             const ulong d_idx = d_batch + (ulong)i * N + j;
-            const float v = Cs[r][c]{bias_add}{res_add};
+            const float linear = float({ty}(Cs[r][c]{bias_add}));
+            const float v = linear{res_add};
             {store}
         }}
     }}

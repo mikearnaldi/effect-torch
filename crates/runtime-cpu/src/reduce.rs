@@ -76,6 +76,28 @@ fn reduce_into_impl<T: Elem>(
     finish: impl Fn(T) -> T,
     destination: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
+    reduce_with_accumulator(
+        operation,
+        source,
+        layout,
+        dims,
+        init,
+        reduce,
+        finish,
+        destination,
+    )
+}
+
+fn reduce_with_accumulator<T: Elem, A: Copy>(
+    operation: &str,
+    source: &[T],
+    layout: &Layout,
+    dims: &[usize],
+    init: A,
+    reduce: impl Fn(A, T) -> A,
+    finish: impl Fn(A) -> T,
+    destination: &mut CpuDestination<'_>,
+) -> Result<(), String> {
     validate_reduce_destination::<T>(operation, layout, dims, destination)?;
     let reduced_elements = dims
         .iter()
@@ -169,6 +191,24 @@ fn cumsum_into_impl<T: Elem + std::ops::Add<Output = T>>(
     dimension: usize,
     destination: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
+    cumsum_with_accumulator(
+        source,
+        layout,
+        dimension,
+        destination,
+        |a, b| a + b,
+        |value| value,
+    )
+}
+
+fn cumsum_with_accumulator<T: Elem, A: Copy + Default>(
+    source: &[T],
+    layout: &Layout,
+    dimension: usize,
+    destination: &mut CpuDestination<'_>,
+    add: impl Fn(A, T) -> A,
+    narrow: impl Fn(A) -> T,
+) -> Result<(), String> {
     if dimension >= layout.shape().len() {
         return Err(format!(
             "cumsum dimension {dimension} is out of bounds for rank {}",
@@ -206,12 +246,14 @@ fn cumsum_into_impl<T: Elem + std::ops::Add<Output = T>>(
                 source_base += coordinate * layout.strides()[current];
                 output_base += coordinate * contiguous_stride(layout.shape(), current);
             }
-            let mut accumulator = T::default();
+            let mut accumulator = A::default();
             let output_stride = contiguous_stride(layout.shape(), dimension);
             for index in 0..reduced_len {
-                accumulator =
-                    accumulator + source[source_base + index * layout.strides()[dimension]];
-                output[output_base + index * output_stride] = accumulator;
+                accumulator = add(
+                    accumulator,
+                    source[source_base + index * layout.strides()[dimension]],
+                );
+                output[output_base + index * output_stride] = narrow(accumulator);
             }
         }
     })
@@ -280,8 +322,26 @@ impl Tensor {
         match &self.buffer {
             CpuBuffer::F32(values) => sum!(values, f32),
             CpuBuffer::F64(values) => sum!(values, f64),
-            CpuBuffer::F16(values) => sum!(values, f16),
-            CpuBuffer::BF16(values) => sum!(values, bf16),
+            CpuBuffer::F16(values) => reduce_with_accumulator(
+                "sum",
+                values,
+                &self.layout,
+                dims,
+                0f32,
+                |a, b| a + b.to_f32(),
+                f16::from_f32,
+                destination,
+            ),
+            CpuBuffer::BF16(values) => reduce_with_accumulator(
+                "sum",
+                values,
+                &self.layout,
+                dims,
+                0f32,
+                |a, b| a + b.to_f32(),
+                bf16::from_f32,
+                destination,
+            ),
             CpuBuffer::U8(values) => sum!(values, u8),
             CpuBuffer::U32(values) => sum!(values, u32),
             CpuBuffer::I64(values) => sum!(values, i64),
@@ -322,8 +382,26 @@ impl Tensor {
         match &self.buffer {
             CpuBuffer::F32(values) => product!(values, 1f32),
             CpuBuffer::F64(values) => product!(values, 1f64),
-            CpuBuffer::F16(values) => product!(values, f16::ONE),
-            CpuBuffer::BF16(values) => product!(values, bf16::ONE),
+            CpuBuffer::F16(values) => reduce_with_accumulator(
+                "prod",
+                values,
+                &self.layout,
+                dims,
+                1f32,
+                |a, b| a * b.to_f32(),
+                f16::from_f32,
+                destination,
+            ),
+            CpuBuffer::BF16(values) => reduce_with_accumulator(
+                "prod",
+                values,
+                &self.layout,
+                dims,
+                1f32,
+                |a, b| a * b.to_f32(),
+                bf16::from_f32,
+                destination,
+            ),
             CpuBuffer::U8(values) => product!(values, 1u8),
             CpuBuffer::U32(values) => product!(values, 1u32),
             CpuBuffer::I64(values) => product!(values, 1i64),
@@ -355,7 +433,7 @@ impl Tensor {
                     &self.layout,
                     dims,
                     $init,
-                    |a: $type, b: $type| if a >= b { a } else { b },
+                    |a: $type, b: $type| a.max(b),
                     |value| value,
                     destination,
                 )
@@ -397,7 +475,7 @@ impl Tensor {
                     &self.layout,
                     dims,
                     $init,
-                    |a: $type, b: $type| if a <= b { a } else { b },
+                    |a: $type, b: $type| a.min(b),
                     |value| value,
                     destination,
                 )
@@ -466,24 +544,24 @@ impl Tensor {
                 |value| value / count as f64,
                 destination,
             ),
-            CpuBuffer::F16(values) => reduce_into_impl(
+            CpuBuffer::F16(values) => reduce_with_accumulator(
                 "mean",
                 values,
                 &self.layout,
                 dims,
-                f16::ZERO,
-                |a, b| a + b,
-                |value| value / f16::from_f64(count as f64),
+                0f32,
+                |a, b| a + b.to_f32(),
+                |value| f16::from_f32(value / count as f32),
                 destination,
             ),
-            CpuBuffer::BF16(values) => reduce_into_impl(
+            CpuBuffer::BF16(values) => reduce_with_accumulator(
                 "mean",
                 values,
                 &self.layout,
                 dims,
-                bf16::ZERO,
-                |a, b| a + b,
-                |value| value / bf16::from_f64(count as f64),
+                0f32,
+                |a, b| a + b.to_f32(),
+                |value| bf16::from_f32(value / count as f32),
                 destination,
             ),
             _ => unreachable!("float dtype checked before dispatch"),
@@ -625,12 +703,22 @@ impl Tensor {
             CpuBuffer::F64(values) => {
                 cumsum_into_impl(values, &self.layout, dimension, destination)
             }
-            CpuBuffer::F16(values) => {
-                cumsum_into_impl(values, &self.layout, dimension, destination)
-            }
-            CpuBuffer::BF16(values) => {
-                cumsum_into_impl(values, &self.layout, dimension, destination)
-            }
+            CpuBuffer::F16(values) => cumsum_with_accumulator(
+                values,
+                &self.layout,
+                dimension,
+                destination,
+                |a: f32, b| a + b.to_f32(),
+                f16::from_f32,
+            ),
+            CpuBuffer::BF16(values) => cumsum_with_accumulator(
+                values,
+                &self.layout,
+                dimension,
+                destination,
+                |a: f32, b| a + b.to_f32(),
+                bf16::from_f32,
+            ),
             CpuBuffer::U8(values) => cumsum_into_impl(values, &self.layout, dimension, destination),
             CpuBuffer::U32(values) => {
                 cumsum_into_impl(values, &self.layout, dimension, destination)
@@ -707,5 +795,23 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(f32_data(&output), f32_data(&tensor.sum(&[1])));
+    }
+
+    #[test]
+    fn half_reductions_accumulate_in_f32_and_round_once() {
+        for (dtype, large) in [(DType::F16, 2048f32), (DType::BF16, 256f32)] {
+            let tensor = Tensor::from_vec(vec![large, 1., -large], vec![3]).cast(dtype);
+            assert_eq!(f32_data(&tensor.sum(&[0]).cast(DType::F32)), vec![1.]);
+            let mean = tensor.mean(&[0]).cast(DType::F32);
+            let expected = Tensor::from_vec(vec![1f32 / 3.], vec![1])
+                .cast(dtype)
+                .cast(DType::F32);
+            assert_eq!(f32_data(&mean), f32_data(&expected));
+            // A narrow running product overflows before the final factor rescales it.
+            let factors = Tensor::from_vec(vec![large, large, 1. / large], vec![3]).cast(dtype);
+            assert_eq!(f32_data(&factors.prod(&[0]).cast(DType::F32)), vec![large]);
+        }
+        let long = Tensor::ones(&[131072], DType::F16);
+        assert_eq!(f32_data(&long.mean(&[0]).cast(DType::F32)), vec![1.]);
     }
 }

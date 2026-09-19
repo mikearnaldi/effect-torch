@@ -27,7 +27,8 @@
 //!   `EFFECT_TORCH_METAL_PROFILE`, and `EFFECT_TORCH_SYNC_TRACE` control
 //!   storage mode, MMA selection, profiling, and sync tracing. The runtime
 //!   snapshots all six variables once.
-//! - The fusion emitter computes in f32 and stores f32/bf16. Primitive kernels
+//! - The fusion emitter computes in f32 and stores f32/f16/bf16, preserving
+//!   each planned semantic rounding boundary. Primitive kernels
 //!   support every `DType` except f64, which Metal does not support.
 //!   Destinations must be contiguous. Input strides become constants in the
 //!   emitted source.
@@ -95,6 +96,7 @@ use std::sync::OnceLock;
 
 pub mod conv;
 pub mod device;
+pub(crate) mod dtype;
 pub mod emit;
 pub(crate) mod executable;
 pub mod gemm;
@@ -143,6 +145,19 @@ impl effect_torch_runtime::Buffer for run::MetalTensor {
 
     fn placement(&self) -> &Placement {
         self.buffer.placement()
+    }
+
+    fn value_spec(&self) -> effect_torch_runtime::ValueSpec<'_> {
+        effect_torch_runtime::ValueSpec {
+            semantic_dtype: self.dtype,
+            logical_shape: self.layout.shape(),
+            storage: effect_torch_runtime::StorageSpec {
+                representation: effect_torch_runtime::StorageRepresentation::Dense,
+                layout_constraint: effect_torch_runtime::LayoutConstraintSpec::DenseStrided(
+                    &self.layout,
+                ),
+            },
+        }
     }
 
     fn dtype(&self) -> effect_torch_runtime::DType {

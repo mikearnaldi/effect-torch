@@ -61,6 +61,7 @@ export declare class Executable {
 export declare class LazyTensor {
   get shape(): Array<number>
   get dtype(): string
+  get storage(): NativeTensorStorage
   metadata(): [Array<number>, string]
   static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
   static ones(shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
@@ -72,7 +73,7 @@ export declare class LazyTensor {
   static constant(value: number, dtype?: NativeDType | undefined | null): LazyTensor
   static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
   static fromMaterialized(tensor: NativeTensor): LazyTensor
-  static input(slot: number, shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
+  static input(slot: number, shape: Array<number>, dtype?: NativeDType | undefined | null, storage?: NativeTensorStorage | undefined | null): LazyTensor
   static scalarInput(slot: number, dtype?: NativeDType | undefined | null): LazyTensor
   add(other: LazyTensor): LazyTensor
   sub(other: LazyTensor): LazyTensor
@@ -117,8 +118,8 @@ export declare class LazyTensor {
   layerNorm(weight: LazyTensor, bias: LazyTensor, eps: number): LazyTensor
   rmsNorm(weight: LazyTensor | undefined | null, eps: number): LazyTensor
   linear(weight: LazyTensor, bias: LazyTensor): LazyTensor
-  quantizedLinear(weight: LazyTensor, bias: LazyTensor | undefined | null, encoding: string, rows: number, columns: number): LazyTensor
-  quantizedEmbedding(weight: LazyTensor, encoding: string, rows: number, columns: number, paddingIndex?: number | undefined | null): LazyTensor
+  quantizedLinear(weight: LazyTensor, bias?: LazyTensor | undefined | null): LazyTensor
+  quantizedEmbedding(weight: LazyTensor, paddingIndex?: number | undefined | null): LazyTensor
   conv1d(weight: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(weight: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   log(): LazyTensor
@@ -224,6 +225,7 @@ export declare class NativeTensor {
   clear(): void
   get shape(): Array<number>
   get dtype(): string
+  get storage(): NativeTensorStorage
   get device(): string
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
   sample(temperature: number, topK: number, topP: number, seed: number, counter: number, cancellationToken?: CancellationToken | undefined | null): Promise<number>
@@ -257,21 +259,29 @@ export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<La
  */
 export declare function inspectGguf(path: string, token?: CancellationToken | undefined | null): Promise<NativeGgufInspection>
 
+/**
+ * Reads a standalone safetensors header or a Hugging Face index and every
+ * shard header it references without reading or allocating any payload.
+ */
+export declare function inspectSafetensors(path: string, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsInspection>
+
 /** Returns `true` because the CPU backend is available on every target. */
 export declare function isAvailable(): boolean
 
 /**
- * Loads every tensor of the GGUF archive at `path` into CPU tensors.
+ * Loads selected tensors of the GGUF archive at `path` into CPU tensors.
+ * Omitted names load all tensors; an empty list loads none.
  * Direct f32 loading requires a little-endian target. Quantized formats use
  * packed `u8` payloads.
  */
-export declare function loadGguf(path: string, token?: CancellationToken | undefined | null): Promise<NativeGgufArchive>
+export declare function loadGguf(path: string, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeGgufArchive>
 
 /**
- * Loads a safetensors archive, rejecting unsupported dtypes and malformed
- * byte lengths.
+ * Loads a safetensors archive. Optional `names` selects unique tensors;
+ * omission loads every tensor and an empty array loads none. Selected payloads
+ * are read without materializing the rest of the file.
  */
-export declare function loadTensors(path: string, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsArchive>
+export declare function loadTensors(path: string, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeSafetensorsArchive>
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined
@@ -304,7 +314,23 @@ export declare const enum NativeDType {
   BF16 = 'bf16'
 }
 
+export interface NativeDTypeLegalizationDiagnostics {
+  targetBackend: string
+  targetArchitecture: string
+  loweringAbiRevision: number
+  policyRevision: number
+  capabilityQueries: number
+  nativeLoweringUnits: number
+  legalizedLoweringUnits: number
+  kernelLocalLegalizations: number
+  materializedConversions: number
+  materializedConversionBytes: number
+  decompositions: number
+  rejectedRegionCandidates: number
+}
+
 export interface NativeExecutableDiagnostics {
+  legalization: NativeDTypeLegalizationDiagnostics
   semanticNodesBeforeOptimization: number
   semanticNodesAfterOptimization: number
   instructions: Array<NativeInstructionDiagnostics>
@@ -550,12 +576,31 @@ export interface NativeSafetensorsEntry {
   tensor: NativeTensor
 }
 
+/** A header-only safetensors inspection with merged archive metadata. */
+export interface NativeSafetensorsInspection {
+  entries: Array<NativeSafetensorsTensorInfo>
+  metadata: Record<string, string>
+}
+
+/** One tensor descriptor from a safetensors inspection. */
+export interface NativeSafetensorsTensorInfo {
+  name: string
+  dtype: string
+  shape: Array<number>
+  byteLength: number
+}
+
 export interface NativeSamplingOptions {
   temperature: number
   topK: number
   topP: number
   seed: number
   counter: number
+}
+
+export interface NativeTensorStorage {
+  representation: string
+  format?: string | undefined
 }
 
 /**

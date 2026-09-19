@@ -328,6 +328,9 @@ The host transfer types are fixed by that logical dtype:
 `fromTypedArray` snapshots the supplied view and infers the dtype shown
 above. Construct BF16 values with a dtype option or `Tensor.cast`. Readback
 widens F16 and BF16 values rather than exposing their storage bits.
+F16 and BF16 tensors use two bytes per element in CPU, Metal, and CUDA storage.
+Safetensors preserves their two-byte payloads. The wider `Float32Array` returned
+by readback is a host-transfer representation.
 `Tensor.toNumberArray` accepts every dtype except I64, whose full range cannot
 be represented by JavaScript numbers.
 
@@ -344,10 +347,30 @@ dtype, the scalar is coerced to the non-scalar dtype. Arithmetic results keep
 that dtype; comparisons return U8. Other operations still enforce their own
 dtype contracts.
 
+Casts to floating types round once, to nearest with ties to even. Integer
+narrowing keeps the low destination-width bits. Floating-to-integer casts
+truncate toward zero, saturate outside the destination range, and map NaN to
+zero. Identity casts preserve bits; cross-dtype floating casts preserve signed
+zero and representable subnormals but may change NaN payloads.
+Arithmetic retains the selected backend's existing handling of subnormals;
+for example, Metal F32 arithmetic can flush them to zero. Legalization preserves
+that behavior in both optimized and unoptimized programs.
+
 A runtime's `capabilities.dtypes` array means that it can represent those
 logical dtypes. It does not promise that every operation accepts every listed
-dtype. For example, CPU stores F16 and BF16 but rejects half-precision matmul,
-and Metal rejects F64 when the graph node is constructed.
+dtype. Compilation classifies each complete operation or fusion region as
+native, legalizable on the selected device, or unsupported. A CPU half-precision
+matmul can convert its inputs to planned F32 temporaries, compute in F32, and
+convert its result back to F16 or BF16. The model's input and output dtypes
+remain unchanged. Fused half-precision chains retain intermediate rounding
+boundaries; reductions use their operation's declared accumulation precision.
+Unsupported operations fail compilation. Metal continues to reject F64.
+
+For a frozen program, `program.handle.diagnostics.legalization` reports the
+target architecture, policy revision, native and legalized operation counts,
+and planned conversion counts and bytes. The memory report includes those
+temporaries and any required segment alignment. Half-precision storage stays
+two bytes per element even when an operation computes in F32.
 
 #### Encoded and state storage
 
@@ -356,7 +379,10 @@ members of `DType`. A quantized GGUF weight remains a logical F32 tensor. Its
 `storage` metadata records the encoding, a packed physical shape, and physical
 dtype U8. Dedicated operations such as `Tensor.embedding` and
 `Tensor.linearRows` can consume supported encoded weights. Ordinary dense
-operations and `Tensor.toTypedArray` may reject the packed layout.
+operations, packed compiled outputs, and `Tensor.toTypedArray` reject the packed
+layout. Packed linear uses the format's canonical represented F32 weights,
+F32 activations, and F32 accumulation. Loading a packed weight does not create
+a complete decoded weight cache.
 
 Likewise, `kvDtype: "int8"` selects quantized KV-cache storage for compiled
 inference. `"int8"` is not a tensor dtype. The cache stores U8 payloads with
@@ -364,53 +390,89 @@ per-token, per-head F32 scales and widens values for attention math.
 
 ## Backend capabilities
 
-| Capability                   | CPU                                | Apple Metal                        |
-| ---------------------------- | ---------------------------------- | ---------------------------------- |
-| Platforms                    | macOS and Linux                    | macOS                              |
-| Architectures                | arm64 and x64                      | arm64 and x64                      |
-| Advertised tensor dtypes     | F32, F64, F16, BF16, I64, U8, U32  | F32, F16, BF16, I64, U8, U32       |
-| F32 matmul                   | Yes                                | Yes                                |
-| F64                          | Storage, math, matmul, and linalg  | Unsupported                        |
-| F16/BF16 storage             | Yes                                | Yes                                |
-| F16/BF16 matmul              | No                                 | Yes                                |
-| Graph compilation            | Yes                                | Yes                                |
-| Autodiff                     | Yes                                | Yes                                |
-| Elementwise/reduction fusion | F32, F64                           | F32, BF16                          |
-| Scaled dot-product attention | Composed backend path              | Native flash path for F32 and BF16 |
-| `inverse`, `det`, `solve`    | Yes                                | Explicitly rejected                |
-| Mixed-BF16 training          | Not advertised                     | Yes                                |
-| Paged KV cache               | F32, F16, BF16, INT8 storage tiers | F32, F16, BF16, INT8 storage tiers |
-| Safetensors path I/O         | Yes                                | Yes, with Metal dtype validation   |
+| Capability                   | CPU                                  | Apple Metal                          |
+| ---------------------------- | ------------------------------------ | ------------------------------------ |
+| Platforms                    | macOS and Linux                      | macOS                                |
+| Architectures                | arm64 and x64                        | arm64 and x64                        |
+| Advertised tensor dtypes     | F32, F64, F16, BF16, I64, U8, U32    | F32, F16, BF16, I64, U8, U32         |
+| F32 matmul                   | Yes                                  | Yes                                  |
+| F64                          | Storage, math, matmul, and linalg    | Unsupported                          |
+| F16/BF16 storage             | Yes                                  | Yes                                  |
+| F16/BF16 matmul              | F32 legalization                     | Yes                                  |
+| Graph compilation            | Yes                                  | Yes                                  |
+| Autodiff                     | Yes                                  | Yes                                  |
+| Elementwise/reduction fusion | F32, F64, F16, BF16                  | F32, F16, BF16                       |
+| Scaled dot-product attention | F32/F64; F32 legalization for halves | Native flash path for F32 and halves |
+| `inverse`, `det`, `solve`    | Yes                                  | Explicitly rejected                  |
+| Mixed-BF16 training          | Not advertised                       | Yes                                  |
+| Paged KV cache               | F32, F16, BF16, INT8 storage tiers   | F32, F16, BF16, INT8 storage tiers   |
+| Safetensors path I/O         | Yes                                  | Yes, with Metal dtype validation     |
 
 `@effect-torch/backend-cuda` is an experimental third backend. Its packaged
 addon is Linux x64 GNU only and requires an NVIDIA driver usable through the
-CUDA 12.9 NVRTC path. It exposes the same lazy `isAvailable` and
+CUDA 12.9 NVRTC and cuBLAS libraries. It exposes the same lazy `isAvailable` and
 `layer({ device? })` interface as Metal and advertises all seven logical
 dtypes. Its current operator coverage is narrower than the CPU and Metal
 table above; the advertised dtype list is not a full operation matrix.
+CUDA uses exact-width storage for all seven dtypes. On compute capability 8.0
+or newer, supported BF16 linears and matmuls use cuBLAS directly with F32
+accumulation. Other approved F16/BF16 operations use planned F32 legalization.
+Its packed linear path uses canonical F32
+activations and weights without a decoded full-weight cache. CUDA fusion
+remains disabled.
 
 Unsupported placement or dtype requests fail; the runtime never moves the graph
 to another backend.
+
+### CUDA BF16 status
+
+The former eight-byte-per-element BF16 device-storage issue is fixed. BF16
+weights occupy two bytes per element, including when loaded from safetensors.
+Device buffer lengths, payload preservation, and numerical conversions have
+been tested on CUDA hardware. For example, 50.4 GB of BF16 weight payloads
+requires approximately 50.4 GB of resident weight storage plus allocation
+overhead. The previous fourfold expansion to 201.6 GB no longer applies.
+
+| Component                                           | Current implementation                                                                           |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| BF16 device storage                                 | Two bytes per element                                                                            |
+| BF16 safetensors I/O                                | Preserves raw two-byte payloads                                                                  |
+| BF16 dense linears and matmuls                      | Direct BF16 cuBLAS with F32 accumulation on supported hardware and shapes                        |
+| Row-oriented cuBLAS linears consuming BF16 directly | `Tensor.linearRows` consumes original `[out, in]` weights without a transpose or F32 weight copy |
+| Indexed/selective safetensors loading               | Header-only inspection, named selection, and Hugging Face sharded indexes                        |
+
+The direct path supports positive-sized dense linears, ordinary matmuls, and
+strided batches with shared or fully broadcast operands. It keeps activation
+and weight inputs in BF16 and disables reduced-precision reductions. Biased
+linears use an output-sized F32 accumulator, add bias in F32, then round once
+to BF16. Each GEMM declares 1 MiB of cuBLAS workspace in the memory plan.
+
+Older GPUs, zero dimensions, and batch broadcasts that cannot use a single
+strided GEMM retain explicit F32 legalization. Those paths may still allocate
+converted weights. Activations, KV state, and workspace also contribute to
+peak memory. Full-model peak-memory and performance validation for the
+50.4 GB BF16 workload remains outstanding.
 
 ## Public API
 
 `@effect-torch/core` exports namespaces rather than one flat symbol list:
 
-| Namespace      | Responsibility                                                    |
-| -------------- | ----------------------------------------------------------------- |
-| `Chat`         | Chat-template generation, segmented parsing, and streaming events |
-| `Runtime`      | Backend contract, handles, capabilities, errors, and service tag  |
-| `Tensor`       | Tensor graph construction, evaluation, compilation, and I/O       |
-| `Gradient`     | Autodiff transforms                                               |
-| `Gguf`         | Validated GGUF model and parameter-artifact loading               |
-| `Loss`         | Regression and classification losses                              |
-| `Model`        | Layers, composition, execution, and compiled inference            |
-| `Optimizer`    | SGD, Adam, AdamW, clipping, and full-step execution               |
-| `LearningRate` | Constant, exponential, stepwise, cosine, and warmup schedules     |
-| `Trainer`      | Compiled and reference training loops                             |
-| `Checkpoint`   | Trainer and sampler checkpoint persistence                        |
-| `Sampler`      | Restorable shuffled token-window sampling                         |
-| `Speculation`  | Autoregressive, history-lookup, and parallel-block proposers      |
+| Namespace      | Responsibility                                                          |
+| -------------- | ----------------------------------------------------------------------- |
+| `Chat`         | Chat-template generation, segmented parsing, and streaming events       |
+| `Runtime`      | Backend contract, handles, capabilities, errors, and service tag        |
+| `Tensor`       | Tensor graph construction, evaluation, compilation, and readback        |
+| `Gradient`     | Autodiff transforms                                                     |
+| `Gguf`         | Validated GGUF model and parameter-artifact loading                     |
+| `Safetensors`  | Safetensors inspection, selective loading, saving, and model parameters |
+| `Loss`         | Regression and classification losses                                    |
+| `Model`        | Layers, composition, execution, and compiled inference                  |
+| `Optimizer`    | SGD, Adam, AdamW, clipping, and full-step execution                     |
+| `LearningRate` | Constant, exponential, stepwise, cosine, and warmup schedules           |
+| `Trainer`      | Compiled and reference training loops                                   |
+| `Checkpoint`   | Trainer and sampler checkpoint persistence                              |
+| `Sampler`      | Restorable shuffled token-window sampling                               |
+| `Speculation`  | Autoregressive, history-lookup, and parallel-block proposers            |
 
 Built-in architectures live at explicit subpath exports:
 
@@ -967,6 +1029,30 @@ tensor catalog against a `Gguf.ModelDefinition`, then loads the parameters on
 the selected runtime. `Gguf.loadParameters` provides the same catalog and
 ownership checks for target-coupled artifacts such as speculative proposers.
 
+Pass `names` to `Gguf.loadParameters` to load part of a file. Only selected
+payloads are read and allocated, and `params` follows the requested name order.
+Names must be unique and present in both the parameter catalog and the file.
+An empty array loads no tensors. Omitting `names` retains exact full-catalog
+validation and loads all tensors.
+
+For a selection based on the file's own tensor descriptors:
+
+```ts
+import { Gguf } from "@effect-torch/core"
+import { Effect } from "effect"
+
+const loadSelected = (file: string, architecture: string, names: ReadonlyArray<string>) =>
+  Gguf.loadParameters(file, {
+    architecture,
+    parameterSpecs: (_, tensors) =>
+      Effect.succeed(tensors.map(({ name, logicalShape }) => ({ name, shape: logicalShape })))
+  }, { names })
+```
+
+The definition can instead supply expected shapes for validation. Selection is
+at whole-tensor granularity; selected packed weights retain their encoded bytes.
+Release the returned handles with `Tensor.clearAll(loaded.params)` after use.
+
 The built-in Muse-Glimmer loader wraps the generic model path:
 
 ```ts
@@ -1042,16 +1128,16 @@ function receives each logits row as a host typed array instead.
 
 ## Safetensors
 
-The bundled runtime backends expose direct path-based safetensors I/O through a
-Runtime extension:
+The `Safetensors` namespace owns archive inspection, loading, saving, and
+named model-parameter persistence. It uses each runtime's native path-based I/O:
 
 ```ts
-import { Tensor } from "@effect-torch/core"
+import { Safetensors, Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 
 const roundTrip = (weight: Tensor.Any, bias: Tensor.Any) =>
   Effect.gen(function*() {
-    yield* Tensor.save(
+    yield* Safetensors.save(
       "weights.safetensors",
       {
         "model.weight": weight,
@@ -1062,37 +1148,74 @@ const roundTrip = (weight: Tensor.Any, bias: Tensor.Any) =>
       }
     )
 
-    const archive = yield* Tensor.loadArchive("weights.safetensors")
+    const archive = yield* Safetensors.loadArchive("weights.safetensors", { names: ["model.weight"] })
     return archive.tensors["model.weight"]
   })
 ```
 
 Properties:
 
-- `Tensor.save` compiles and materializes lazy entries together in one multi-root
+- `Safetensors.save` compiles and materializes lazy entries together in one multi-root
   request.
-- Loaded tensors are concrete runtime-owned handles.
+- Loaded tensors are caller-owned concrete handles on the selected runtime.
 - Metadata values are strings.
 - `"__metadata__"` is reserved as a tensor name.
 - I/O runs natively and is interruptible.
 - The selected backend validates placement and dtype support.
-- Metal rejects F64 archives rather than loading them on CPU.
+- Metal rejects loading F64 tensors. Header inspection can still describe them.
+- F16/BF16 loading and saving preserve their two-byte payloads.
+- Native readers validate archive headers and read payloads one tensor at a
+  time. `Safetensors.loadArchive(path, { names })` and `Safetensors.load(path, { names })`
+  read and allocate only the selected tensors. Missing or duplicate names fail;
+  an empty selection loads no tensors. Omitting `names` loads all tensors.
+- A `.safetensors.index.json` path resolves Hugging Face `weight_map` entries
+  across shard files. A selected load opens only the shards it needs.
+- Sharded loads merge string metadata from the opened shards and reject
+  conflicting values. Index bookkeeping such as `metadata.total_size` is
+  excluded. An empty index selection returns empty metadata.
+- `Safetensors.inspectArchive(path)` returns frozen `entries` with `name`, `dtype`,
+  `shape`, and exact `byteLength`, plus archive string metadata. It reads headers
+  without reading tensor payloads or allocating tensors on the device.
 
-Models provide named parameter persistence:
+For example, select one layer from a sharded model:
 
 ```ts
-import { Model } from "@effect-torch/core"
+const loadLayer = (file: string, prefix: string) =>
+  Effect.gen(function*() {
+    const index = yield* Safetensors.inspectArchive(file)
+    const names = index.entries
+      .filter((entry) => entry.name.startsWith(prefix))
+      .map((entry) => entry.name)
+    return yield* Safetensors.loadArchive(file, { names })
+  })
+```
+
+The returned handles are caller-owned. Release them with
+`Tensor.clearAll(Object.values(archive.tensors))` after use, or register them
+with `Tensor.clearAllScoped` inside an Effect scope.
+
+Save and load parameters in model-specification order:
+
+```ts
+import { Model, Safetensors } from "@effect-torch/core"
 import { Effect } from "effect"
 
 const roundTrip = (model: Model.Model, params: Model.Params) =>
   Effect.gen(function*() {
-    yield* Model.save(model, params, "model.safetensors")
-    return yield* Model.load(model, "model.safetensors")
+    yield* Safetensors.saveModel(model, params, "model.safetensors")
+    return yield* Safetensors.loadModel(model, "model.safetensors")
   })
 ```
 
 Trainer checkpoints extend the same format with optimizer, step, and optional
 sampler state.
+`Safetensors.loadModel` inspects headers and loads only its declared parameter names.
+
+Migration: tensor-level `save`, `load`, `loadArchive`, and `inspectArchive`
+have moved from `Tensor` to `Safetensors`. Model-level `save` and `load` have
+moved to `Safetensors.saveModel` and `Safetensors.loadModel`, keeping their
+argument order. Archive types now live under `Safetensors`: `SaveOptions`,
+`LoadOptions`, `Archive`, `TensorInfo`, and `Inspection`.
 
 ## Tokenizers
 
@@ -1211,7 +1334,9 @@ CPU and Apple Metal are the stable consumer runtimes. CUDA is experimental.
   implicitly.
 - Apple Metal is macOS-only and never falls back to CPU.
 - Metal does not support F64 or rank-2 linalg operations.
-- CPU does not implement F16 or BF16 matmul.
+- CPU executes F16/BF16 matmul through planned F32 legalization. CUDA uses
+  direct BF16 cuBLAS on supported hardware and shapes, with F32 legalization
+  for other supported half-precision cases.
 - Mixed-BF16 training is Metal-only.
 - INT8 is a KV-cache storage tier, not a general tensor dtype.
 - GGML K-quants are encoded inference-weight layouts, not general tensor dtypes.

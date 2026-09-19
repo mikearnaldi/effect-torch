@@ -5,10 +5,11 @@
 //!
 //! # Dtype and layout rules
 //!
-//! - The fused emitter computes in f32 and stores f32/bf16. Elementwise entry
-//!   points accept those types directly. The `*_promote` family casts other
-//!   types to f32, runs the fused kernel, and casts back. Comparisons use an f32
-//!   intermediate and produce u8.
+//! - The fused emitter computes in f32 and stores f32/f16/bf16. Independent
+//!   half arithmetic consumes compiler-planned conversions. Comparisons use an
+//!   f32 intermediate and produce u8. Integer arithmetic, comparisons, select,
+//!   and min/max reductions have typed kernels. Target policy rejects integer
+//!   operations without an exact implementation.
 //! - Broadcasting follows NumPy rules. A lane stride of 0 encodes a broadcast
 //!   dimension in the emitted kernel.
 //! - Allocating paths use `kernels::strided_copy` to materialize
@@ -44,6 +45,15 @@ pub enum BinOp {
     Ge,
     Eq,
     Ne,
+}
+
+impl BinOp {
+    pub(crate) fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Self::Lt | Self::Le | Self::Gt | Self::Ge | Self::Eq | Self::Ne
+        )
+    }
 }
 
 /// Elementwise unary operators. `Sign` is lowered to a select expression;
@@ -150,10 +160,10 @@ fn contig(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
     }
 }
 
-fn require_f32(t: &MetalTensor) -> crate::err::Res<()> {
-    if !matches!(t.dtype, DType::F32 | DType::BF16) {
+fn require_fused_float(t: &MetalTensor) -> crate::err::Res<()> {
+    if !matches!(t.dtype, DType::F32 | DType::F16 | DType::BF16) {
         return Err(format!(
-            "metal_native: emitter supports f32 and bf16, got {:?}",
+            "metal_native: emitter supports f32, f16, and bf16, got {:?}",
             t.dtype
         ));
     }
@@ -234,9 +244,9 @@ fn compile_elementwise_exact(
         .first()
         .ok_or_else(|| "elementwise requires at least one input".to_string())?
         .1;
-    if !matches!(dtype, DType::F32 | DType::BF16) {
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
         return Err(format!(
-            "metal_native: emitter supports f32 and bf16, got {dtype:?}"
+            "metal_native: emitter supports f32, f16, and bf16, got {dtype:?}"
         ));
     }
     if inputs.iter().any(|(_, input_dtype)| *input_dtype != dtype) {
@@ -346,9 +356,14 @@ pub fn warm_binary(
     compare: bool,
 ) -> crate::err::Res<()> {
     let shape = broadcast_shape(a_shape, b_shape)?;
+    if a_dtype == b_dtype && !a_dtype.is_float() {
+        let layouts =
+            [a_shape, b_shape].map(|input| Layout::contiguous(input.to_vec()).broadcast_to(&shape));
+        return kernels::compile_integer_binary(MetalDevice::get(), &layouts, a_dtype, op);
+    }
     let dtype = if compare {
         DType::F32
-    } else if a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::BF16) {
+    } else if a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::F16 | DType::BF16) {
         a_dtype
     } else if a_shape.is_empty() && !b_shape.is_empty() && a_dtype.is_float() && b_dtype.is_float()
     {
@@ -378,26 +393,13 @@ pub fn warm_where(
     condition_shape: &[usize],
     a_shape: &[usize],
     b_shape: &[usize],
+    condition_dtype: DType,
     dtype: DType,
 ) -> crate::err::Res<()> {
     let shape = broadcast_shape(&broadcast_shape(condition_shape, a_shape)?, b_shape)?;
-    crate::run::warm_elementwise(
-        MetalDevice::get(),
-        &[Expr::Select(
-            Box::new(Expr::Input(0)),
-            Box::new(Expr::Input(1)),
-            Box::new(Expr::Input(2)),
-        )],
-        &[
-            lane_strides(condition_shape, &shape)?,
-            lane_strides(a_shape, &shape)?,
-            lane_strides(b_shape, &shape)?,
-        ],
-        &shape,
-        shape.iter().product(),
-        0,
-        dtype,
-    )
+    let layouts = [condition_shape, a_shape, b_shape]
+        .map(|input| Layout::contiguous(input.to_vec()).broadcast_to(&shape));
+    kernels::compile_select(MetalDevice::get(), &layouts, condition_dtype, dtype)
 }
 
 /// Precompiles a plain (unfused expression) reduction over `dims`.
@@ -421,6 +423,15 @@ pub fn warm_reduce(
             .filter_map(|(dimension, size)| (!dims.contains(&dimension)).then_some(*size))
             .collect()
     };
+    if !dtype.is_float() {
+        return kernels::compile_integer_reduce(
+            MetalDevice::get(),
+            &Layout::contiguous(in_shape.to_vec()),
+            dtype,
+            dims,
+            op,
+        );
+    }
     crate::run::warm_reduce(
         MetalDevice::get(),
         op,
@@ -430,7 +441,7 @@ pub fn warm_reduce(
         dims,
         keepdims,
         &out_shape,
-        if matches!(dtype, DType::F32 | DType::BF16) {
+        if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
             dtype
         } else {
             DType::F32
@@ -493,6 +504,11 @@ pub fn precompile_binary_promote(
     b: &MetalTensor,
     op: BinOp,
 ) -> crate::err::Res<()> {
+    if a.dtype == b.dtype && !a.dtype.is_float() {
+        let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
+        let layouts = [a, b].map(|input| input.layout.broadcast_to(&shape));
+        return kernels::compile_integer_binary(MetalDevice::get(), &layouts, a.dtype, op);
+    }
     let mut a_layout = a.layout.clone();
     let mut b_layout = b.layout.clone();
     let mut a_dtype = a.dtype;
@@ -517,7 +533,7 @@ pub fn precompile_binary_promote(
         b_dtype = a_dtype;
     }
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
-    if a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::BF16) {
+    if a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::F16 | DType::BF16) {
         return compile_elementwise_exact(
             &[bin_expr(&op, Expr::Input(0), Expr::Input(1))],
             &[(&a_layout, a_dtype), (&b_layout, b_dtype)],
@@ -546,9 +562,12 @@ pub fn precompile_binary_promote(
     Ok(())
 }
 
-/// Precompiles the compare pipeline set: f32 casts for both operands, the
-/// fused compare kernel, and the f32→u8 result cast.
+/// Precompiles typed integer comparisons, or the float comparison pipeline
+/// with F32 operands and a U8 result.
 pub fn precompile_compare(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<()> {
+    if a.dtype == b.dtype && !a.dtype.is_float() {
+        return precompile_binary_promote(a, b, op);
+    }
     let mut a_layout = a.layout.clone();
     let mut b_layout = b.layout.clone();
     if a.dtype != DType::F32 {
@@ -616,37 +635,19 @@ pub fn precompile_relu(a: &MetalTensor) -> crate::err::Res<()> {
     }
 }
 
-/// Precompiles the select kernel (and the condition cast when the
-/// condition dtype differs from the branch dtype).
+/// Precompiles the typed select kernel for the exact input layouts.
 pub fn precompile_where(
     cond: &MetalTensor,
     a: &MetalTensor,
     b: &MetalTensor,
 ) -> crate::err::Res<()> {
-    let _ = where_scratch_requirements(cond, a, b)?;
-    let condition_layout = if cond.dtype == a.dtype {
-        cond.layout.clone()
-    } else {
-        kernels::compile_cast_layout(MetalDevice::get(), &cond.layout, cond.dtype, a.dtype)?;
-        Layout::contiguous(cond.layout.shape().to_vec())
-    };
+    where_scratch_requirements(cond, a, b)?;
     let shape = broadcast_shape(
         &broadcast_shape(cond.layout.shape(), a.layout.shape())?,
         b.layout.shape(),
     )?;
-    compile_elementwise_exact(
-        &[Expr::Select(
-            Box::new(Expr::Input(0)),
-            Box::new(Expr::Input(1)),
-            Box::new(Expr::Input(2)),
-        )],
-        &[
-            (&condition_layout, a.dtype),
-            (&a.layout, a.dtype),
-            (&b.layout, b.dtype),
-        ],
-        &shape,
-    )
+    let layouts = [cond, a, b].map(|input| input.layout.broadcast_to(&shape));
+    kernels::compile_select(MetalDevice::get(), &layouts, cond.dtype, a.dtype)
 }
 
 /// Precompiles the fused broadcast binary kernel for exact input
@@ -678,8 +679,8 @@ pub fn binary_into(
     op: BinOp,
     out: &MetalTensor,
 ) -> crate::err::Res<()> {
-    require_f32(a)?;
-    require_f32(b)?;
+    require_fused_float(a)?;
+    require_fused_float(b)?;
     if a.dtype != b.dtype {
         return Err(format!(
             "binary: dtype mismatch, got {:?} and {:?}; cast explicitly",
@@ -729,6 +730,9 @@ pub fn binary_promote_scratch_requirements(
     a: &MetalTensor,
     b: &MetalTensor,
 ) -> crate::err::Res<Vec<ScratchRequirement>> {
+    if a.dtype == b.dtype && !a.dtype.is_float() {
+        return Ok(Vec::new());
+    }
     let mut requirements = Vec::new();
     let mut a_dtype = a.dtype;
     let mut b_dtype = b.dtype;
@@ -755,7 +759,7 @@ pub fn binary_promote_scratch_requirements(
         });
         b_dtype = a_dtype;
     }
-    if a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::BF16) {
+    if a_dtype == b_dtype && matches!(a_dtype, DType::F32 | DType::F16 | DType::BF16) {
         return Ok(requirements);
     }
     if a_dtype != DType::F32 {
@@ -793,6 +797,9 @@ pub fn binary_promote_into(
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
     let output_dtype = binary_promote_output_dtype(a, b);
     out.validate_destination("binary promote", &shape, output_dtype)?;
+    if a.dtype == b.dtype && !a.dtype.is_float() {
+        return kernels::integer_binary_into(MetalDevice::get(), a, b, op, out);
+    }
 
     let mut index = 0usize;
     let mut a_value = a;
@@ -816,7 +823,9 @@ pub fn binary_promote_into(
         b_value = scratch[index];
         index += 1;
     }
-    if a_value.dtype == b_value.dtype && matches!(a_value.dtype, DType::F32 | DType::BF16) {
+    if a_value.dtype == b_value.dtype
+        && matches!(a_value.dtype, DType::F32 | DType::F16 | DType::BF16)
+    {
         return binary_into(a_value, b_value, op, out);
     }
 
@@ -857,12 +866,15 @@ pub fn compare(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<M
     Ok(out)
 }
 
-/// The exact intermediates [`compare_into`] consumes: optional f32 casts
-/// of each operand, then the f32 broadcast result.
+/// Integer comparisons need no scratch. Float comparisons use optional F32
+/// operand casts and an F32 broadcast result before the U8 result cast.
 pub fn compare_scratch_requirements(
     a: &MetalTensor,
     b: &MetalTensor,
 ) -> crate::err::Res<Vec<ScratchRequirement>> {
+    if a.dtype == b.dtype && !a.dtype.is_float() {
+        return Ok(Vec::new());
+    }
     let mut requirements = Vec::new();
     if a.dtype != DType::F32 {
         requirements.push(ScratchRequirement {
@@ -896,6 +908,9 @@ pub fn compare_into(
     validate_scratch("compare", &requirements, scratch)?;
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
     out.validate_destination("compare", &shape, DType::U8)?;
+    if a.dtype == b.dtype && !a.dtype.is_float() {
+        return kernels::integer_binary_into(MetalDevice::get(), a, b, op, out);
+    }
     let mut index = 0usize;
     let a32 = if a.dtype == DType::F32 {
         a
@@ -981,7 +996,7 @@ pub fn unary(a: &MetalTensor, op: UnOp) -> crate::err::Res<MetalTensor> {
 
 /// Destination form of [`unary`]; requires the precompiled pipeline.
 pub fn unary_into(a: &MetalTensor, op: UnOp, out: &MetalTensor) -> crate::err::Res<()> {
-    require_f32(a)?;
+    require_fused_float(a)?;
     let shape = a.layout.shape().to_vec();
     out.validate_destination("unary", &shape, a.dtype)?;
     let exprs = vec![un_expr(&op, Expr::Input(0))];
@@ -1077,7 +1092,7 @@ pub fn powf(a: &MetalTensor, e: f64) -> crate::err::Res<MetalTensor> {
 
 /// Destination form of [`powf`]; requires the precompiled pipeline.
 pub fn powf_into(a: &MetalTensor, e: f64, out: &MetalTensor) -> crate::err::Res<()> {
-    require_f32(a)?;
+    require_fused_float(a)?;
     let shape = a.layout.shape().to_vec();
     out.validate_destination("pow", &shape, a.dtype)?;
     let exprs = vec![Expr::Powf(Box::new(Expr::Input(0)), e.to_bits())];
@@ -1103,31 +1118,22 @@ pub fn where_(
     Ok(out)
 }
 
-/// The single cast buffer [`where_into`] needs when the condition dtype
-/// differs from the (f32/bf16) branch dtype.
+/// Typed select needs no conversion scratch, including mixed condition types.
 pub fn where_scratch_requirements(
-    cond: &MetalTensor,
+    _cond: &MetalTensor,
     a: &MetalTensor,
     b: &MetalTensor,
 ) -> crate::err::Res<Vec<ScratchRequirement>> {
-    require_f32(a)?;
-    require_f32(b)?;
     if a.dtype != b.dtype {
         return Err(format!(
             "where: branch dtype mismatch, got {:?} and {:?}; cast explicitly",
             a.dtype, b.dtype
         ));
     }
-    Ok((cond.dtype != a.dtype)
-        .then(|| ScratchRequirement {
-            shape: cond.layout.shape().to_vec(),
-            dtype: a.dtype,
-        })
-        .into_iter()
-        .collect())
+    Ok(Vec::new())
 }
 
-/// Destination form of [`where_`].
+/// Destination form of [`where_`]. Conditions and branches retain their types.
 pub fn where_into(
     cond: &MetalTensor,
     a: &MetalTensor,
@@ -1142,25 +1148,11 @@ pub fn where_into(
         b.layout.shape(),
     )?;
     out.validate_destination("where", &shape, a.dtype)?;
-    let condition = if requirements.is_empty() {
-        cond
-    } else {
-        kernels::cast_into(MetalDevice::get(), cond, scratch[0])?;
-        scratch[0]
-    };
-    let sc = tensor_lane_strides(condition, &shape)?;
-    let sa = tensor_lane_strides(a, &shape)?;
-    let sb = tensor_lane_strides(b, &shape)?;
-    let exprs = vec![Expr::Select(
-        Box::new(Expr::Input(0)),
-        Box::new(Expr::Input(1)),
-        Box::new(Expr::Input(2)),
-    )];
-    elementwise_into(&exprs, &[condition, a, b], vec![sc, sa, sb], &shape, out)
+    kernels::select_into(MetalDevice::get(), [cond, a, b], out)
 }
 
-/// Allocating reduction over `dims` (f32/bf16 only; deterministic serial
-/// per-output accumulation).
+/// Allocating reduction over `dims`. Float sum, product, and mean accumulate
+/// in F32 and round only the completed result. Integer min/max remain typed.
 pub fn reduce(
     a: &MetalTensor,
     dims: &[usize],
@@ -1182,11 +1174,8 @@ pub fn precompile_reduce(
     keepdims: bool,
     op: ReduceOp,
 ) -> crate::err::Res<()> {
-    if !matches!(a.dtype, DType::F32 | DType::BF16) {
-        return Err(format!(
-            "reduce: unsupported dtype {:?} on Metal (f32 or bf16)",
-            a.dtype
-        ));
+    if !a.dtype.is_float() {
+        return kernels::compile_integer_reduce(MetalDevice::get(), &a.layout, a.dtype, dims, op);
     }
     let in_shape = a.layout.shape().to_vec();
     let out_shape = reduce_output_shape(&in_shape, dims, keepdims);
@@ -1227,15 +1216,12 @@ pub fn reduce_into(
     op: ReduceOp,
     out: &MetalTensor,
 ) -> crate::err::Res<()> {
-    if !matches!(a.dtype, DType::F32 | DType::BF16) {
-        return Err(format!(
-            "reduce: unsupported dtype {:?} on Metal (f32 or bf16)",
-            a.dtype
-        ));
-    }
     let in_shape = a.layout.shape().to_vec();
     let out_shape = reduce_output_shape(&in_shape, dims, keepdims);
     out.validate_destination("reduce", &out_shape, a.dtype)?;
+    if !a.dtype.is_float() {
+        return kernels::integer_reduce_into(MetalDevice::get(), a, dims, op, out);
+    }
     crate::runtime::metal::run::run_reduce_into(
         MetalDevice::get(),
         op,
@@ -1832,8 +1818,8 @@ pub fn linear(
     w: &MetalTensor,
     bias: &MetalTensor,
 ) -> crate::err::Res<MetalTensor> {
-    require_f32(x)?;
-    require_f32(w)?;
+    require_fused_float(x)?;
+    require_fused_float(w)?;
     let dims = x.layout.shape();
     let rank = dims.len();
     let (k, n) = (w.layout.shape()[0], w.layout.shape()[1]);
@@ -1870,6 +1856,116 @@ mod tests {
                 tensor.numel() * size,
             )
             .to_vec()
+        }
+    }
+
+    #[test]
+    fn typed_integer_kernels_preserve_large_strided_values_and_empty_identities() {
+        let device = MetalDevice::get();
+        for dtype in [DType::U8, DType::U32, DType::I64] {
+            let large = match dtype {
+                DType::U8 => 253,
+                DType::U32 => u32::MAX as i64 - 1,
+                _ => (1_i64 << 40) + 1,
+            };
+            let encode = |values: &[i64]| {
+                values
+                    .iter()
+                    .flat_map(|&value| match dtype {
+                        DType::U8 => vec![value as u8],
+                        DType::U32 => (value as u32).to_ne_bytes().to_vec(),
+                        _ => value.to_ne_bytes().to_vec(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let data = encode(&[0, large, large - 1, 1, 2, large]);
+            let source = MetalTensor {
+                buffer: device.upload_bytes(&data),
+                layout: Layout::new(vec![2, 2], vec![1, 2], 1),
+                dtype,
+            };
+            let scalar = MetalTensor {
+                buffer: device.upload_bytes(&encode(&[large - 1])),
+                layout: Layout::contiguous(vec![]),
+                dtype,
+            };
+            let mut results = Vec::new();
+            for op in [
+                BinOp::Eq,
+                BinOp::Ne,
+                BinOp::Lt,
+                BinOp::Le,
+                BinOp::Gt,
+                BinOp::Ge,
+            ] {
+                assert!(compare_scratch_requirements(&source, &scalar)
+                    .unwrap()
+                    .is_empty());
+                results.push(compare(&source, &scalar, op).unwrap());
+            }
+            let min = binary_promote(&source, &scalar, BinOp::Min).unwrap();
+            let max = binary_promote(&source, &scalar, BinOp::Max).unwrap();
+            let reduced_min = reduce(&source, &[1], false, ReduceOp::Min).unwrap();
+            let reduced_max = reduce(&source, &[0], true, ReduceOp::Max).unwrap();
+            let selected = where_(&results[4], &source, &scalar).unwrap();
+            let empty = MetalTensor::empty(device, vec![2, 0], dtype);
+            let empty_min = reduce(&empty, &[1], false, ReduceOp::Min).unwrap();
+            let empty_max = reduce(&empty, &[1], false, ReduceOp::Max).unwrap();
+            device.synchronize().unwrap();
+            for (result, expected) in results.iter().zip([
+                [0, 0, 1, 0],
+                [1, 1, 0, 1],
+                [0, 1, 0, 1],
+                [0, 1, 1, 1],
+                [1, 0, 0, 0],
+                [1, 0, 1, 0],
+            ]) {
+                assert_eq!(bytes(result), expected);
+            }
+            assert_eq!(bytes(&min), encode(&[large - 1, 1, large - 1, 2]));
+            assert_eq!(
+                bytes(&max),
+                encode(&[large, large - 1, large - 1, large - 1])
+            );
+            assert_eq!(bytes(&reduced_min), encode(&[1, 2]));
+            assert_eq!(bytes(&reduced_max), encode(&[large, 2]));
+            assert_eq!(bytes(&selected), bytes(&max));
+            let (low, high) = match dtype {
+                DType::U8 => (0, 255),
+                DType::U32 => (0, u32::MAX as i64),
+                _ => (i64::MIN, i64::MAX),
+            };
+            assert_eq!(bytes(&empty_min), encode(&[high, high]));
+            assert_eq!(bytes(&empty_max), encode(&[low, low]));
+        }
+    }
+
+    #[test]
+    fn typed_half_select_preserves_conditions_and_strided_branches() {
+        let device = MetalDevice::get();
+        let condition = MetalTensor::from_f32(device, vec![1e-30, 0.0, -1e-30], vec![3, 1]);
+        for dtype in [DType::F16, DType::BF16] {
+            let values =
+                MetalTensor::from_f32(device, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+            let half = kernels::cast(device, &values, dtype).unwrap();
+            let strided = MetalTensor {
+                buffer: half.buffer.clone(),
+                layout: half.layout.permute(&[1, 0]),
+                dtype,
+            };
+            let fallback = kernels::cast(
+                device,
+                &MetalTensor::from_f32(device, vec![-1.0, -2.0], vec![1, 2]),
+                dtype,
+            )
+            .unwrap();
+            assert!(where_scratch_requirements(&condition, &strided, &fallback)
+                .unwrap()
+                .is_empty());
+            let selected = where_(&condition, &strided, &fallback).unwrap();
+            let result = kernels::cast(device, &selected, DType::F32).unwrap();
+            device.synchronize().unwrap();
+            assert_eq!(result.read_f32().unwrap(), [1.0, 4.0, -1.0, -2.0, 3.0, 6.0]);
         }
     }
 

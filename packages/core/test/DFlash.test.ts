@@ -133,12 +133,12 @@ const graphRuntime = runtimeDouble({
           return lazyTensor(request.attributes.shape, request.attributes.dtype)
         case "quantizedEmbedding":
           return lazyTensor(
-            [...request.inputs[0].shape, request.attributes.logicalShape[1]],
+            [...request.inputs[0].shape, request.inputs[1].shape[1]],
             "f32"
           )
         case "quantizedLinear":
           return lazyTensor(
-            [...request.inputs[0].shape.slice(0, -1), request.attributes.logicalShape[0]],
+            [...request.inputs[0].shape.slice(0, -1), request.inputs[1].shape[0]],
             "f32"
           )
         case "concat": {

@@ -130,8 +130,8 @@ impl CpuBuffer {
 /// Element operations for dtype-generic kernels dispatched across the
 /// [`CpuBuffer`] variants.
 ///
-/// Mixed-dtype kernels such as casts and linalg use `to_f64` and `from_f64`
-/// to convert values through `f64`.
+/// Reference numerical kernels use `to_f64` and `from_f64` for computation.
+/// Tensor casts use pair-specific conversions to avoid intermediate rounding.
 pub trait Elem: CpuElement {
     /// Copies a vector into freshly allocated, uniquely owned storage.
     fn buffer_of(v: Vec<Self>) -> CpuBuffer;
@@ -192,14 +192,105 @@ macro_rules! impl_elem {
 
 impl_elem!(f32, F32, DType::F32, |x| x as f64, |x| x as f32);
 impl_elem!(f64, F64, DType::F64, |x| x, |x| x);
-impl_elem!(f16, F16, DType::F16, |x: f16| x.to_f64(), f16::from_f64);
-impl_elem!(
-    bf16,
-    BF16,
-    DType::BF16,
-    |x: bf16| x.to_f64(),
-    bf16::from_f64
-);
+impl_elem!(f16, F16, DType::F16, |x: f16| x.to_f64(), f16_from_f64);
+
+// Round the complete binary64 significand once. half::f16::from_f64 converts
+// through F32 on x86 F16C, and its software fallback discards low sticky bits.
+fn f16_from_f64(value: f64) -> f16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    if exponent == 0x7ff {
+        let payload = if fraction == 0 {
+            0
+        } else {
+            (fraction >> 42) as u16 | 0x0200
+        };
+        return f16::from_bits(sign | 0x7c00 | payload);
+    }
+    let exponent = exponent - 1023;
+    if exponent < -25 {
+        return f16::from_bits(sign);
+    }
+    if exponent > 15 {
+        return f16::from_bits(sign | 0x7c00);
+    }
+    let significand = fraction | (1u64 << 52);
+    let shift = if exponent < -14 { 28 - exponent } else { 42 };
+    let retained = significand >> shift;
+    let remainder = significand & ((1u64 << shift) - 1);
+    let midpoint = 1u64 << (shift - 1);
+    let rounded =
+        retained + u64::from(remainder > midpoint || remainder == midpoint && retained & 1 != 0);
+    let encoding = if exponent < -14 {
+        rounded as u16
+    } else {
+        (((exponent + 15) as u16) << 10) + rounded as u16 - 1024
+    };
+    f16::from_bits(sign | encoding)
+}
+
+// Convert the binary64 significand directly. Converting through F32 loses
+// sticky bits near BF16 midpoints and can round in the wrong direction.
+fn bf16_from_f64(value: f64) -> bf16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    if exponent == 0x7ff {
+        return bf16::from_bits(sign | if fraction == 0 { 0x7f80 } else { 0x7fc0 });
+    }
+    let exponent = exponent - 1023;
+    if exponent < -134 {
+        return bf16::from_bits(sign);
+    }
+    if exponent > 127 {
+        return bf16::from_bits(sign | 0x7f80);
+    }
+    let significand = fraction | (1u64 << 52);
+    let shift = if exponent < -126 { -exponent - 81 } else { 45 };
+    let retained = significand >> shift;
+    let remainder = significand & ((1u64 << shift) - 1);
+    let midpoint = 1u64 << (shift - 1);
+    let rounded =
+        retained + u64::from(remainder > midpoint || remainder == midpoint && retained & 1 != 0);
+    let encoding = if exponent < -126 {
+        rounded as u16
+    } else {
+        (((exponent + 127) as u16) << 7) + rounded as u16 - 128
+    };
+    bf16::from_bits(sign | encoding)
+}
+
+// Integer-to-half conversion rounds the integer significand once. In
+// particular, an I64 -> F64 -> BF16 conversion can lose midpoint sticky bits.
+fn integer_half_bits(value: i64, fraction_bits: u32, exponent_bias: u32) -> u16 {
+    let sign = if value < 0 { 0x8000 } else { 0 };
+    let magnitude = value.unsigned_abs();
+    if magnitude == 0 {
+        return 0;
+    }
+    let exponent = 63 - magnitude.leading_zeros();
+    if exponent > exponent_bias {
+        return sign | (((2 * exponent_bias + 1) << fraction_bits) as u16);
+    }
+    let rounded = if exponent <= fraction_bits {
+        magnitude << (fraction_bits - exponent)
+    } else {
+        let shift = exponent - fraction_bits;
+        let retained = magnitude >> shift;
+        let remainder = magnitude & ((1u64 << shift) - 1);
+        let midpoint = 1u64 << (shift - 1);
+        retained + u64::from(remainder > midpoint || remainder == midpoint && retained & 1 != 0)
+    };
+    // A carry from the rounded significand increments the exponent, including
+    // F16 overflow to infinity at its upper finite midpoint.
+    sign | (((exponent + exponent_bias) << fraction_bits) as u16
+        + (rounded - (1u64 << fraction_bits)) as u16)
+}
+
+impl_elem!(bf16, BF16, DType::BF16, |x: bf16| x.to_f64(), bf16_from_f64);
 impl_elem!(u8, U8, DType::U8, |x| x as f64, |x| x as u8);
 impl_elem!(u32, U32, DType::U32, |x| x as f64, |x| x as u32);
 impl_elem!(i64, I64, DType::I64, |x| x as f64, |x| x as i64);
@@ -660,8 +751,9 @@ impl Tensor {
         &[]
     }
 
-    /// Converts every element to `dtype`, routing through `f64`. Same-dtype
-    /// casts are cheap clones.
+    /// Converts elements directly to the destination dtype. Float conversion
+    /// rounds once; integer narrowing wraps, while float-to-integer saturates.
+    /// Same-dtype casts are cheap clones.
     pub fn cast(&self, dtype: DType) -> Self {
         if self.dtype() == dtype {
             return self.clone();
@@ -691,29 +783,114 @@ impl Tensor {
                 destination.dtype()
             ));
         }
+        if self.dtype() == dtype {
+            return self.copy_into(destination);
+        }
         macro_rules! source {
-            ($values:expr, $source:ty) => {
+            ($values:expr, $source:ty, $value:ident => [$f32:expr, $f64:expr, $f16:expr, $bf16:expr, $u8:expr, $u32:expr, $i64:expr]) => {
                 match dtype {
-                    DType::F32 => cast_strided::<$source, f32>($values, &self.layout, destination),
-                    DType::F64 => cast_strided::<$source, f64>($values, &self.layout, destination),
-                    DType::F16 => cast_strided::<$source, f16>($values, &self.layout, destination),
-                    DType::BF16 => {
-                        cast_strided::<$source, bf16>($values, &self.layout, destination)
+                    DType::F32 => {
+                        cast_strided($values, &self.layout, destination, |$value: $source| $f32)
                     }
-                    DType::U8 => cast_strided::<$source, u8>($values, &self.layout, destination),
-                    DType::U32 => cast_strided::<$source, u32>($values, &self.layout, destination),
-                    DType::I64 => cast_strided::<$source, i64>($values, &self.layout, destination),
+                    DType::F64 => {
+                        cast_strided($values, &self.layout, destination, |$value: $source| $f64)
+                    }
+                    DType::F16 => {
+                        cast_strided($values, &self.layout, destination, |$value: $source| $f16)
+                    }
+                    DType::BF16 => {
+                        cast_strided($values, &self.layout, destination, |$value: $source| $bf16)
+                    }
+                    DType::U8 => {
+                        cast_strided($values, &self.layout, destination, |$value: $source| $u8)
+                    }
+                    DType::U32 => {
+                        cast_strided($values, &self.layout, destination, |$value: $source| $u32)
+                    }
+                    DType::I64 => {
+                        cast_strided($values, &self.layout, destination, |$value: $source| $i64)
+                    }
                 }
             };
         }
         match &self.buffer {
-            CpuBuffer::F32(values) => source!(values, f32),
-            CpuBuffer::F64(values) => source!(values, f64),
-            CpuBuffer::F16(values) => source!(values, f16),
-            CpuBuffer::BF16(values) => source!(values, bf16),
-            CpuBuffer::U8(values) => source!(values, u8),
-            CpuBuffer::U32(values) => source!(values, u32),
-            CpuBuffer::I64(values) => source!(values, i64),
+            CpuBuffer::F32(values) => {
+                source!(values, f32, x => [
+                    x,
+                    x as f64,
+                    f16::from_f32(x),
+                    bf16::from_f32(x),
+                    x as u8,
+                    x as u32,
+                    x as i64
+                ])
+            }
+            CpuBuffer::F64(values) => {
+                source!(values, f64, x => [
+                    x as f32,
+                    x,
+                    f16_from_f64(x),
+                    bf16_from_f64(x),
+                    x as u8,
+                    x as u32,
+                    x as i64
+                ])
+            }
+            CpuBuffer::F16(values) => {
+                source!(values, f16, x => [
+                    x.to_f32(),
+                    x.to_f64(),
+                    x,
+                    bf16::from_f32(x.to_f32()),
+                    x.to_f32() as u8,
+                    x.to_f32() as u32,
+                    x.to_f32() as i64
+                ])
+            }
+            CpuBuffer::BF16(values) => {
+                source!(values, bf16, x => [
+                    x.to_f32(),
+                    x.to_f64(),
+                    f16::from_f32(x.to_f32()),
+                    x,
+                    x.to_f32() as u8,
+                    x.to_f32() as u32,
+                    x.to_f32() as i64
+                ])
+            }
+            CpuBuffer::U8(values) => {
+                source!(values, u8, x => [
+                    x as f32,
+                    x as f64,
+                    f16::from_bits(integer_half_bits(x as i64, 10, 15)),
+                    bf16::from_bits(integer_half_bits(x as i64, 7, 127)),
+                    x,
+                    x as u32,
+                    x as i64
+                ])
+            }
+            CpuBuffer::U32(values) => {
+                source!(values, u32, x => [
+                    x as f32,
+                    x as f64,
+                    f16::from_bits(integer_half_bits(x as i64, 10, 15)),
+                    bf16::from_bits(integer_half_bits(x as i64, 7, 127)),
+                    x as u8,
+                    x,
+                    x as i64
+                ])
+            }
+            CpuBuffer::I64(values) => {
+                source!(values, i64, x => [
+                    x as f32,
+                    x as f64,
+                    f16::from_bits(integer_half_bits(x, 10, 15)),
+                    bf16::from_bits(integer_half_bits(x, 7, 127)),
+                    x as u8,
+                    x as u32,
+                    x
+                ])
+            }
         }
     }
 }
@@ -919,10 +1096,11 @@ fn cast_strided<S: Elem, D: Elem>(
     source: &[S],
     layout: &Layout,
     destination: &mut CpuDestination<'_>,
+    convert: impl Fn(S) -> D,
 ) -> Result<(), String> {
     destination.write::<D, _>("cast", layout.shape(), |output| {
         for (index, value) in output.iter_mut().enumerate() {
-            *value = D::from_f64(source[source_index(layout, index)].to_f64());
+            *value = convert(source[source_index(layout, index)]);
         }
     })
 }
@@ -986,6 +1164,278 @@ mod tests {
             panic!()
         };
         assert_eq!(data.as_slice(), &[1.5, -2.25, 100.0]);
+    }
+
+    #[test]
+    fn identity_cast_preserves_i64_bits_in_strided_views() {
+        let tensor = Tensor::from_vec(vec![i64::MAX, i64::MIN, (1i64 << 53) + 1, -7], vec![2, 2]);
+        let tensor = tensor.view(tensor.layout.permute(&[1, 0]));
+        let mut output = Tensor::empty(&[2, 2], DType::I64);
+        tensor
+            .cast_into(DType::I64, &mut output.destination().unwrap())
+            .unwrap();
+        let CpuBuffer::I64(values) = &output.buffer else {
+            panic!("expected i64 storage")
+        };
+        assert_eq!(
+            values.as_slice(),
+            &[i64::MAX, (1i64 << 53) + 1, i64::MIN, -7]
+        );
+    }
+
+    #[test]
+    fn f64_to_half_cast_avoids_double_rounding() {
+        for (dtype, fraction_bits) in [(DType::F16, 10), (DType::BF16, 7)] {
+            let source = Tensor::from_vec(
+                vec![1.0f64 + 2f64.powi(-fraction_bits - 1) + 2f64.powi(-40)],
+                vec![1],
+            );
+            let mut output = Tensor::empty(&[1], dtype);
+            source
+                .cast_into(dtype, &mut output.destination().unwrap())
+                .unwrap();
+            let widened = output.cast(DType::F64);
+            assert_eq!(
+                f64::slice_of(&widened).unwrap(),
+                &[1. + 2f64.powi(-fraction_bits)]
+            );
+        }
+    }
+
+    fn assert_binary64_to_half_rounding<T: Elem>(
+        from_bits: fn(u16) -> T,
+        to_bits: fn(T) -> u16,
+        infinity: u16,
+    ) {
+        let mut source = Vec::new();
+        let mut expected = Vec::new();
+        let mut check = |value: f64, bits: u16| {
+            assert_eq!(
+                to_bits(T::from_f64(value)),
+                bits,
+                "{} narrowing {value:e}",
+                T::dtype()
+            );
+            source.extend([f64::NAN, value]);
+            expected.push(bits);
+        };
+        // Every adjacent finite pair, including zero/subnormal, subnormal/normal,
+        // binade transitions, and the final overflow midpoint. The neighboring
+        // binary64 values retain sticky bits that both F32 and truncation lose.
+        for bits in 0..infinity {
+            let lower = from_bits(bits).to_f64();
+            let upper = if bits + 1 == infinity {
+                lower + (lower - from_bits(bits - 1).to_f64())
+            } else {
+                from_bits(bits + 1).to_f64()
+            };
+            let midpoint = (lower + upper) / 2.;
+            let below = f64::from_bits(midpoint.to_bits() - 1);
+            let above = f64::from_bits(midpoint.to_bits() + 1);
+            for (value, rounded) in [
+                (below, bits),
+                (midpoint, bits + (bits & 1)),
+                (above, bits + 1),
+            ] {
+                check(value, rounded);
+                check(-value, 0x8000 | rounded);
+            }
+        }
+        for (value, bits) in [
+            (0., 0),
+            (f64::from_bits(1), 0),
+            (f64::MIN_POSITIVE, 0),
+            (f64::MAX, infinity),
+            (f64::INFINITY, infinity),
+        ] {
+            check(value, bits);
+            check(-value, 0x8000 | bits);
+        }
+
+        let count = expected.len();
+        let source =
+            Tensor::from_vec(source, vec![count * 2]).view(Layout::new(vec![count], vec![2], 1));
+        let mut output = Tensor::empty(&[count], T::dtype());
+        {
+            let _guard = ExecutableAllocationGuard::enter();
+            source
+                .cast_into(T::dtype(), &mut output.destination().unwrap())
+                .unwrap();
+        }
+        for (index, (&value, bits)) in T::slice_of(&output)
+            .unwrap()
+            .iter()
+            .zip(expected)
+            .enumerate()
+        {
+            assert_eq!(to_bits(value), bits, "{} cast at {index}", T::dtype());
+        }
+        for value in [f64::NAN, -f64::NAN, f64::from_bits(0x7ff0_0000_0000_0001)] {
+            assert!(T::from_f64(value).to_f64().is_nan());
+        }
+    }
+
+    #[test]
+    fn binary64_to_f16_rounds_all_midpoints_to_nearest_even() {
+        assert_binary64_to_half_rounding(f16::from_bits, f16::to_bits, 0x7c00);
+        for (bits, expected) in [
+            (0x7ff0_0000_0000_0001, 0x7e00),
+            (0x7ff4_0000_0000_0001, 0x7f00),
+            (0xfff0_0000_0000_0001, 0xfe00),
+            (0xfff4_0000_0000_0001, 0xff00),
+        ] {
+            assert_eq!(f16_from_f64(f64::from_bits(bits)).to_bits(), expected);
+        }
+    }
+
+    #[test]
+    fn binary64_to_bf16_rounds_all_midpoints_to_nearest_even() {
+        assert_binary64_to_half_rounding(bf16::from_bits, bf16::to_bits, 0x7f80);
+    }
+
+    #[test]
+    fn identity_half_cast_preserves_all_bits_in_strided_views() {
+        fn check<T: Elem>(from_bits: fn(u16) -> T, to_bits: fn(T) -> u16) {
+            let data = (0..=u16::MAX)
+                .flat_map(|bits| [T::default(), from_bits(bits)])
+                .collect();
+            let count = usize::from(u16::MAX) + 1;
+            let source =
+                Tensor::from_vec(data, vec![count * 2]).view(Layout::new(vec![count], vec![2], 1));
+            let cloned = source.cast(T::dtype()).contiguous();
+            let mut output = Tensor::empty(&[count], T::dtype());
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                source
+                    .cast_into(T::dtype(), &mut output.destination().unwrap())
+                    .unwrap();
+            }
+            for tensor in [&cloned, &output] {
+                for (bits, &value) in (0..=u16::MAX).zip(T::slice_of(tensor).unwrap()) {
+                    assert_eq!(to_bits(value), bits, "{} identity cast", T::dtype());
+                }
+            }
+        }
+        check(f16::from_bits, f16::to_bits);
+        check(bf16::from_bits, bf16::to_bits);
+    }
+
+    #[test]
+    fn integer_to_float_cast_rounds_once_from_the_full_significand() {
+        for (dtype, half_ulp) in [(DType::BF16, 1i64 << 54), (DType::F32, 1i64 << 38)] {
+            let base = 1i64 << 62;
+            let midpoint = base + half_ulp;
+            let source = Tensor::from_vec(
+                vec![midpoint - 1, 0, midpoint, 0, midpoint + 1, 0, -midpoint - 1],
+                vec![7],
+            )
+            .view(Layout::new(vec![4], vec![2], 0));
+            let mut output = Tensor::empty(&[4], dtype);
+            {
+                let _guard = ExecutableAllocationGuard::enter();
+                source
+                    .cast_into(dtype, &mut output.destination().unwrap())
+                    .unwrap();
+            }
+            let widened = output.cast(DType::F64);
+            assert_eq!(
+                f64::slice_of(&widened).unwrap(),
+                &[
+                    base as f64,
+                    base as f64,
+                    (base + 2 * half_ulp) as f64,
+                    -(base + 2 * half_ulp) as f64
+                ]
+            );
+        }
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let source = Tensor::from_vec(vec![i64::MIN, i64::MAX], vec![2]);
+            let output = source.cast(dtype).cast(DType::F64);
+            let expected = if dtype == DType::F16 {
+                f64::INFINITY
+            } else {
+                2f64.powi(63)
+            };
+            assert_eq!(f64::slice_of(&output).unwrap(), &[-expected, expected]);
+        }
+    }
+
+    #[test]
+    fn integer_to_half_rounds_midpoints_and_overflow_to_nearest_even() {
+        for value in -70000..=70000 {
+            assert_eq!(
+                integer_half_bits(value, 10, 15),
+                f16::from_f64(value as f64).to_bits()
+            );
+        }
+        for bits in ((127 + 8) << 7)..((127 + 63) << 7) {
+            let lower = bf16::from_bits(bits).to_f64() as u64;
+            let upper = bf16::from_bits(bits + 1).to_f64() as u64;
+            let midpoint = ((lower + upper) / 2) as i64;
+            assert_eq!(integer_half_bits(midpoint - 1, 7, 127), bits);
+            assert_eq!(integer_half_bits(midpoint, 7, 127), bits + (bits & 1));
+            assert_eq!(integer_half_bits(midpoint + 1, 7, 127), bits + 1);
+            assert_eq!(
+                integer_half_bits(-midpoint - 1, 7, 127),
+                0x8000 | (bits + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn integer_casts_wrap_without_losing_source_bits() {
+        let source = Tensor::from_vec(
+            vec![i64::MIN, -1, 0, 256, (1i64 << 62) + 257, i64::MAX],
+            vec![6],
+        );
+        assert_eq!(
+            u8::slice_of(&source.cast(DType::U8)).unwrap(),
+            &[0, 255, 0, 0, 1, 255]
+        );
+        assert_eq!(
+            u32::slice_of(&source.cast(DType::U32)).unwrap(),
+            &[0, u32::MAX, 0, 256, 257, u32::MAX]
+        );
+        let unsigned = Tensor::from_vec(vec![0u32, 256, u32::MAX], vec![3]);
+        assert_eq!(
+            u8::slice_of(&unsigned.cast(DType::U8)).unwrap(),
+            &[0, 0, 255]
+        );
+        assert_eq!(
+            i64::slice_of(&unsigned.cast(DType::I64)).unwrap(),
+            &[0, 256, 4294967295]
+        );
+    }
+
+    #[test]
+    fn float_to_integer_casts_preserve_saturation_and_truncation() {
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let values = Tensor::from_vec(
+                vec![
+                    f64::NEG_INFINITY,
+                    -1.75,
+                    -0.,
+                    0.,
+                    1.75,
+                    f64::INFINITY,
+                    f64::NAN,
+                ],
+                vec![7],
+            )
+            .cast(dtype);
+            assert_eq!(
+                u8::slice_of(&values.cast(DType::U8)).unwrap(),
+                &[0, 0, 0, 0, 1, u8::MAX, 0]
+            );
+            assert_eq!(
+                u32::slice_of(&values.cast(DType::U32)).unwrap(),
+                &[0, 0, 0, 0, 1, u32::MAX, 0]
+            );
+            assert_eq!(
+                i64::slice_of(&values.cast(DType::I64)).unwrap(),
+                &[i64::MIN, -1, 0, 0, 1, i64::MAX, 0]
+            );
+        }
     }
 
     #[test]

@@ -392,6 +392,60 @@ mod tests {
     }
 
     #[test]
+    fn f64_samples_round_once_without_changing_draw_count() {
+        for dtype in [
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+            DType::U8,
+            DType::U32,
+            DType::I64,
+        ] {
+            for normal in [false, true] {
+                let mut output = Tensor::empty(&[37], dtype);
+                let mut reference = Tensor::empty(&[37], DType::F64);
+                let mut actual_rng = Xoroshiro128Plus::new(42);
+                let mut reference_rng = Xoroshiro128Plus::new(42);
+                {
+                    let _guard = ExecutableAllocationGuard::enter();
+                    if normal {
+                        randn_with_rng_into(&mut output.destination().unwrap(), &mut actual_rng)
+                            .unwrap();
+                        randn_with_rng_into(
+                            &mut reference.destination().unwrap(),
+                            &mut reference_rng,
+                        )
+                        .unwrap();
+                    } else {
+                        uniform_with_rng_into(
+                            -10.,
+                            10.,
+                            &mut output.destination().unwrap(),
+                            &mut actual_rng,
+                        )
+                        .unwrap();
+                        uniform_with_rng_into(
+                            -10.,
+                            10.,
+                            &mut reference.destination().unwrap(),
+                            &mut reference_rng,
+                        )
+                        .unwrap();
+                    }
+                }
+                assert_eq!(actual_rng.next_u64(), reference_rng.next_u64());
+                let expected = reference.cast(dtype).cast(DType::F64);
+                let actual = output.cast(DType::F64);
+                assert_eq!(
+                    f64::slice_of(&actual).unwrap(),
+                    f64::slice_of(&expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn random_into_is_allocation_free_and_matches_wrapper_stream() {
         let requirements = Tensor::randn_requirements(&[8], DType::F32);
         assert_eq!(requirements.output.bytes, 32);

@@ -17,9 +17,66 @@ use std::sync::Arc;
 
 /// A graph leaf value backed by a Metal tensor.
 #[derive(Clone)]
-pub struct Value(pub MetalTensor);
+pub struct Value(pub MetalTensor, Option<PackedValue>);
+
+#[derive(Clone)]
+struct PackedValue {
+    shape: Vec<usize>,
+    storage: effect_torch_runtime::StorageMetadata,
+}
 
 impl Value {
+    pub fn dense(tensor: MetalTensor) -> Self {
+        Self(tensor, None)
+    }
+
+    /// Attach a validated canonical representation to imported packed bytes.
+    pub fn with_packed_storage(
+        self,
+        codec: effect_torch_runtime::GgmlKQuant,
+        shape: Vec<usize>,
+    ) -> Result<Self, String> {
+        let storage = effect_torch_runtime::StorageMetadata::packed(codec);
+        let spec = effect_torch_runtime::ValueSpec {
+            semantic_dtype: DType::F32,
+            logical_shape: &shape,
+            storage: storage.as_spec(),
+        };
+        let bytes = self
+            .0
+            .layout
+            .checked_byte_size(self.0.dtype)
+            .ok_or("packed buffer extent overflow")?;
+        if self.1.is_some() {
+            return Err("value already has packed storage".to_string());
+        }
+        spec.validate_buffer(self.0.dtype, &self.0.layout, bytes)?;
+        if self.0.buffer.size < bytes {
+            return Err("packed bytes exceed the Metal allocation".to_string());
+        }
+        Ok(Self(self.0, Some(PackedValue { shape, storage })))
+    }
+
+    pub fn value_spec(&self) -> effect_torch_runtime::ValueSpec<'_> {
+        match &self.1 {
+            Some(packed) => effect_torch_runtime::ValueSpec {
+                semantic_dtype: DType::F32,
+                logical_shape: &packed.shape,
+                storage: packed.storage.as_spec(),
+            },
+            None => effect_torch_runtime::Buffer::value_spec(&self.0),
+        }
+    }
+
+    pub fn storage(&self) -> effect_torch_runtime::StorageMetadata {
+        self.1
+            .as_ref()
+            .map(|packed| packed.storage.clone())
+            .unwrap_or_else(|| effect_torch_runtime::StorageMetadata {
+                representation: effect_torch_runtime::StorageRepresentation::Dense,
+                layout: effect_torch_runtime::StorageLayout::DenseStrided(self.0.layout.clone()),
+            })
+    }
     /// The Metal device this value lives on.
     pub fn device(&self) -> Device {
         Device::Metal(self.0.buffer.device_ordinal())
@@ -32,28 +89,26 @@ impl Value {
 
     /// Element type of the wrapped tensor.
     pub fn dtype(&self) -> DType {
-        self.0.dtype
+        self.value_spec().semantic_dtype
     }
 
     /// Logical shape of the wrapped tensor.
     pub fn shape(&self) -> &[usize] {
-        self.0.layout.shape()
+        self.value_spec().logical_shape
     }
 
-    /// Number of logical elements.
-    pub fn numel(&self) -> usize {
-        self.0.numel()
-    }
-
-    /// Contiguous byte size: `numel * dtype.size_in_bytes()`.
+    /// Physical byte size, including the packed representation when present.
     pub fn byte_size(&self) -> usize {
-        self.numel() * self.dtype().size_in_bytes()
+        self.0.numel() * self.0.dtype.size_in_bytes()
     }
 
     /// Synchronizes, copies to contiguous f32 on device, and reads back to
     /// the host (tests only).
     #[cfg(test)]
     pub fn to_f32_vec(&self) -> Result<Vec<f32>, String> {
+        if self.1.is_some() {
+            return Err("packed values require explicit dequantization".to_string());
+        }
         MetalDevice::with_ordinal(self.0.buffer.device_ordinal() as usize, || {
             let device = MetalDevice::get();
             let tensor = kernels::strided_copy(device, &self.0)?;
@@ -91,7 +146,7 @@ pub(crate) fn value_from_bytes(
     if dtype == DType::F64 {
         return Err("f64 is not supported on Metal".to_string());
     }
-    Ok(Value(MetalTensor {
+    Ok(Value::dense(MetalTensor {
         buffer: MetalDevice::get().upload_bytes(bytes),
         layout: Layout::contiguous(shape.to_vec()),
         dtype,
@@ -112,7 +167,7 @@ pub(crate) fn empty_shared_value(shape: &[usize], dtype: DType) -> Result<Value,
     if dtype == DType::F64 {
         return Err("f64 is not supported on Metal".to_string());
     }
-    Ok(Value(MetalTensor {
+    Ok(Value::dense(MetalTensor {
         buffer: MetalDevice::get().alloc_raw_checked(byte_len)?,
         layout: Layout::contiguous(shape.to_vec()),
         dtype,
@@ -163,6 +218,10 @@ impl effect_torch_graph::LeafValue for Value {
 
     fn device(&self) -> Device {
         self.device()
+    }
+
+    fn storage(&self) -> effect_torch_runtime::StorageMetadata {
+        self.storage()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

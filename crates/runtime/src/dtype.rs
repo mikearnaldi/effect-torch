@@ -7,12 +7,14 @@
 
 use std::fmt;
 
-/// Scalar element type of a tensor or buffer.
+/// Semantic scalar type of a tensor. Packed storage has a separate representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,
     F64,
+    /// IEEE binary16. Dense storage preserves the original 16 bits.
     F16,
+    /// Bfloat16. Dense storage preserves the original 16 bits.
     BF16,
     U8,
     U32,
@@ -20,7 +22,8 @@ pub enum DType {
 }
 
 impl DType {
-    /// Size of one element in bytes.
+    /// Size of one canonical dense element in bytes. This is not a packed
+    /// tensor byte-size calculation; use `ValueSpec::canonical_geometry` for that.
     pub fn size_in_bytes(self) -> usize {
         match self {
             DType::F32 => 4,

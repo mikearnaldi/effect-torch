@@ -21,7 +21,9 @@
 //! Each binding has a [`BindingLayoutPolicy`]. `Require(`
 //! [`LayoutConstraint`]`)` requires `Exact`, `Contiguous`,
 //! `ZeroOffsetContiguous`, or `AnyStrided` layout. `Canonicalize { target }`
-//! accepts any layout because the backend converts it to `target` before use.
+//! accepts any valid dense layout because the backend converts it to `target`
+//! before use. Packed representations retain their format-specific canonical
+//! layout requirement under every binding policy.
 //! [`BindingAliasing`] records whether a binding may share storage, is
 //! disjoint from other bindings, or is the only writer to its storage.
 //!
@@ -32,7 +34,10 @@
 //! that many counters. This prevents a frozen graph from replaying stale random
 //! state.
 
-use crate::{DType, ErasedBuffer, Layout, Placement, RuntimeId};
+use crate::{
+    DType, ErasedBuffer, Layout, LayoutConstraintSpec, Placement, RuntimeId, StorageMetadata,
+    StorageRepresentation, ValueSpec,
+};
 use std::error::Error;
 use std::fmt;
 
@@ -45,7 +50,8 @@ pub enum LayoutConstraint {
     Contiguous,
     /// Densely packed row-major with offset 0.
     ZeroOffsetContiguous,
-    /// Any strides are acceptable.
+    /// Any valid dense strides are acceptable. Packed formats retain their
+    /// intrinsic layout requirements.
     AnyStrided,
 }
 
@@ -54,7 +60,8 @@ pub enum LayoutConstraint {
 pub enum BindingLayoutPolicy {
     /// The caller's buffer must already satisfy the constraint.
     Require(LayoutConstraint),
-    /// Accepts any layout. The backend canonicalizes it to `target`.
+    /// Accepts any valid dense layout. The backend canonicalizes it to `target`.
+    /// Packed inputs and targets must satisfy their intrinsic layout requirements.
     Canonicalize { target: Layout },
 }
 
@@ -78,11 +85,46 @@ pub enum BindingAliasing {
 /// Declaration of one tensor argument of a program.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BindingDecl {
+    /// Representation metadata. For dense bindings, `layout` below owns the
+    /// invocation layout contract; use `value_spec()` to query it. Packed storage
+    /// retains the format-specific layout constraint recorded here.
+    pub storage: StorageMetadata,
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub placement: Placement,
     pub layout: BindingLayoutPolicy,
     pub aliasing: BindingAliasing,
+}
+
+impl BindingDecl {
+    /// Caller-visible value contract derived from the binding policy.
+    ///
+    /// `Contiguous` permits nonzero offsets and `Canonicalize` accepts arbitrary
+    /// valid dense strides. Their full policies remain in `self.layout`; the
+    /// borrowed storage view conservatively reports `Unconstrained`. A
+    /// canonicalization target is an execution layout, not an input requirement.
+    pub fn value_spec(&self) -> ValueSpec<'_> {
+        let mut storage = self.storage.as_spec();
+        if storage.representation == StorageRepresentation::Dense {
+            storage.layout_constraint = match &self.layout {
+                BindingLayoutPolicy::Require(LayoutConstraint::Exact(layout)) => {
+                    LayoutConstraintSpec::DenseStrided(layout)
+                }
+                BindingLayoutPolicy::Require(LayoutConstraint::ZeroOffsetContiguous) => {
+                    LayoutConstraintSpec::Canonical
+                }
+                BindingLayoutPolicy::Require(
+                    LayoutConstraint::Contiguous | LayoutConstraint::AnyStrided,
+                )
+                | BindingLayoutPolicy::Canonicalize { .. } => LayoutConstraintSpec::Unconstrained,
+            };
+        }
+        ValueSpec {
+            semantic_dtype: self.dtype,
+            logical_shape: &self.shape,
+            storage,
+        }
+    }
 }
 
 /// Type of a scalar argument.
@@ -266,9 +308,20 @@ pub struct InvocationSignature {
 /// Declared shape, dtype, and placement of one program output.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OutputSignature {
+    pub storage: StorageMetadata,
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub placement: Placement,
+}
+
+impl OutputSignature {
+    pub fn value_spec(&self) -> ValueSpec<'_> {
+        ValueSpec {
+            semantic_dtype: self.dtype,
+            logical_shape: &self.shape,
+            storage: self.storage.as_spec(),
+        }
+    }
 }
 
 /// Calling convention for a compiled program, including positional tensor
@@ -321,12 +374,15 @@ impl ProgramSignature {
         }
     }
 
-    /// Checks binding `binding`'s dtype, placement, shape, and layout policy
-    /// without requiring an [`ErasedBuffer`].
+    /// Checks binding `binding`'s logical dtype/shape, representation, placement,
+    /// and physical layout policy without requiring an [`ErasedBuffer`]. The
+    /// handle constructor must already have checked the observed physical dtype,
+    /// base alignment, and allocation extent with `ValueSpec::validate_buffer`
+    /// and the backend's allocation checks.
     pub fn validate_binding_metadata(
         &self,
         binding: usize,
-        dtype: DType,
+        value: ValueSpec<'_>,
         placement: &Placement,
         layout: &Layout,
     ) -> Result<(), InvocationError> {
@@ -337,6 +393,7 @@ impl ProgramSignature {
                 actual: binding.saturating_add(1),
             });
         };
+        let dtype = value.semantic_dtype;
         if dtype != decl.dtype {
             return Err(InvocationError::DTypeMismatch {
                 binding,
@@ -347,8 +404,15 @@ impl ProgramSignature {
         if placement != &decl.placement {
             return Err(InvocationError::PlacementMismatch { binding });
         }
-        if layout.shape() != decl.shape {
+        if value.logical_shape != decl.shape {
             return Err(InvocationError::ShapeMismatch { binding });
+        }
+        if value.storage.representation != decl.storage.representation {
+            return Err(InvocationError::RepresentationMismatch {
+                binding,
+                expected: decl.storage.representation,
+                actual: value.storage.representation,
+            });
         }
         let layout_matches = match &decl.layout {
             BindingLayoutPolicy::Require(LayoutConstraint::Exact(expected)) => layout == expected,
@@ -361,6 +425,40 @@ impl ProgramSignature {
         };
         if !layout_matches {
             return Err(InvocationError::LayoutMismatch { binding });
+        }
+        value
+            .validate()
+            .map_err(|reason| InvocationError::InvalidStorage { binding, reason })?;
+        let expected = decl.value_spec();
+        let geometry = value
+            .canonical_geometry()
+            .map_err(|reason| InvocationError::InvalidStorage { binding, reason })?;
+        let extent = layout
+            .checked_byte_size(geometry.physical_dtype)
+            .ok_or_else(|| InvocationError::InvalidStorage {
+                binding,
+                reason: "physical layout byte extent overflows".to_string(),
+            })?;
+        value
+            .validate_buffer(geometry.physical_dtype, layout, extent)
+            .map_err(|reason| InvocationError::InvalidStorage { binding, reason })?;
+        expected
+            .validate_buffer(geometry.physical_dtype, layout, extent)
+            .map_err(|reason| InvocationError::InvalidStorage { binding, reason })?;
+        if let BindingLayoutPolicy::Canonicalize { target } = &decl.layout {
+            let mut target_spec = expected;
+            if target_spec.storage.representation == StorageRepresentation::Dense {
+                target_spec.storage.layout_constraint = LayoutConstraintSpec::DenseStrided(target);
+            }
+            let target_extent = target
+                .checked_byte_size(geometry.physical_dtype)
+                .ok_or_else(|| InvocationError::InvalidStorage {
+                    binding,
+                    reason: "canonicalization target byte extent overflows".to_string(),
+                })?;
+            target_spec
+                .validate_buffer(geometry.physical_dtype, target, target_extent)
+                .map_err(|reason| InvocationError::InvalidStorage { binding, reason })?;
         }
         Ok(())
     }
@@ -429,7 +527,7 @@ impl ProgramSignature {
             }
             self.validate_binding_metadata(
                 index,
-                buffer.dtype(),
+                buffer.value_spec(),
                 buffer.placement(),
                 buffer.layout(),
             )?;
@@ -549,6 +647,14 @@ pub enum InvocationError {
         expected: DType,
         actual: DType,
     },
+    /// A binding's represented values use a different storage format.
+    RepresentationMismatch {
+        binding: usize,
+        expected: StorageRepresentation,
+        actual: StorageRepresentation,
+    },
+    /// Invalid representation geometry or layout at the boundary.
+    InvalidStorage { binding: usize, reason: String },
     /// A binding's placement differs from the declaration.
     PlacementMismatch { binding: usize },
     /// A binding's shape differs from the declaration.
@@ -592,6 +698,17 @@ impl fmt::Display for InvocationError {
                 f,
                 "binding {binding} has dtype {actual}, expected {expected}"
             ),
+            InvocationError::RepresentationMismatch {
+                binding,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "binding {binding} has representation {actual:?}, expected {expected:?}"
+            ),
+            InvocationError::InvalidStorage { binding, reason } => {
+                write!(f, "binding {binding} has invalid storage: {reason}")
+            }
             InvocationError::PlacementMismatch { binding } => {
                 write!(f, "binding {binding} has the wrong placement")
             }
@@ -655,6 +772,10 @@ mod tests {
             self.dtype
         }
 
+        fn value_spec(&self) -> ValueSpec<'_> {
+            dense_view(self.dtype, self.layout.shape(), &self.layout)
+        }
+
         fn layout(&self) -> &Layout {
             &self.layout
         }
@@ -667,6 +788,7 @@ mod tests {
     fn signature() -> ProgramSignature {
         ProgramSignature {
             bindings: vec![BindingDecl {
+                storage: StorageMetadata::dense(),
                 shape: vec![2],
                 dtype: DType::F32,
                 placement: Placement::new(DeviceId::new("cpu:0")),
@@ -764,12 +886,17 @@ mod tests {
 
         let placement = Placement::new(DeviceId::new("cpu:0"));
         assert!(signature
-            .validate_binding_metadata(0, DType::F32, &placement, &Layout::contiguous(vec![2]),)
+            .validate_binding_metadata(
+                0,
+                ValueSpec::dense(DType::F32, &[2]),
+                &placement,
+                &Layout::contiguous(vec![2]),
+            )
             .is_ok());
         assert_eq!(
             signature.validate_binding_metadata(
                 0,
-                DType::F32,
+                ValueSpec::dense(DType::F32, &[2]),
                 &placement,
                 &Layout::new(vec![2], vec![1], 1),
             ),
@@ -778,5 +905,363 @@ mod tests {
         assert!(signature
             .validate_runtime_value_metadata(0, &RuntimeValue::U64(2))
             .is_ok());
+    }
+
+    fn dense_binding(layout: BindingLayoutPolicy) -> ProgramSignature {
+        ProgramSignature {
+            bindings: vec![BindingDecl {
+                shape: vec![2, 3],
+                dtype: DType::F32,
+                storage: StorageMetadata::dense(),
+                placement: Placement::new(DeviceId::new("cpu:0")),
+                layout,
+                aliasing: BindingAliasing::MayAlias,
+            }],
+            ..ProgramSignature::default()
+        }
+    }
+
+    fn dense_view<'a>(dtype: DType, shape: &'a [usize], layout: &'a Layout) -> ValueSpec<'a> {
+        ValueSpec {
+            semantic_dtype: dtype,
+            logical_shape: shape,
+            storage: crate::StorageSpec {
+                representation: StorageRepresentation::Dense,
+                layout_constraint: LayoutConstraintSpec::DenseStrided(layout),
+            },
+        }
+    }
+
+    #[test]
+    fn dense_binding_policy_owns_strided_and_offset_rebinding() {
+        let owner = RuntimeId::new();
+        let layouts = [
+            Layout::contiguous(vec![2, 3]),
+            Layout::new(vec![2, 3], vec![3, 1], 2),
+            Layout::new(vec![2, 3], vec![1, 2], 0),
+            Layout::new(vec![2, 3], vec![8, 2], 1),
+            Layout::new(vec![2, 3], vec![0, 1], 0),
+        ];
+        let policies = [
+            (
+                BindingLayoutPolicy::Require(LayoutConstraint::AnyStrided),
+                [true, true, true, true, true],
+            ),
+            (
+                BindingLayoutPolicy::Canonicalize {
+                    target: layouts[0].clone(),
+                },
+                [true, true, true, true, true],
+            ),
+            (
+                BindingLayoutPolicy::Require(LayoutConstraint::Contiguous),
+                [true, true, false, false, false],
+            ),
+            (
+                BindingLayoutPolicy::Require(LayoutConstraint::ZeroOffsetContiguous),
+                [true, false, false, false, false],
+            ),
+            (
+                BindingLayoutPolicy::Require(LayoutConstraint::Exact(layouts[3].clone())),
+                [false, false, false, true, false],
+            ),
+        ];
+        for (policy, accepted) in policies {
+            let signature = dense_binding(policy.clone());
+            for (layout, accepted) in layouts.iter().zip(accepted) {
+                let invocation = Invocation {
+                    bindings: vec![ErasedBuffer::new(TestBuffer {
+                        owner,
+                        placement: signature.bindings[0].placement.clone(),
+                        dtype: DType::F32,
+                        layout: layout.clone(),
+                    })],
+                    ..Invocation::default()
+                };
+                let result = signature.validate_invocation(owner, &invocation);
+                if accepted {
+                    result.unwrap();
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(InvocationError::LayoutMismatch { binding: 0 }),
+                        "{policy:?} with {layout:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonicalization_validates_its_target_separately_from_the_input() {
+        let source = Layout::new(vec![2, 3], vec![1, 2], 0);
+        let value = dense_view(DType::F32, &[2, 3], &source);
+        for target in [
+            Layout::contiguous(vec![2, 3]),
+            Layout::new(vec![2, 3], vec![5, 1], 1),
+        ] {
+            let signature = dense_binding(BindingLayoutPolicy::Canonicalize { target });
+            signature
+                .validate_binding_metadata(0, value, &signature.bindings[0].placement, &source)
+                .unwrap();
+        }
+        for target in [
+            Layout::contiguous(vec![3, 2]),
+            Layout::new(vec![2, 3], vec![usize::MAX, 1], 0),
+        ] {
+            let signature = dense_binding(BindingLayoutPolicy::Canonicalize { target });
+            assert!(matches!(
+                signature.validate_binding_metadata(
+                    0,
+                    value,
+                    &signature.bindings[0].placement,
+                    &source
+                ),
+                Err(InvocationError::InvalidStorage { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn permissive_dense_policies_still_require_truthful_value_metadata() {
+        let physical = Layout::new(vec![2, 3], vec![1, 2], 0);
+        let value = dense_view(DType::F32, &[2, 3], &physical);
+        // Physical scalar type is checked before handle publication; permissive
+        // binding layouts do not authorize changing representation or dtype.
+        assert!(value
+            .validate_buffer(DType::F16, &physical, 24)
+            .unwrap_err()
+            .contains("physical dtype"));
+        value.validate_buffer(DType::F32, &physical, 24).unwrap();
+        for policy in [
+            BindingLayoutPolicy::Require(LayoutConstraint::AnyStrided),
+            BindingLayoutPolicy::Canonicalize {
+                target: Layout::contiguous(vec![2, 3]),
+            },
+        ] {
+            let signature = dense_binding(policy);
+            let placement = &signature.bindings[0].placement;
+            assert_eq!(
+                signature.validate_binding_metadata(
+                    0,
+                    ValueSpec {
+                        semantic_dtype: DType::F16,
+                        ..value
+                    },
+                    placement,
+                    &physical
+                ),
+                Err(InvocationError::DTypeMismatch {
+                    binding: 0,
+                    expected: DType::F32,
+                    actual: DType::F16
+                })
+            );
+            assert_eq!(
+                signature.validate_binding_metadata(
+                    0,
+                    ValueSpec {
+                        logical_shape: &[3, 2],
+                        ..value
+                    },
+                    placement,
+                    &physical
+                ),
+                Err(InvocationError::ShapeMismatch { binding: 0 })
+            );
+            assert!(matches!(
+                signature.validate_binding_metadata(
+                    0,
+                    ValueSpec::dense(DType::F32, &[2, 3]),
+                    placement,
+                    &physical
+                ),
+                Err(InvocationError::InvalidStorage { .. })
+            ));
+            assert!(matches!(
+                signature.validate_binding_metadata(
+                    0,
+                    value,
+                    placement,
+                    &Layout::contiguous(vec![2, 3])
+                ),
+                Err(InvocationError::InvalidStorage { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn permissive_binding_policies_cannot_weaken_packed_canonical_layout() {
+        let storage = StorageMetadata::packed(crate::GgmlKQuant::Q4K);
+        let value = ValueSpec {
+            semantic_dtype: DType::F32,
+            logical_shape: &[2, 256],
+            storage: storage.as_spec(),
+        };
+        let canonical = Layout::contiguous(vec![2, 144]);
+        assert!(value.validate_buffer(DType::F32, &canonical, 288).is_err());
+        for policy in [
+            BindingLayoutPolicy::Require(LayoutConstraint::AnyStrided),
+            BindingLayoutPolicy::Canonicalize {
+                target: canonical.clone(),
+            },
+        ] {
+            let mut signature = dense_binding(policy);
+            signature.bindings[0].shape = vec![2, 256];
+            signature.bindings[0].storage = storage.clone();
+            let placement = &signature.bindings[0].placement;
+            signature
+                .validate_binding_metadata(0, value, placement, &canonical)
+                .unwrap();
+            for layout in [
+                Layout::new(vec![2, 144], vec![144, 1], 1),
+                Layout::new(vec![2, 144], vec![145, 1], 0),
+            ] {
+                assert!(matches!(
+                    signature.validate_binding_metadata(0, value, placement, &layout),
+                    Err(InvocationError::InvalidStorage { .. })
+                ));
+            }
+            let unconstrained = ValueSpec {
+                storage: crate::StorageSpec {
+                    layout_constraint: LayoutConstraintSpec::Unconstrained,
+                    ..value.storage
+                },
+                ..value
+            };
+            assert!(matches!(
+                signature.validate_binding_metadata(0, unconstrained, placement, &canonical),
+                Err(InvocationError::InvalidStorage { .. })
+            ));
+        }
+        let mut signature = dense_binding(BindingLayoutPolicy::Canonicalize {
+            target: Layout::new(vec![2, 144], vec![144, 1], 1),
+        });
+        signature.bindings[0].shape = vec![2, 256];
+        signature.bindings[0].storage = storage;
+        let value = signature.bindings[0].value_spec();
+        assert!(matches!(
+            signature.validate_binding_metadata(
+                0,
+                value,
+                &signature.bindings[0].placement,
+                &canonical
+            ),
+            Err(InvocationError::InvalidStorage { .. })
+        ));
+    }
+
+    #[test]
+    fn invocation_checks_packed_identity_and_logical_geometry() {
+        use crate::{GgmlKQuant, StorageMetadata};
+        #[derive(Debug)]
+        struct PackedBuffer {
+            owner: RuntimeId,
+            placement: Placement,
+            layout: Layout,
+            storage: StorageMetadata,
+        }
+        impl Buffer for PackedBuffer {
+            fn runtime_id(&self) -> RuntimeId {
+                self.owner
+            }
+            fn placement(&self) -> &Placement {
+                &self.placement
+            }
+            fn dtype(&self) -> DType {
+                DType::F32
+            }
+            fn layout(&self) -> &Layout {
+                &self.layout
+            }
+            fn value_spec(&self) -> ValueSpec<'_> {
+                ValueSpec {
+                    semantic_dtype: DType::F32,
+                    logical_shape: &[2, 256],
+                    storage: self.storage.as_spec(),
+                }
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let owner = RuntimeId::new();
+        let placement = Placement::new(DeviceId::new("cpu:0"));
+        let storage = StorageMetadata::packed(GgmlKQuant::Q4K);
+        let signature = ProgramSignature {
+            bindings: vec![BindingDecl {
+                shape: vec![2, 256],
+                dtype: DType::F32,
+                storage: storage.clone(),
+                placement: placement.clone(),
+                layout: BindingLayoutPolicy::Require(LayoutConstraint::ZeroOffsetContiguous),
+                aliasing: BindingAliasing::MayAlias,
+            }],
+            ..ProgramSignature::default()
+        };
+        let invoke = |codec: GgmlKQuant| Invocation {
+            bindings: vec![ErasedBuffer::new(PackedBuffer {
+                owner,
+                placement: placement.clone(),
+                layout: Layout::contiguous(vec![2, codec.block_bytes()]),
+                storage: StorageMetadata::packed(codec),
+            })],
+            ..Invocation::default()
+        };
+        signature
+            .validate_invocation(owner, &invoke(GgmlKQuant::Q4K))
+            .unwrap();
+        assert!(matches!(
+            signature.validate_invocation(owner, &invoke(GgmlKQuant::Q5K)),
+            Err(InvocationError::RepresentationMismatch { binding: 0, .. })
+        ));
+        let physical = Layout::contiguous(vec![2, 144]);
+        assert!(matches!(
+            signature.validate_binding_metadata(
+                0,
+                ValueSpec::dense(DType::F32, &[2, 256]),
+                &placement,
+                &physical
+            ),
+            Err(InvocationError::RepresentationMismatch { .. })
+        ));
+        assert!(matches!(
+            signature.validate_binding_metadata(
+                0,
+                ValueSpec::dense(DType::U8, &[2, 144]),
+                &placement,
+                &physical
+            ),
+            Err(InvocationError::DTypeMismatch { .. })
+        ));
+        let value = ValueSpec {
+            semantic_dtype: DType::F32,
+            logical_shape: &[2, 256],
+            storage: storage.as_spec(),
+        };
+        assert!(matches!(
+            signature.validate_binding_metadata(
+                0,
+                value,
+                &placement,
+                &Layout::contiguous(vec![2, 143])
+            ),
+            Err(InvocationError::InvalidStorage { .. })
+        ));
+        assert!(matches!(
+            signature.validate_binding_metadata(
+                0,
+                ValueSpec {
+                    logical_shape: &[1, 512],
+                    ..value
+                },
+                &placement,
+                &physical
+            ),
+            Err(InvocationError::ShapeMismatch { .. })
+        ));
+        let mut other = signature.clone();
+        other.bindings[0].storage = StorageMetadata::packed(GgmlKQuant::Q5K);
+        assert_ne!(signature, other);
     }
 }

@@ -9,28 +9,49 @@
 //! [`run_reduce_into`] write to planned destinations without allocating.
 //! They use a caller-provided scratch tensor sized by [`scratch_requirement`].
 //! The scratch holds a cache for each input lane followed by the program's
-//! value stack, all in the command's native dtype.
+//! value stack, in F32 for half/F32 storage and F64 for F64 storage.
 //!
 //! Non-contiguous lanes use explicit per-lane strides, with stride 0 for
 //! broadcasting. Contiguous inputs may omit strides and use linear reads. The
 //! runtime checks every read offset against lane storage before execution, so
-//! a mismatched plan returns an error instead of reading out of bounds. This
-//! backend supports only `f32` and `f64`.
+//! a mismatched plan returns an error instead of reading out of bounds.
+//! Half programs retain their semantic rounding points in the typed IR.
 
 use crate::value::Value;
 use crate::{CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_compiler::{Expr, ReduceOp, Scalar};
 use effect_torch_graph::Device;
 use effect_torch_runtime::DType;
+use half::{bf16, f16};
+
+trait FusionElement: Elem {
+    type Compute: Scalar + Elem;
+    fn widen(self) -> Self::Compute;
+    fn narrow(value: Self::Compute) -> Self;
+}
+
+macro_rules! fusion_element {
+    ($storage:ty, $compute:ty, $widen:expr, $narrow:expr) => {
+        impl FusionElement for $storage {
+            type Compute = $compute;
+            fn widen(self) -> Self::Compute {
+                ($widen)(self)
+            }
+            fn narrow(value: Self::Compute) -> Self {
+                ($narrow)(value)
+            }
+        }
+    };
+}
+
+fusion_element!(f32, f32, |value| value, |value| value);
+fusion_element!(f64, f64, |value| value, |value| value);
+fusion_element!(f16, f32, f16::to_f32, f16::from_f32);
+fusion_element!(bf16, f32, bf16::to_f32, bf16::from_f32);
 
 type Res<T> = Result<T, String>;
 
 pub use effect_torch_compiler::{adamw_exprs, sgd_exprs, CpuFusionProgram};
-
-/// Whether this backend can execute a fused program for `device`/`dtype`.
-pub fn is_supported(device: &Device, dtype: DType) -> bool {
-    device.is_cpu() && matches!(dtype, DType::F32 | DType::F64)
-}
 
 /// Flattens expression trees into an immutable program. A compiled CPU command
 /// must retain and reuse the returned program for every execution.
@@ -39,14 +60,18 @@ pub fn prepare(exprs: &[Expr]) -> CpuFusionProgram {
 }
 
 /// Exact evaluation scratch retained in planned CPU storage. The lane cache
-/// and value stack have the command's native dtype.
+/// and value stack use the execution dtype, independently of output storage.
 pub fn scratch_requirement(program: &CpuFusionProgram, dtype: DType) -> Res<CpuTensorRequirement> {
-    if !matches!(dtype, DType::F32 | DType::F64) {
+    if !dtype.is_float() {
         return Err(format!("fusion: unsupported dtype {dtype:?}"));
     }
     Ok(CpuTensorRequirement::new(
         &[program.scratch_elements()],
-        dtype,
+        if dtype == DType::F64 {
+            DType::F64
+        } else {
+            DType::F32
+        },
     ))
 }
 
@@ -102,7 +127,7 @@ fn validate_scratch<T: Elem>(program: &CpuFusionProgram, scratch: &CpuDestinatio
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_elementwise<T: Elem>(
+fn validate_elementwise<T: FusionElement>(
     program: &CpuFusionProgram,
     inputs: &[Value],
     strides: Option<&[Vec<usize>]>,
@@ -202,11 +227,11 @@ fn validate_elementwise<T: Elem>(
             ));
         }
     }
-    validate_scratch::<T>(program, scratch)
+    validate_scratch::<T::Compute>(program, scratch)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bridge_elementwise_into<T: Scalar + Elem>(
+fn bridge_elementwise_into<T: FusionElement>(
     program: &CpuFusionProgram,
     inputs: &[Value],
     strides: Option<&[Vec<usize>]>,
@@ -226,7 +251,7 @@ fn bridge_elementwise_into<T: Scalar + Elem>(
         destinations,
         scratch,
     )?;
-    scratch.write_current::<T, _>("fusion scratch", |scratch_values| -> Res<()> {
+    scratch.write_current::<T::Compute, _>("fusion scratch", |scratch_values| -> Res<()> {
         let (lane_values, values) = scratch_values.split_at_mut(program.input_count());
         for (output_index, destination) in destinations.iter_mut().enumerate() {
             destination.write::<T, _>("fusion", shape, |output| {
@@ -236,17 +261,19 @@ fn bridge_elementwise_into<T: Scalar + Elem>(
                             strided_offset(index, shape, &strides[lane])
                         });
                         lane_values[lane] = native_slice::<T>(inputs[lane].tensor())
-                            .expect("fusion inputs were validated")[offset];
+                            .expect("fusion inputs were validated")[offset]
+                            .widen();
                     }
-                    output[index] = program.evaluate(
+                    output[index] = T::narrow(program.evaluate(
                         output_index,
                         |lane| lane_values[lane as usize],
                         |scalar| {
                             native_slice::<T>(scalars[scalar as usize].tensor())
                                 .expect("fusion scalars were validated")[0]
+                                .widen()
                         },
                         values,
-                    );
+                    ));
                 }
             })?;
         }
@@ -285,6 +312,26 @@ pub fn run_elementwise_multi_into(
             scratch,
         ),
         DType::F64 => bridge_elementwise_into::<f64>(
+            program,
+            inputs,
+            strides,
+            scalars,
+            n,
+            shape,
+            destinations,
+            scratch,
+        ),
+        DType::F16 => bridge_elementwise_into::<f16>(
+            program,
+            inputs,
+            strides,
+            scalars,
+            n,
+            shape,
+            destinations,
+            scratch,
+        ),
+        DType::BF16 => bridge_elementwise_into::<bf16>(
             program,
             inputs,
             strides,
@@ -347,11 +394,11 @@ fn run(
     let program = prepare(exprs);
     let prepared_inputs = inputs
         .iter()
-        .map(|value| Value(value.tensor().contiguous()))
+        .map(|value| Value::dense(value.tensor().contiguous()))
         .collect::<Vec<_>>();
     let prepared_scalars = scalars
         .iter()
-        .map(|value| Value(value.tensor().contiguous()))
+        .map(|value| Value::dense(value.tensor().contiguous()))
         .collect::<Vec<_>>();
     let mut outputs = exprs
         .iter()
@@ -377,7 +424,7 @@ fn run(
             &mut scratch.destination()?,
         )?;
     }
-    Ok(outputs.into_iter().map(Value).collect())
+    Ok(outputs.into_iter().map(Value::dense).collect())
 }
 
 fn validate_reduce_shape(
@@ -434,33 +481,6 @@ fn validate_reduce_shape(
     Ok(())
 }
 
-fn reduce_output_offset(
-    index: usize,
-    in_shape: &[usize],
-    dims: &[usize],
-    keepdims: bool,
-    out_shape: &[usize],
-) -> usize {
-    let mut remainder = index;
-    let mut output_dimension = out_shape.len();
-    let mut output_stride = 1usize;
-    let mut output_offset = 0usize;
-    for dimension in (0..in_shape.len()).rev() {
-        let width = in_shape[dimension].max(1);
-        let coordinate = remainder % width;
-        remainder /= width;
-        if !dims.contains(&dimension) {
-            output_dimension -= 1;
-            output_offset += coordinate * output_stride;
-            output_stride *= out_shape[output_dimension];
-        } else if keepdims {
-            output_dimension -= 1;
-            output_stride *= out_shape[output_dimension];
-        }
-    }
-    output_offset
-}
-
 fn reduce_init<T: Scalar>(op: ReduceOp) -> T {
     T::from_f64(match op {
         ReduceOp::Sum | ReduceOp::Mean => 0.0,
@@ -480,7 +500,7 @@ fn reduce_fold<T: Scalar>(op: ReduceOp, accumulator: T, value: T) -> T {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_reduce<T: Elem>(
+fn validate_reduce<T: FusionElement>(
     program: &CpuFusionProgram,
     inputs: &[Value],
     strides: &[Vec<usize>],
@@ -549,11 +569,11 @@ fn validate_reduce<T: Elem>(
             destination.shape()
         ));
     }
-    validate_scratch::<T>(program, scratch)
+    validate_scratch::<T::Compute>(program, scratch)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bridge_reduce_into<T: Scalar + Elem>(
+fn bridge_reduce_into<T: FusionElement>(
     op: ReduceOp,
     program: &CpuFusionProgram,
     inputs: &[Value],
@@ -576,34 +596,57 @@ fn bridge_reduce_into<T: Scalar + Elem>(
         destination,
         scratch,
     )?;
-    let input_elements = checked_numel(in_shape, "fusion reduce")?;
-    scratch.write_current::<T, _>("fusion scratch", |scratch_values| -> Res<()> {
+    let extent = dims
+        .iter()
+        .try_fold(1usize, |total, &dimension| {
+            total.checked_mul(in_shape[dimension])
+        })
+        .ok_or_else(|| "fusion reduce extent overflow".to_string())?;
+    scratch.write_current::<T::Compute, _>("fusion scratch", |scratch_values| -> Res<()> {
         let (lane_values, values) = scratch_values.split_at_mut(program.input_count());
         destination.write::<T, _>("fusion reduce", out_shape, |output| {
-            output.fill(reduce_init::<T>(op));
-            for index in 0..input_elements {
-                for lane in 0..program.input_count() {
-                    let offset = strided_offset(index, in_shape, &strides[lane]);
-                    lane_values[lane] = native_slice::<T>(inputs[lane].tensor())
-                        .expect("fusion reduce inputs were validated")[offset];
+            // Reduce one output at a time so half storage never becomes an accumulator.
+            // The dimension traversal matches the independent reduction kernel.
+            for (output_index, result) in output.iter_mut().enumerate() {
+                let mut remainder = output_index;
+                let mut base = 0usize;
+                let mut stride = 1usize;
+                for dimension in (0..in_shape.len()).rev() {
+                    if !dims.contains(&dimension) {
+                        let width = in_shape[dimension].max(1);
+                        base += (remainder % width) * stride;
+                        remainder /= width;
+                    }
+                    stride *= in_shape[dimension];
                 }
-                let value = program.evaluate(
-                    0,
-                    |lane| lane_values[lane as usize],
-                    |_| unreachable!("fused reduce scalar lane"),
-                    values,
-                );
-                let output_index = reduce_output_offset(index, in_shape, dims, keepdims, out_shape);
-                output[output_index] = reduce_fold(op, output[output_index], value);
-            }
-            if op == ReduceOp::Mean {
-                let extent = dims
-                    .iter()
-                    .fold(1usize, |total, &dimension| total * in_shape[dimension]);
-                let extent = <T as Scalar>::from_f64(extent as f64);
-                for value in output {
-                    *value = value.div(extent);
+                let mut accumulator = reduce_init::<T::Compute>(op);
+                for reduced in 0..extent {
+                    let mut index = base;
+                    let mut remainder = reduced;
+                    for &dimension in dims.iter().rev() {
+                        let width = in_shape[dimension].max(1);
+                        let stride: usize = in_shape[dimension + 1..].iter().product();
+                        index += (remainder % width) * stride;
+                        remainder /= width;
+                    }
+                    for lane in 0..program.input_count() {
+                        let offset = strided_offset(index, in_shape, &strides[lane]);
+                        lane_values[lane] = native_slice::<T>(inputs[lane].tensor())
+                            .expect("fusion reduce inputs were validated")[offset]
+                            .widen();
+                    }
+                    let value = program.evaluate(
+                        0,
+                        |lane| lane_values[lane as usize],
+                        |_| unreachable!("fused reduce scalar lane"),
+                        values,
+                    );
+                    accumulator = reduce_fold(op, accumulator, value);
                 }
+                if op == ReduceOp::Mean {
+                    accumulator = accumulator.div(<T::Compute as Scalar>::from_f64(extent as f64));
+                }
+                *result = T::narrow(accumulator);
             }
         })?;
         Ok(())
@@ -657,6 +700,30 @@ pub fn run_reduce_into(
             destination,
             scratch,
         ),
+        DType::F16 => bridge_reduce_into::<f16>(
+            op,
+            program,
+            inputs,
+            strides,
+            in_shape,
+            dims,
+            keepdims,
+            out_shape,
+            destination,
+            scratch,
+        ),
+        DType::BF16 => bridge_reduce_into::<bf16>(
+            op,
+            program,
+            inputs,
+            strides,
+            in_shape,
+            dims,
+            keepdims,
+            out_shape,
+            destination,
+            scratch,
+        ),
         _ => Err(format!("fusion: unsupported dtype {dtype:?}")),
     }
 }
@@ -678,7 +745,7 @@ fn run_reduce(
     let program = prepare(std::slice::from_ref(expr));
     let prepared_inputs = inputs
         .iter()
-        .map(|value| Value(value.tensor().contiguous()))
+        .map(|value| Value::dense(value.tensor().contiguous()))
         .collect::<Vec<_>>();
     let mut output = Tensor::empty(out_shape, dtype);
     let requirement = scratch_requirement(&program, dtype)?;
@@ -697,7 +764,7 @@ fn run_reduce(
         &mut output.destination()?,
         &mut scratch.destination()?,
     )?;
-    Ok(Value(output))
+    Ok(Value::dense(output))
 }
 
 #[cfg(test)]
@@ -811,12 +878,12 @@ mod tests {
 
     #[test]
     fn planned_multi_output_into_is_allocation_free_and_matches_wrapper() {
-        let a = Value(Tensor::from_vec(
+        let a = Value::dense(Tensor::from_vec(
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
             vec![2, 3],
         ));
-        let b = Value(Tensor::from_vec(vec![10.0f32, 20.0, 30.0], vec![1, 3]));
-        let scalar = Value(Tensor::from_vec(vec![0.5f32], vec![]));
+        let b = Value::dense(Tensor::from_vec(vec![10.0f32, 20.0, 30.0], vec![1, 3]));
+        let scalar = Value::dense(Tensor::from_vec(vec![0.5f32], vec![]));
         let exprs = [
             Expr::Add(Box::new(Expr::Input(0)), Box::new(Expr::Input(1))),
             Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Scalar(0))),
@@ -871,7 +938,7 @@ mod tests {
 
     #[test]
     fn single_output_into_matches_multi_output_path() {
-        let input = Value(Tensor::from_vec(vec![1.0f32, -2.0, 3.0], vec![3]));
+        let input = Value::dense(Tensor::from_vec(vec![1.0f32, -2.0, 3.0], vec![3]));
         let program = prepare(&[Expr::Neg(Box::new(Expr::Input(0)))]);
         let requirement = scratch_requirement(&program, DType::F32).unwrap();
         let mut output = Tensor::empty(&[3], DType::F32);
@@ -898,7 +965,7 @@ mod tests {
 
     #[test]
     fn planned_reduce_into_is_allocation_free_and_matches_wrapper() {
-        let input = Value(Tensor::from_vec(
+        let input = Value::dense(Tensor::from_vec(
             vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0],
             vec![2, 3],
         ));

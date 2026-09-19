@@ -31,9 +31,10 @@
 
 use crate::schedule::{DenseNodeId, GraphIndex};
 use crate::{
-    adamw_exprs, broadcast_compatible, is_fusion_supported, lane_strides, pow_expr, sgd_exprs,
-    CompileOptions, KernelExpr, ReduceOp,
+    adamw_exprs, broadcast_compatible, lane_strides, pow_expr, sgd_exprs, CompileOptions,
+    KernelExpr, ReduceOp,
 };
+use crate::{DTypeDisposition, ExecutableDTypePlan, RegionDTypeSpec, TargetDTypeCapabilities};
 use effect_torch_graph::{Device, Node, NodeKind};
 use effect_torch_runtime::{DType, DenseId};
 use std::cmp::Reverse;
@@ -124,6 +125,8 @@ pub struct OptimizationWork {
     pub semantic_nodes_scanned: usize,
     pub semantic_nodes_rebuilt: usize,
     pub fusion_candidates: usize,
+    pub capability_queries: usize,
+    pub rejected_region_candidates: usize,
     pub multi_output_work_items: usize,
     pub multi_output_dependency_edges: usize,
     pub multi_output_dependency_passes: usize,
@@ -453,6 +456,7 @@ fn optimizer_semantic_outputs(outputs: &[OptimizerOutput]) -> Vec<SemanticOutput
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptimizationPlan<R = NativeRegion> {
     pub regions: Box<[R]>,
+    pub(crate) region_dtype_plans: Box<[ExecutableDTypePlan]>,
     pub node_region: Box<[Option<RegionId>]>,
     pub outputs: Box<[Option<RegionOutput>]>,
     pub lowering_order: Box<[LoweringUnit]>,
@@ -461,13 +465,20 @@ pub struct OptimizationPlan<R = NativeRegion> {
 
 impl OptimizationPlan<NativeRegion> {
     /// Selects native regions for one indexed graph under the given options.
-    pub fn select(index: &GraphIndex, options: &CompileOptions) -> Result<Self, String> {
-        build_optimization_plan(index, options)
+    pub fn select<C: TargetDTypeCapabilities>(
+        index: &GraphIndex,
+        options: &CompileOptions,
+        target: &C,
+    ) -> Result<Self, String> {
+        build_optimization_plan(index, options, target)
     }
 
     /// Selects regions from a prepared program's shared index and options.
-    pub fn from_prepared(program: &crate::PreparedProgram) -> Result<Self, String> {
-        build_optimization_plan(&program.index, &program.options)
+    pub fn from_prepared<C: TargetDTypeCapabilities>(
+        program: &crate::PreparedProgram,
+        target: &C,
+    ) -> Result<Self, String> {
+        build_optimization_plan(&program.index, &program.options, target)
     }
 
     /// Resolves a semantic value to an independent lowering or region output.
@@ -494,6 +505,11 @@ impl OptimizationPlan<NativeRegion> {
     /// returns. This method also catches invalid hand-built or mutated plans.
     pub fn validate(&self, index: &GraphIndex) -> Result<(), String> {
         let node_count = index.order.len();
+        if self.region_dtype_plans.len() != self.regions.len() {
+            return Err(
+                "optimization: every selected region must retain one execution plan".into(),
+            );
+        }
         if self.node_region.len() != node_count || self.outputs.len() != node_count {
             return Err("optimization: plan tables do not match the graph index".to_string());
         }
@@ -583,30 +599,34 @@ impl OptimizationPlan<NativeRegion> {
 }
 
 /// Selects optimization regions for an indexed graph.
-pub fn select_optimization_regions(
+pub fn select_optimization_regions<C: TargetDTypeCapabilities>(
     index: &GraphIndex,
     options: &CompileOptions,
+    target: &C,
 ) -> Result<OptimizationPlan, String> {
-    build_optimization_plan(index, options)
+    build_optimization_plan(index, options, target)
 }
 
 /// Selects optimization regions for a prepared program.
-pub fn optimize_prepared_program(
+pub fn optimize_prepared_program<C: TargetDTypeCapabilities>(
     program: &crate::PreparedProgram,
+    target: &C,
 ) -> Result<OptimizationPlan, String> {
-    OptimizationPlan::from_prepared(program)
+    OptimizationPlan::from_prepared(program, target)
 }
 
 /// Runs the selection pipeline described in the module documentation. With
 /// `optimize` disabled, returns an empty region set and a lowering order of
 /// independent nodes only. Every path ends in plan validation.
-pub fn build_optimization_plan(
+pub fn build_optimization_plan<C: TargetDTypeCapabilities>(
     index: &GraphIndex,
     options: &CompileOptions,
+    target: &C,
 ) -> Result<OptimizationPlan, String> {
     if !options.optimize {
         let mut plan = OptimizationPlan {
             regions: Vec::new().into_boxed_slice(),
+            region_dtype_plans: Box::new([]),
             node_region: vec![None; index.order.len()].into_boxed_slice(),
             outputs: vec![None; index.order.len()].into_boxed_slice(),
             lowering_order: index
@@ -631,7 +651,7 @@ pub fn build_optimization_plan(
         return Ok(plan);
     }
 
-    let mut selector = RegionSelector::new(index, options);
+    let mut selector = RegionSelector::new(index, options, target);
     if options.environment.fusion && options.environment.gemm_epilogues {
         selector.select_gemm_epilogues();
     }
@@ -649,23 +669,26 @@ pub fn build_optimization_plan(
 /// without removing it, so each subsequent pass checks `active`.
 struct DraftRegion {
     region: NativeRegion,
+    disposition: ExecutableDTypePlan,
     active: bool,
 }
 
 /// Mutable selection state for one graph. `reserved` marks nodes claimed by a
 /// committed region. Later passes must skip them. `roots` marks values that
 /// must materialize. `drafts` stores candidates in creation order.
-struct RegionSelector<'a> {
+struct RegionSelector<'a, C> {
     index: &'a GraphIndex,
     options: &'a CompileOptions,
+    target: &'a C,
+    error: Option<String>,
     roots: Vec<bool>,
     reserved: Vec<bool>,
     drafts: Vec<DraftRegion>,
     work: OptimizationWork,
 }
 
-impl<'a> RegionSelector<'a> {
-    fn new(index: &'a GraphIndex, options: &'a CompileOptions) -> Self {
+impl<'a, C: TargetDTypeCapabilities> RegionSelector<'a, C> {
+    fn new(index: &'a GraphIndex, options: &'a CompileOptions, target: &'a C) -> Self {
         let mut roots = vec![false; index.order.len()];
         for root in index.roots.iter() {
             roots[root.index()] = true;
@@ -673,6 +696,8 @@ impl<'a> RegionSelector<'a> {
         Self {
             index,
             options,
+            target,
+            error: None,
             roots,
             reserved: vec![false; index.order.len()],
             drafts: Vec::new(),
@@ -690,14 +715,43 @@ impl<'a> RegionSelector<'a> {
             .expect("every semantic child is present in GraphIndex")
     }
 
-    fn add_region(&mut self, region: NativeRegion) -> usize {
+    fn classify_region(&mut self, region: &NativeRegion) -> Option<ExecutableDTypePlan> {
         self.work.fusion_candidates += 1;
+        self.work.capability_queries += 1;
+        let result = RegionDTypeSpec::new(self.index, region).and_then(|spec| {
+            match self.target.classify_region(&spec) {
+                DTypeDisposition::Unsupported(_) => Ok(None),
+                disposition => {
+                    crate::legalization::validate_disposition(&spec.operations, disposition)
+                        .map(Some)
+                }
+            }
+        });
+        match result {
+            Ok(Some(plan)) => Some(plan),
+            Ok(None) => {
+                self.work.rejected_region_candidates += 1;
+                None
+            }
+            Err(error) => {
+                self.error.get_or_insert(error);
+                None
+            }
+        }
+    }
+
+    fn add_region(&mut self, region: NativeRegion) -> Option<usize> {
+        let disposition = self.classify_region(&region)?;
+        for node in region.nodes() {
+            self.reserved[node.index()] = true;
+        }
         let draft = self.drafts.len();
         self.drafts.push(DraftRegion {
             region,
+            disposition,
             active: true,
         });
-        draft
+        Some(draft)
     }
 
     fn select_gemm_epilogues(&mut self) {
@@ -738,12 +792,10 @@ impl<'a> RegionSelector<'a> {
                         let mut nodes = vec![dense];
                         if !self.roots[linear.index()] {
                             nodes.push(linear);
-                            self.reserved[linear.index()] = true;
                         }
                         nodes.sort_unstable();
                         let mut inputs = linear_inputs.to_vec();
                         inputs.push(residual);
-                        self.reserved[dense_index] = true;
                         self.add_region(NativeRegion::LinearResidual(LinearResidualRegion {
                             nodes: nodes.into_boxed_slice(),
                             inputs: inputs.into_boxed_slice(),
@@ -764,8 +816,6 @@ impl<'a> RegionSelector<'a> {
                     };
                     let dual = self.index.consumers[linear.index()].len() != 1
                         || self.roots[linear.index()];
-                    self.reserved[linear.index()] = true;
-                    self.reserved[dense_index] = true;
                     self.add_region(NativeRegion::LinearGelu(LinearGeluRegion {
                         nodes: vec![linear, dense].into_boxed_slice(),
                         inputs: inputs.to_vec().into_boxed_slice(),
@@ -785,7 +835,7 @@ impl<'a> RegionSelector<'a> {
 
     fn absorbable_linear(&self, dense: DenseNodeId) -> Option<[DenseNodeId; 3]> {
         let node = &self.index.order[dense.index()];
-        if !node.device.is_metal() || !matches!(node.dtype, DType::F32 | DType::BF16) {
+        if !node.device.is_metal() {
             return None;
         }
         match &node.kind {
@@ -803,7 +853,7 @@ impl<'a> RegionSelector<'a> {
         for (dense_index, node) in self.index.order.iter().enumerate() {
             let dense = DenseNodeId::from_index(dense_index)
                 .expect("GraphIndex validated the semantic node count");
-            if self.reserved[dense_index] || !is_fusion_supported(&node.device, node.dtype) {
+            if self.reserved[dense_index] {
                 continue;
             }
             match &node.kind {
@@ -859,7 +909,7 @@ impl<'a> RegionSelector<'a> {
                     if chunk.len() >= 2 {
                         self.select_adamw_group(chunk);
                         for step in chunk {
-                            grouped[step.index()] = true;
+                            grouped[step.index()] = self.reserved[step.index()];
                         }
                     }
                 }
@@ -941,9 +991,6 @@ impl<'a> RegionSelector<'a> {
         let scalar_inputs: [DenseNodeId; 3] = children[4..7].try_into().unwrap();
         let options = self.adamw_options(step);
         let (nodes, outputs) = self.optimizer_routes(step, 0);
-        for node in &nodes {
-            self.reserved[node.index()] = true;
-        }
         self.add_region(NativeRegion::AdamW(AdamWRegion {
             nodes: nodes.into_boxed_slice(),
             inputs: children.to_vec().into_boxed_slice(),
@@ -999,9 +1046,6 @@ impl<'a> RegionSelector<'a> {
         inputs.extend(scalar_inputs);
         nodes.sort_unstable();
         nodes.dedup();
-        for node in &nodes {
-            self.reserved[node.index()] = true;
-        }
         self.add_region(NativeRegion::AdamWGroup(AdamWGroupRegion {
             nodes: nodes.into_boxed_slice(),
             inputs: inputs.into_boxed_slice(),
@@ -1041,9 +1085,6 @@ impl<'a> RegionSelector<'a> {
         }
         nodes.sort_unstable();
         nodes.dedup();
-        for node in &nodes {
-            self.reserved[node.index()] = true;
-        }
         let outputs = [
             OptimizerOutput {
                 index: 0,
@@ -1138,7 +1179,8 @@ impl<'a> RegionSelector<'a> {
                             (region, operation.apply(lane))
                         }
                     };
-                    region.expression = expression;
+                    region.expression =
+                        expression.semantic(dense, self.index.order[dense_index].dtype);
                     region.ops += 1;
                     region.nodes.push(dense);
                     open[dense_index] = Some(region);
@@ -1180,7 +1222,13 @@ impl<'a> RegionSelector<'a> {
                             let right_expression = left.absorb(right);
                             let left_expression =
                                 std::mem::replace(&mut left.expression, KernelExpr::cst(0.0));
-                            (left, operation.apply(left_expression, right_expression))
+                            (
+                                left,
+                                operation.apply(
+                                    self.semantic_operand(left_expression, dense, 0),
+                                    self.semantic_operand(right_expression, dense, 1),
+                                ),
+                            )
                         }
                         (Some(mut region), None) => {
                             let right = self.element_operand(
@@ -1190,7 +1238,13 @@ impl<'a> RegionSelector<'a> {
                             );
                             let left =
                                 std::mem::replace(&mut region.expression, KernelExpr::cst(0.0));
-                            (region, operation.apply(left, right))
+                            (
+                                region,
+                                operation.apply(
+                                    self.semantic_operand(left, dense, 0),
+                                    self.semantic_operand(right, dense, 1),
+                                ),
+                            )
                         }
                         (None, Some(mut region)) => {
                             let left = self.element_operand(
@@ -1200,7 +1254,13 @@ impl<'a> RegionSelector<'a> {
                             );
                             let right =
                                 std::mem::replace(&mut region.expression, KernelExpr::cst(0.0));
-                            (region, operation.apply(left, right))
+                            (
+                                region,
+                                operation.apply(
+                                    self.semantic_operand(left, dense, 0),
+                                    self.semantic_operand(right, dense, 1),
+                                ),
+                            )
                         }
                         (None, None) => {
                             let mut region = OpenRegion::empty();
@@ -1214,10 +1274,17 @@ impl<'a> RegionSelector<'a> {
                                 b,
                                 &self.index.order[dense_index].shape,
                             );
-                            (region, operation.apply(left, right))
+                            (
+                                region,
+                                operation.apply(
+                                    self.semantic_operand(left, dense, 0),
+                                    self.semantic_operand(right, dense, 1),
+                                ),
+                            )
                         }
                     };
-                    region.expression = expression;
+                    region.expression =
+                        expression.semantic(dense, self.index.order[dense_index].dtype);
                     region.ops += 1;
                     region.nodes.push(dense);
                     open[dense_index] = Some(region);
@@ -1246,7 +1313,10 @@ impl<'a> RegionSelector<'a> {
                         } else if let Some(value) =
                             self.const_value(child, &self.index.order[dense_index].shape)
                         {
-                            expressions.push(KernelExpr::cst(value));
+                            expressions.push(KernelExpr::typed_constant(
+                                value,
+                                self.index.order[child.index()].dtype,
+                            ));
                         } else if region.inputs.len() >= MAX_LANES
                             && !region.lane_of.contains_key(&child)
                         {
@@ -1259,12 +1329,17 @@ impl<'a> RegionSelector<'a> {
                     if !abandon {
                         let mut expressions = expressions.into_iter();
                         let condition = comparison
-                            .apply(expressions.next().unwrap(), expressions.next().unwrap());
+                            .apply(
+                                self.semantic_operand(expressions.next().unwrap(), cond, 0),
+                                self.semantic_operand(expressions.next().unwrap(), cond, 1),
+                            )
+                            .semantic(cond, self.index.order[cond.index()].dtype);
                         region.expression = KernelExpr::Select(
                             Box::new(condition),
                             Box::new(expressions.next().unwrap()),
                             Box::new(expressions.next().unwrap()),
-                        );
+                        )
+                        .semantic(dense, self.index.order[dense_index].dtype);
                         region.ops += 1;
                         if self.index.consumers[cond.index()].len() == 1
                             && !self.roots[cond.index()]
@@ -1284,10 +1359,7 @@ impl<'a> RegionSelector<'a> {
                     let output_shape = reduced_shape(&input_shape, &dims, keepdims);
                     let guards_ok = !dims.is_empty()
                         && dims.iter().all(|&dim| dim < rank)
-                        && dims.iter().map(|&dim| input_shape[dim]).product::<usize>() > 0
-                        && !(self.index.order[dense_index].device.is_metal()
-                            && (input_shape.iter().product::<usize>() > i32::MAX as usize
-                                || output_shape.iter().product::<usize>() > i32::MAX as usize));
+                        && dims.iter().map(|&dim| input_shape[dim]).product::<usize>() > 0;
                     if let Some(mut region) = open[input.index()].take() {
                         if guards_ok && !region.inputs.is_empty() {
                             let strides = region
@@ -1342,6 +1414,18 @@ impl<'a> RegionSelector<'a> {
         Ok(())
     }
 
+    fn semantic_operand(
+        &self,
+        expression: KernelExpr,
+        node: DenseNodeId,
+        operand: usize,
+    ) -> KernelExpr {
+        match crate::scalar_coercion(&self.index.order[node.index()].kind, operand) {
+            Some(conversion) => KernelExpr::Cast(Box::new(expression), conversion.destination),
+            None => expression,
+        }
+    }
+
     fn element_operand(
         &self,
         region: &mut OpenRegion,
@@ -1349,7 +1433,7 @@ impl<'a> RegionSelector<'a> {
         output_shape: &[usize],
     ) -> KernelExpr {
         self.const_value(child, output_shape)
-            .map(KernelExpr::cst)
+            .map(|value| KernelExpr::typed_constant(value, self.index.order[child.index()].dtype))
             .unwrap_or_else(|| region.lane(child))
     }
 
@@ -1368,9 +1452,6 @@ impl<'a> RegionSelector<'a> {
             return None;
         }
         let node = &self.index.order[dense.index()];
-        if !is_fusion_supported(&node.device, node.dtype) {
-            return None;
-        }
         let input_ok =
             |child: &std::sync::Arc<Node>| broadcast_compatible(&child.shape, &node.shape);
         match &node.kind {
@@ -1410,8 +1491,8 @@ impl<'a> RegionSelector<'a> {
             NodeKind::Round { .. } => Some(ElementOperation::Unary(UnaryOperation::Round)),
             NodeKind::Pow { exp, .. } => Some(ElementOperation::Unary(UnaryOperation::Pow(*exp))),
             NodeKind::Sign { .. } => Some(ElementOperation::Unary(UnaryOperation::Sign)),
-            NodeKind::Cast { a, dtype } if a.dtype == *dtype => {
-                Some(ElementOperation::Unary(UnaryOperation::Identity))
+            NodeKind::Cast { a, dtype } if a.dtype.is_float() && dtype.is_float() => {
+                Some(ElementOperation::Unary(UnaryOperation::Cast(*dtype)))
             }
             NodeKind::Where { cond, a, b }
                 if self.index.consumers[self.dense(cond).index()].len() == 1
@@ -1419,39 +1500,19 @@ impl<'a> RegionSelector<'a> {
                     && input_ok(b) =>
             {
                 let comparison = match &cond.kind {
-                    NodeKind::Eq { a, b }
-                        if input_ok(a)
-                            && input_ok(b)
-                            && is_fusion_supported(&a.device, a.dtype) =>
-                    {
+                    NodeKind::Eq { a, b } if input_ok(a) && input_ok(b) => {
                         Some(ComparisonOperation::Eq)
                     }
-                    NodeKind::Gt { a, b }
-                        if input_ok(a)
-                            && input_ok(b)
-                            && is_fusion_supported(&a.device, a.dtype) =>
-                    {
+                    NodeKind::Gt { a, b } if input_ok(a) && input_ok(b) => {
                         Some(ComparisonOperation::Gt)
                     }
-                    NodeKind::Lt { a, b }
-                        if input_ok(a)
-                            && input_ok(b)
-                            && is_fusion_supported(&a.device, a.dtype) =>
-                    {
+                    NodeKind::Lt { a, b } if input_ok(a) && input_ok(b) => {
                         Some(ComparisonOperation::Lt)
                     }
-                    NodeKind::Ge { a, b }
-                        if input_ok(a)
-                            && input_ok(b)
-                            && is_fusion_supported(&a.device, a.dtype) =>
-                    {
+                    NodeKind::Ge { a, b } if input_ok(a) && input_ok(b) => {
                         Some(ComparisonOperation::Ge)
                     }
-                    NodeKind::Le { a, b }
-                        if input_ok(a)
-                            && input_ok(b)
-                            && is_fusion_supported(&a.device, a.dtype) =>
-                    {
+                    NodeKind::Le { a, b } if input_ok(a) && input_ok(b) => {
                         Some(ComparisonOperation::Le)
                     }
                     _ => None,
@@ -1484,7 +1545,6 @@ impl<'a> RegionSelector<'a> {
         mut region: OpenRegion,
     ) -> Result<(), String> {
         let node = &self.index.order[endpoint.index()];
-        let element_count = node.shape.iter().product::<usize>();
         let strides = region
             .inputs
             .iter()
@@ -1493,10 +1553,7 @@ impl<'a> RegionSelector<'a> {
                     .map(Vec::into_boxed_slice)
             })
             .collect::<Option<Vec<_>>>();
-        if region.ops >= 2
-            && !region.inputs.is_empty()
-            && !(node.device.is_metal() && element_count > i32::MAX as usize)
-        {
+        if region.ops >= 2 && !region.inputs.is_empty() {
             if let Some(strides) = strides {
                 normalize_nodes(&mut region.nodes);
                 self.add_region(NativeRegion::Elementwise(ElementwiseRegion {
@@ -1642,6 +1699,10 @@ impl<'a> RegionSelector<'a> {
                 if let Some(region) =
                     self.merge_multi_region(prefix, &group, &shape, keep_prefix, split)
                 {
+                    let candidate = NativeRegion::MultiOutput(region);
+                    let Some(disposition) = self.classify_region(&candidate) else {
+                        continue;
+                    };
                     if self.options.environment.fusion_debug {
                         eprintln!(
                             "[fusion] multi-merge: prefix {prefix_output} -> {} continuations (keep {keep_prefix}, split {split})",
@@ -1651,12 +1712,14 @@ impl<'a> RegionSelector<'a> {
                     let selected = if split {
                         let selected = self.drafts.len();
                         self.drafts.push(DraftRegion {
-                            region: NativeRegion::MultiOutput(region),
+                            region: candidate,
+                            disposition,
                             active: true,
                         });
                         selected
                     } else {
-                        self.drafts[prefix].region = NativeRegion::MultiOutput(region);
+                        self.drafts[prefix].region = candidate;
+                        self.drafts[prefix].disposition = disposition;
                         prefix
                     };
                     for &merged in &group {
@@ -1797,11 +1860,6 @@ impl<'a> RegionSelector<'a> {
         if inputs.len() + outputs.len() > MAX_BUFFERS || total_ops > MAX_MERGED_OPS {
             return None;
         }
-        if prefix_region.device.is_metal()
-            && output_shape.iter().product::<usize>() > i32::MAX as usize
-        {
-            return None;
-        }
         normalize_nodes(&mut nodes);
         Some(MultiOutputRegion {
             nodes: nodes.into_boxed_slice(),
@@ -1818,21 +1876,27 @@ impl<'a> RegionSelector<'a> {
     /// building ownership and routing tables, and computing the lowering order.
     /// It rejects overlap and duplicate routing, then validates the plan.
     fn finish(mut self) -> Result<OptimizationPlan, String> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
         let mut active = self
             .drafts
             .into_iter()
             .enumerate()
             .filter_map(|(draft, region)| {
-                region
-                    .active
-                    .then_some((region.region.ordering_key(), draft, region.region))
+                region.active.then_some((
+                    region.region.ordering_key(),
+                    draft,
+                    region.region,
+                    region.disposition,
+                ))
             })
             .collect::<Vec<_>>();
-        active.sort_by_key(|(key, draft, _)| (*key, *draft));
-        let regions = active
+        active.sort_by_key(|(key, draft, _, _)| (*key, *draft));
+        let (regions, region_dtype_plans): (Vec<_>, Vec<_>) = active
             .into_iter()
-            .map(|(_, _, region)| region)
-            .collect::<Vec<_>>();
+            .map(|(_, _, region, disposition)| (region, disposition))
+            .unzip();
         let mut node_region = vec![None; self.index.order.len()];
         let mut outputs = vec![None; self.index.order.len()];
         for (region_index, region) in regions.iter().enumerate() {
@@ -1864,6 +1928,7 @@ impl<'a> RegionSelector<'a> {
         self.work.selected_regions = regions.len();
         let mut plan = OptimizationPlan {
             regions: regions.into_boxed_slice(),
+            region_dtype_plans: region_dtype_plans.into_boxed_slice(),
             node_region: node_region.into_boxed_slice(),
             outputs: outputs.into_boxed_slice(),
             lowering_order: Vec::new().into_boxed_slice(),
@@ -2083,7 +2148,7 @@ enum UnaryOperation {
     Round,
     Pow(f64),
     Sign,
-    Identity,
+    Cast(DType),
 }
 
 impl UnaryOperation {
@@ -2120,7 +2185,7 @@ impl UnaryOperation {
                     Box::new(KernelExpr::cst(0.0)),
                 )),
             ),
-            Self::Identity => input,
+            Self::Cast(dtype) => KernelExpr::Cast(Box::new(input), dtype),
         }
     }
 }
@@ -2336,6 +2401,7 @@ mod tests {
 
     fn input(slot: u32, shape: &[usize], dtype: DType, device: Device) -> Arc<Node> {
         Node::new(NodeKind::Input {
+            storage: effect_torch_runtime::StorageMetadata::dense(),
             slot,
             shape: shape.to_vec(),
             dtype,
@@ -2394,7 +2460,12 @@ mod tests {
             .map(|node| (node.id, Arc::as_ptr(node) as usize))
             .collect::<Vec<_>>();
 
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
 
         assert_eq!(plan.regions.len(), 1);
         let NativeRegion::Elementwise(region) = &plan.regions[0] else {
@@ -2425,7 +2496,12 @@ mod tests {
             optimize: false,
             ..CompileOptions::default()
         };
-        let plan = build_optimization_plan(&index, &options).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &options,
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         assert!(plan.regions.is_empty());
         assert!(plan.node_region.iter().all(Option::is_none));
         assert!(plan.outputs.iter().all(Option::is_none));
@@ -2446,7 +2522,12 @@ mod tests {
         let neg = Node::new(NodeKind::Neg { a: x }).unwrap();
         let root = Node::new(NodeKind::Tanh { a: neg }).unwrap();
         let index = GraphIndex::new(&[root.clone(), root.clone()]).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         let route = plan.outputs[dense(&index, &root).index()].unwrap();
         assert_eq!(route.index, 0);
         assert_eq!(index.roots[0], index.roots[1]);
@@ -2465,7 +2546,12 @@ mod tests {
         })
         .unwrap();
         let index = GraphIndex::new(std::slice::from_ref(&root)).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         let NativeRegion::ElementwiseReduce(region) = &plan.regions[0] else {
             panic!("expected a fused reduction")
         };
@@ -2504,14 +2590,25 @@ mod tests {
         .unwrap();
         let root = Node::new(NodeKind::Tanh { a: selected }).unwrap();
         let index = GraphIndex::new(std::slice::from_ref(&root)).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         let NativeRegion::Elementwise(region) = &plan.regions[0] else {
             panic!("expected an elementwise select region")
         };
-        let KernelExpr::Tanh(expression) = &region.output.expression else {
+        let KernelExpr::Semantic(continuation, _, _) = &region.output.expression else {
+            panic!("expected the continuation semantic boundary")
+        };
+        let KernelExpr::Tanh(expression) = continuation.as_ref() else {
             panic!("expected the continuation after select")
         };
-        assert!(matches!(expression.as_ref(), KernelExpr::Select(..)));
+        let KernelExpr::Semantic(selected, _, _) = expression.as_ref() else {
+            panic!("expected the select semantic boundary")
+        };
+        assert!(matches!(selected.as_ref(), KernelExpr::Select(..)));
         assert!(region.nodes.contains(&dense(&index, &condition)));
         assert_eq!(
             region.inputs.as_ref(),
@@ -2532,7 +2629,12 @@ mod tests {
         })
         .unwrap();
         let index = GraphIndex::new(std::slice::from_ref(&root)).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         let NativeRegion::LinearResidual(region) = &plan.regions[0] else {
             panic!("expected a linear residual region")
         };
@@ -2559,7 +2661,12 @@ mod tests {
         .unwrap();
         let other = Node::new(NodeKind::Neg { a: linear.clone() }).unwrap();
         let index = GraphIndex::new(&[gelu.clone(), other]).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         let NativeRegion::LinearGelu(region) = &plan.regions[0] else {
             panic!("expected a linear gelu region")
         };
@@ -2578,7 +2685,12 @@ mod tests {
     fn multi_output_inlines_a_nonmaterialized_shared_prefix() {
         let (roots, prefix, left, right) = elementwise_shared_graph(false);
         let index = GraphIndex::new(&roots).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         assert_eq!(plan.regions.len(), 1);
         let NativeRegion::MultiOutput(region) = &plan.regions[0] else {
             panic!("expected a multi-output region")
@@ -2599,7 +2711,12 @@ mod tests {
     fn multi_output_materializes_a_root_prefix_at_output_zero() {
         let (roots, prefix, left, right) = elementwise_shared_graph(true);
         let index = GraphIndex::new(&roots).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         let NativeRegion::MultiOutput(region) = &plan.regions[0] else {
             panic!("expected a multi-output region")
         };
@@ -2636,7 +2753,12 @@ mod tests {
         let sibling = Node::new(NodeKind::Sqrt { a: sibling }).unwrap();
         let index = GraphIndex::new(&[safe.clone(), nested.clone(), sibling.clone()]).unwrap();
 
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
 
         assert_eq!(plan.work.region_table_merges, 2);
         let multis = plan
@@ -2699,7 +2821,12 @@ mod tests {
         let nested = Node::new(NodeKind::Sin { a: nested }).unwrap();
         let index = GraphIndex::new(&[safe.clone(), nested.clone()]).unwrap();
 
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
 
         assert_eq!(plan.work.region_table_merges, 1);
         let (multi_region_id, multi) = plan
@@ -2786,7 +2913,12 @@ mod tests {
         }
         let index = GraphIndex::new(&roots).unwrap();
 
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
 
         assert!(plan.work.multi_output_dependency_edges > 0);
         assert!(plan.work.multi_output_dependency_passes <= plan.work.fusion_candidates + 1);
@@ -2823,7 +2955,12 @@ mod tests {
         let right = Node::new(NodeKind::Sqrt { a: right }).unwrap();
         let index = GraphIndex::new(&[sibling, left, right]).unwrap();
 
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
 
         assert_eq!(plan.work.region_table_merges, 2);
         assert_eq!(
@@ -2881,7 +3018,12 @@ mod tests {
             .remove(0);
         let index = GraphIndex::new(&[probabilities, gradient]).unwrap();
 
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
 
         assert!(plan
             .regions
@@ -2895,8 +3037,18 @@ mod tests {
     fn plan_selection_is_deterministic() {
         let (roots, _, _, _) = elementwise_shared_graph(true);
         let index = GraphIndex::new(&roots).unwrap();
-        let first = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
-        let second = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let first = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
+        let second = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         assert_eq!(first, second);
     }
 
@@ -2945,7 +3097,12 @@ mod tests {
         let index = GraphIndex::new(&roots).unwrap();
         let mut options = CompileOptions::default();
         options.environment.optimizer_groups = true;
-        let plan = build_optimization_plan(&index, &options).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &options,
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         assert_eq!(plan.regions.len(), 1);
         let NativeRegion::AdamWGroup(region) = &plan.regions[0] else {
             panic!("expected a grouped AdamW region")
@@ -3009,7 +3166,12 @@ mod tests {
             let mut options = CompileOptions::default();
             options.environment.optimizer_groups = true;
 
-            let plan = build_optimization_plan(&index, &options).unwrap();
+            let plan = build_optimization_plan(
+                &index,
+                &options,
+                &crate::test_target::TestTarget::for_index(&index),
+            )
+            .unwrap();
 
             assert_eq!(plan.regions.len(), variants.len());
             assert!(plan
@@ -3065,7 +3227,12 @@ mod tests {
         })
         .unwrap();
         let index = GraphIndex::new(&[step.clone(), velocity_out.clone()]).unwrap();
-        let plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         let NativeRegion::Sgd(region) = &plan.regions[0] else {
             panic!("expected an SGD region")
         };
@@ -3090,7 +3257,12 @@ mod tests {
         let neg = Node::new(NodeKind::Neg { a: x }).unwrap();
         let root = Node::new(NodeKind::Tanh { a: neg }).unwrap();
         let index = GraphIndex::new(std::slice::from_ref(&root)).unwrap();
-        let mut plan = build_optimization_plan(&index, &CompileOptions::default()).unwrap();
+        let mut plan = build_optimization_plan(
+            &index,
+            &CompileOptions::default(),
+            &crate::test_target::TestTarget::for_index(&index),
+        )
+        .unwrap();
         plan.outputs[dense(&index, &root).index()]
             .as_mut()
             .unwrap()
