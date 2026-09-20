@@ -1113,6 +1113,13 @@ export const logSoftmax = dualOptions(
  * @category neural network
  */
 export interface ScaledDotProductAttentionOptions {
+  /**
+   * Fused kernel by default. Stepwise builds a dense math graph: QK, scaling,
+   * mask addition and PV round to the input dtype; softmax computes in F32
+   * and rounds probabilities back. Scaling uses an F32 multiplier before
+   * rounding the result. Masks add the dtype's finite minimum.
+   */
+  readonly rounding?: "fused" | "stepwise"
   /** Score multiplier; defaults to `1 / sqrt(headDim)`. */
   readonly scale?: number
   /**
@@ -1128,14 +1135,19 @@ export interface ScaledDotProductAttentionOptions {
 }
 
 /**
- * Scaled dot-product attention `softmax(q·kᵀ · scale) · v` as a single
- * semantic operation: `q` is `[..., T, D]`, `k` is `[..., S, D]` and `v`
+ * Scaled dot-product attention `softmax(q·kᵀ · scale) · v`. By default this
+ * is a single semantic operation: `q` is `[..., T, D]`, `k` is `[..., S, D]` and `v`
  * is `[..., S, Dv]`. At rank 3 and above, the final leading dimension is
  * the head dimension: query heads may be a divisible multiple of K/V heads,
  * while preceding batch dimensions must match. The output uses the query
  * heads and has shape `[..., Hq, T, Dv]`. The backward is closed-form and recomputes
  * the attention probabilities instead of retaining them; it is not
  * second-order differentiable.
+ *
+ * `rounding: "stepwise"` builds ordinary tensor operations with explicit
+ * rounding boundaries and F32 softmax. It supports F32/F16/BF16 and uses
+ * ordinary graph autodiff. Its causal mask is fixed in the graph; decode
+ * compilation does not rewrite it into paged K/V attention.
  *
  * @since 0.1.0
  * @category neural network
@@ -1145,64 +1157,155 @@ export const scaledDotProductAttention = (
   k: Any,
   v: Any,
   options: ScaledDotProductAttentionOptions = {}
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("scaledDotProductAttention", () => {
-    const op = "scaledDotProductAttention"
-    const rank = q.shape.length
-    if (rank < 2 || k.shape.length !== rank || v.shape.length !== rank) {
-      throw new Error(
-        `${op}: q, k and v must share a rank >= 2, got [${q.shape}], [${k.shape}] and [${v.shape}]`
-      )
-    }
-    const leading = q.shape.slice(0, rank < 3 ? -2 : -3)
-    if (!leading.every((d, i) => d === k.shape[i]) || !leading.every((d, i) => d === v.shape[i])) {
-      throw new Error(
-        `${op}: leading dims must match, got [${q.shape}], [${k.shape}] and [${v.shape}]`
-      )
-    }
-    if (rank >= 3) {
-      const qHeads = q.shape[rank - 3]
-      const kvHeads = k.shape[rank - 3]
-      if (v.shape[rank - 3] !== kvHeads) {
-        throw new Error(`${op}: k and v heads mismatch, got [${k.shape}] and [${v.shape}]`)
-      }
-      if (kvHeads === 0 || qHeads % kvHeads !== 0) {
-        throw new Error(`${op}: query heads ${qHeads} must be divisible by K/V heads ${kvHeads}`)
-      }
-    }
-    if (q.shape[rank - 1] !== k.shape[rank - 1]) {
-      throw new Error(`${op}: q and k head dims mismatch, got [${q.shape}] and [${k.shape}]`)
-    }
-    if (k.shape[rank - 2] !== v.shape[rank - 2]) {
-      throw new Error(`${op}: k and v sequence lengths mismatch, got [${k.shape}] and [${v.shape}]`)
-    }
-    if (!isFloat(q.dtype)) {
-      throw new Error(`${op}: dtype must be floating-point, got ${q.dtype}`)
-    }
-    if (k.dtype !== q.dtype || v.dtype !== q.dtype) {
-      throw new Error(`${op}: q, k and v must share a dtype, got ${q.dtype}, ${k.dtype} and ${v.dtype}`)
-    }
-    if (k.placement.id !== q.placement.id || v.placement.id !== q.placement.id) {
-      throw new Error(`${op}: q, k and v must use the same placement`)
-    }
-    if (options.window !== undefined) {
-      if (options.causal !== true) {
-        throw new Error(`${op}: window requires causal=true`)
-      }
-      if (options.window !== null && (!Number.isSafeInteger(options.window) || options.window <= 0)) {
-        throw new Error(`${op}: window must be a positive integer or null`)
-      }
-    }
-    const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> => {
+  if (options.rounding === "stepwise") {
+    return attentionStepwise(q, k, v, options)
+  }
+
+  return graphTry("scaledDotProductAttention", () => {
+    validateAttention(q, k, v, options)
+
     return {
       op: "scaledDotProductAttention",
       inputs: [q, k, v],
       attributes: {
-        scale,
+        scale: options.scale ?? 1 / Math.sqrt(q.shape[q.shape.length - 1]),
         causal: options.causal ?? false,
         window: options.window
       }
     }
+  })
+}
+
+const validateAttention = (q: Any, k: Any, v: Any, options: ScaledDotProductAttentionOptions): void => {
+  const op = "scaledDotProductAttention"
+  const rank = q.shape.length
+  if (rank < 2 || k.shape.length !== rank || v.shape.length !== rank) {
+    throw new Error(
+      `${op}: q, k and v must share a rank >= 2, got [${q.shape}], [${k.shape}] and [${v.shape}]`
+    )
+  }
+  const leading = q.shape.slice(0, rank < 3 ? -2 : -3)
+  if (!leading.every((d, i) => d === k.shape[i]) || !leading.every((d, i) => d === v.shape[i])) {
+    throw new Error(
+      `${op}: leading dims must match, got [${q.shape}], [${k.shape}] and [${v.shape}]`
+    )
+  }
+  if (rank >= 3) {
+    const qHeads = q.shape[rank - 3]
+    const kvHeads = k.shape[rank - 3]
+    if (v.shape[rank - 3] !== kvHeads) {
+      throw new Error(`${op}: k and v heads mismatch, got [${k.shape}] and [${v.shape}]`)
+    }
+    if (kvHeads === 0 || qHeads % kvHeads !== 0) {
+      throw new Error(`${op}: query heads ${qHeads} must be divisible by K/V heads ${kvHeads}`)
+    }
+  }
+  if (q.shape[rank - 1] !== k.shape[rank - 1]) {
+    throw new Error(`${op}: q and k head dims mismatch, got [${q.shape}] and [${k.shape}]`)
+  }
+  if (k.shape[rank - 2] !== v.shape[rank - 2]) {
+    throw new Error(`${op}: k and v sequence lengths mismatch, got [${k.shape}] and [${v.shape}]`)
+  }
+  if (!isFloat(q.dtype)) {
+    throw new Error(`${op}: dtype must be floating-point, got ${q.dtype}`)
+  }
+  if (k.dtype !== q.dtype || v.dtype !== q.dtype) {
+    throw new Error(`${op}: q, k and v must share a dtype, got ${q.dtype}, ${k.dtype} and ${v.dtype}`)
+  }
+  if (k.placement.id !== q.placement.id || v.placement.id !== q.placement.id) {
+    throw new Error(`${op}: q, k and v must use the same placement`)
+  }
+  if (options.window !== undefined) {
+    if (options.causal !== true) {
+      throw new Error(`${op}: window requires causal=true`)
+    }
+    if (options.window !== null && (!Number.isSafeInteger(options.window) || options.window <= 0)) {
+      throw new Error(`${op}: window must be a positive integer or null`)
+    }
+  }
+}
+
+const attentionStepwise = (
+  q: Any,
+  k: Any,
+  v: Any,
+  options: ScaledDotProductAttentionOptions
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    yield* Effect.try({
+      try: () => {
+        validateAttention(q, k, v, options)
+        if (
+          q.storage !== undefined || k.storage !== undefined || v.storage !== undefined ||
+          !["f32", "f16", "bf16"].includes(q.dtype)
+        ) {
+          throw new Error("stepwise attention requires dense F32, F16, or BF16 tensors")
+        }
+      },
+      catch: (cause) => caughtTensorError("scaledDotProductAttention", cause)
+    })
+
+    const rank = q.shape.length
+    const queries = q.shape[rank - 2]
+    const keys = k.shape[rank - 2]
+    const heads = rank >= 3 ? q.shape[rank - 3] : 1
+    const kvHeads = rank >= 3 ? k.shape[rank - 3] : 1
+    const batch = q.shape.slice(0, -3)
+    const repeat = (value: Any) =>
+      Effect.gen(function*() {
+        if (rank === 2) {
+          return value
+        }
+
+        const width = value.shape[rank - 1]
+        const grouped = yield* reshape(value, [...batch, kvHeads, 1, keys, width])
+        const repeated = yield* broadcastTo(grouped, [...batch, kvHeads, heads / kvHeads, keys, width])
+
+        return yield* reshape(repeated, [...batch, heads, keys, width])
+      })
+
+    const repeatedKeys = yield* repeat(k)
+    const order = Array.from({ length: rank }, (_, index) => index)
+    order[rank - 2] = rank - 1
+    order[rank - 1] = rank - 2
+    const transposedKeys = yield* transpose(repeatedKeys, order)
+    let scores = yield* matmul(q, transposedKeys)
+    const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
+
+    if (scale !== 1) {
+      const scoresFloat = yield* cast(scores, "f32")
+      const multiplier = yield* constantLike(scoresFloat, scale)
+      const scaled = yield* mul(scoresFloat, multiplier)
+      scores = yield* cast(scaled, q.dtype)
+    }
+
+    if (options.causal) {
+      const offset = Math.max(0, keys - queries)
+      const queryIndices = yield* arange(offset, offset + queries, { dtype: "i64" })
+      const keyIndices = yield* arange(keys, undefined, { dtype: "i64" })
+      const row = yield* reshape(queryIndices, [queries, 1])
+      const column = yield* reshape(keyIndices, [1, keys])
+      let allowed = yield* le(column, row)
+
+      if (options.window !== undefined && options.window !== null) {
+        const distance = yield* sub(row, column)
+        const window = yield* constantLike(row, options.window)
+        const insideWindow = yield* lt(distance, window)
+        allowed = yield* logicalAnd(allowed, insideWindow)
+      }
+
+      const minimum = q.dtype === "bf16" ? -3.3895313892515355e38 : q.dtype === "f16" ? -65504 : -3.4028234663852886e38
+      const mask = yield* where(allowed, yield* constantLike(scores, 0), yield* constantLike(scores, minimum))
+      scores = yield* add(scores, mask)
+    }
+
+    const scoresFloat = yield* cast(scores, "f32")
+    const probabilitiesFloat = yield* softmax(scoresFloat, { dims: [-1] })
+    const probabilities = yield* cast(probabilitiesFloat, q.dtype)
+    const repeatedValues = yield* repeat(v)
+
+    return yield* matmul(probabilities, repeatedValues)
   })
 
 /**
@@ -1726,6 +1829,35 @@ export const argmax: {
     graphTry("argmax", () => {
       const d = normalizeDim("argmax", self.shape.length, dim)
       return { op: "argmax", inputs: [self], attributes: { dim: d } }
+    })
+)
+
+/**
+ * Returns the indices of the `k` largest values on the last axis as a lazy
+ * `u32` tensor. Leading dimensions are preserved and the last dimension is `k`.
+ * Currently accepts only dense `f32` inputs. Cast other dtypes explicitly.
+ * Values are ordered descending, with ties ordered by ascending original index.
+ * Infinities are supported; NaN causes execution to fail with a `TensorError`.
+ * Requires rank >= 1 and a positive integer `k` no greater than the last width.
+ * Not differentiable.
+ *
+ * @since 0.1.0
+ * @category reductions
+ */
+export const topKIndices: {
+  (k: number): (self: Any) => Effect.Effect<Lazy, TensorError, Runtime.Runtime>
+  (self: Any, k: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
+} = dual(
+  2,
+  (self: Any, k: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+    graphTry("topKIndices", () => {
+      const width = self.shape[self.shape.length - 1]
+      if (width === undefined) throw new Error("topKIndices: input must have rank >= 1")
+      if (!Number.isSafeInteger(k) || k <= 0 || k > width) {
+        throw new Error(`topKIndices: k must be a positive integer <= ${width}, got ${k}`)
+      }
+      if (self.dtype !== "f32") throw new Error(`topKIndices: expected f32, got ${self.dtype}`)
+      return { op: "topKIndices", inputs: [self], attributes: { k } }
     })
 )
 
@@ -3455,13 +3587,15 @@ export const cast: {
  * or finalized. Concrete roots are accepted, but JavaScript identity and
  * storage aliasing are unspecified;
  * every returned handle has independent ownership and may be cleared without
- * consuming its concrete root.
+ * consuming its concrete root. Optional compilation settings apply to this
+ * invocation's program, including optimization and constant-weight capture.
  *
  * @since 0.1.0
  * @category destructors
  */
 export const compute = <Roots extends ReadonlyArray<Any>>(
-  roots: Roots
+  roots: Roots,
+  options: Runtime.ExecutableCompileOptions = {}
 ): Effect.Effect<{ readonly [K in keyof Roots]: Concrete }, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     if (roots.length === 0) {
@@ -3474,7 +3608,7 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
     let owned: ReadonlyArray<Concrete> = []
     return yield* Effect.onExit(
       Effect.gen(function*() {
-        const executable = yield* fromBackend("compile", runtime.compile({ roots }))
+        const executable = yield* fromBackend("compile", runtime.compile({ roots, options }))
         const values = yield* fromBackend(
           "execute",
           runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
@@ -4236,6 +4370,73 @@ export interface KvSequence {
 }
 
 /**
+ * Key/value tensors shaped [batch, heads, tokens, width]. Key and value widths
+ * may differ. Ownership follows the supplied handles.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface KvPair<Handle extends Any = Any> {
+  readonly keys: Handle
+  readonly values: Handle
+}
+
+/**
+ * Caller-owned, read-only K/V for a completed prefix. Each layer may have
+ * different head geometry and retain a different number of tokens.
+ * tokenCount records the original sequence length, including evicted rows.
+ * Concurrent readers borrow these handles. Release them after all reads finish.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface KvPrefix {
+  readonly tokenCount: number
+  readonly bytes: number
+  readonly layers: ReadonlyArray<KvPair<Concrete>>
+}
+
+/**
+ * Groups materialized layer K/V into a prefix without copying or retaining
+ * handles. The supplied handles become the prefix's owned tensors. Byte
+ * accounting reports tensor payload sizes, excluding allocator overhead.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const makeKvPrefix = (tokenCount: number, layers: ReadonlyArray<KvPair<Concrete>>): KvPrefix => ({
+  tokenCount,
+  bytes: layers.reduce((total, layer) => total + byteLength(layer.keys) + byteLength(layer.values), 0),
+  layers
+})
+
+/**
+ * Releases a prefix's K/V handles. All operations borrowing it must finish first.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const clearKvPrefix = (prefix: KvPrefix): Effect.Effect<void, never, Runtime.Runtime> =>
+  clearAll(prefix.layers.flatMap(({ keys, values }) => [keys, values]))
+
+/**
+ * Tensor payload size, using physical storage geometry for encoded tensors.
+ * This excludes allocation padding and does not deduplicate aliased handles.
+ *
+ * @since 0.1.0
+ * @category getters
+ */
+export const byteLength = (self: Any): number => {
+  if (self.storage !== undefined) {
+    return self.storage.physicalShape.reduce((size, dimension) => size * dimension, 1)
+  }
+
+  const bytes = { f64: 8, f32: 4, bf16: 2, f16: 2, i64: 8, u32: 4, u8: 1 }
+
+  return self.shape.reduce((size, dimension) => size * dimension, bytes[self.dtype])
+}
+
+/**
  * A backend-owned decode-state pool containing fixed-capacity per-layer
  * key/value arenas and a prefix cache. Each child sequence owns its mutable
  * recurrent state; hybrid cache entries may retain recurrent snapshots at
@@ -4827,6 +5028,43 @@ export const linearRows = (
   })
 
 /**
+ * Applies a selected expert matrix to each row: input `[N, I]`, weight bank
+ * `[E, O, I]`, and `u32` indices `[N]` produce `[N, O]`. Input and weights
+ * must have the same dense `f32` or `bf16` dtype. Each dot product accumulates
+ * in F32 and rounds once to the input dtype. Reduction order is backend-defined.
+ * The weight bank is borrowed directly, without gathering or converting the full bank.
+ *
+ * Requires `0 < E <= 2^32 - 1`. Empty rows and zero inner/output widths are
+ * supported. An index outside `[0, E)` fails execution, including when the
+ * output width is zero. This inference-only operation is not differentiable.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const expertLinearRows = (
+  self: Any,
+  weights: Any,
+  indices: Any
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  graphTry("expertLinearRows", () => {
+    checkCompatible("expertLinearRows", self, weights)
+    if (self.dtype !== "f32" && self.dtype !== "bf16") {
+      throw new Error(`expertLinearRows: expected f32 or bf16, got ${self.dtype}`)
+    }
+    if (
+      self.shape.length !== 2 || weights.shape.length !== 3 || indices.shape.length !== 1 ||
+      self.shape[1] !== weights.shape[2] || self.shape[0] !== indices.shape[0]
+    ) {
+      throw new Error("expertLinearRows: expected input [N,I], weights [E,O,I], and indices [N]")
+    }
+    if (weights.shape[0] <= 0 || weights.shape[0] > 0xffffffff) {
+      throw new Error("expertLinearRows: E must be positive and fit U32")
+    }
+    if (indices.dtype !== "u32") throw new Error("expertLinearRows: indices must be u32")
+    return { op: "expertLinearRows", inputs: [self, weights, indices] }
+  })
+
+/**
  * Layer normalization over the last dim as a single semantic operation:
  * `y = (x − μ)/√(σ² + eps) · weight + bias`. The semantic node lets the
  * fused Metal kernel evaluate it in one launch (RFC 0007).
@@ -4860,6 +5098,120 @@ export const layerNorm = (
       inputs: [self, weight, bias],
       attributes: { eps }
     }
+  })
+
+/**
+ * Runs a gated MLP for each selected expert. Input is [rows, inputWidth],
+ * gateUp is [experts, 2 * intermediateWidth, inputWidth], down is
+ * [experts, outputWidth, intermediateWidth], and indices and routing weights
+ * are [rows, routes]. Only activations expand per route; weight banks remain
+ * indexed. activate builds a graph over the gate half of the projection.
+ *
+ * Routing weights use F32. Each weighted contribution rounds to the input dtype
+ * before summation in ascending expert-ID order. Duplicate IDs keep route order.
+ * Every addition rounds to the input dtype as well.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const gatedExperts = (
+  input: Any,
+  gateUp: Any,
+  down: Any,
+  indices: Any,
+  routingWeights: Any,
+  activate: (gate: Any) => Effect.Effect<Any, TensorError, Runtime.Runtime>
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const rows = input.shape[0]
+    const inputWidth = input.shape[1]
+    const intermediateWidth = down.shape[2]
+    const outputWidth = down.shape[1]
+    const routes = indices.shape[1]
+    const fail = (message: string) => new TensorError({ op: "gatedExperts", message })
+
+    if (input.shape.length !== 2 || input.storage !== undefined || !["f32", "bf16", "f16"].includes(input.dtype)) {
+      return yield* fail("input must be dense floating-point [rows, inputWidth]")
+    }
+
+    if (
+      indices.dtype !== "u32" || indices.shape.length !== 2 || indices.shape[0] !== rows || routes < 1 ||
+      routes > 2 ** 24
+    ) {
+      return yield* fail("indices must be U32 [rows, routes] with 1 <= routes <= 2^24")
+    }
+
+    if (
+      routingWeights.dtype !== "f32" || routingWeights.shape.length !== 2 ||
+      routingWeights.shape[0] !== rows || routingWeights.shape[1] !== routes
+    ) {
+      return yield* fail("routing weights must be F32 with the same shape as indices")
+    }
+
+    if (
+      gateUp.shape.length !== 3 || down.shape.length !== 3 || gateUp.shape[0] !== down.shape[0] ||
+      gateUp.shape[1] !== 2 * intermediateWidth || gateUp.shape[2] !== inputWidth
+    ) {
+      return yield* fail(
+        "expert banks must have shapes [experts, 2 * intermediate, input] and [experts, output, intermediate]"
+      )
+    }
+
+    const tokenRows = yield* reshape(input, [rows, 1, inputWidth])
+    const routedRows = yield* broadcastTo(tokenRows, [rows, routes, inputWidth])
+    const expanded = yield* reshape(routedRows, [rows * routes, inputWidth])
+
+    const flatIndices = yield* reshape(indices, [rows * routes])
+
+    const gateUpOutput = yield* expertLinearRows(expanded, gateUp, flatIndices)
+    const gate = yield* slice(gateUpOutput, { end: [rows * routes, intermediateWidth] })
+    const up = yield* slice(gateUpOutput, { start: [0, intermediateWidth] })
+
+    const activated = yield* activate(gate)
+    const activation = yield* mul(activated, up)
+    const projected = yield* expertLinearRows(activation, down, flatIndices)
+
+    const projectedFloat = yield* cast(projected, "f32")
+    const flatWeights = yield* reshape(routingWeights, [rows * routes, 1])
+    const weightedFloat = yield* mul(projectedFloat, flatWeights)
+    const contributions = yield* cast(weightedFloat, input.dtype)
+    const weighted = yield* reshape(contributions, [rows, routes, outputWidth])
+
+    // Rank routes by (expert ID, original position) using integer comparisons.
+    // This remains exact for the full U32 domain and handles repeated experts.
+    const left = yield* unsqueeze(indices, -1)
+    const right = yield* unsqueeze(indices, -2)
+    const positions = yield* fromTypedArray(Uint32Array.from({ length: routes }, (_, i) => i))
+    const columnPositions = yield* unsqueeze(positions, 0)
+    const rowPositions = yield* unsqueeze(positions, 1)
+    const earlier = yield* lt(columnPositions, rowPositions)
+    const smallerExpert = yield* lt(right, left)
+    const sameExpert = yield* eq(right, left)
+    const tieBreak = yield* mul(sameExpert, earlier)
+    const precedes = yield* add(smallerExpert, tieBreak)
+
+    // Sum only zero/one ranks in F32, exact through 2^24 routes. The expert
+    // ID comparisons above stay integer, including IDs beyond 2^24.
+    const precedesFloat = yield* cast(precedes, "f32")
+    const counts = yield* sum(precedesFloat, { dims: [-1] })
+    const rank = yield* cast(counts, "u32")
+    const rankColumns = yield* unsqueeze(rank, -1)
+    const ranks = yield* broadcastTo(rankColumns, [rows, routes, outputWidth])
+    const empty = yield* zeros([rows, routes, outputWidth], { dtype: input.dtype })
+    const sorted = yield* scatterAdd(empty, ranks, weighted, { dim: 1 })
+
+    let output = yield* zeros([rows, outputWidth], { dtype: input.dtype })
+
+    for (let route = 0; route < routes; route++) {
+      const selected = yield* slice(sorted, {
+        start: [0, route, 0],
+        end: [rows, route + 1, outputWidth]
+      })
+      const contribution = yield* reshape(selected, [rows, outputWidth])
+      output = yield* add(output, contribution)
+    }
+
+    return output
   })
 
 /**
@@ -4922,6 +5274,10 @@ export const positionEmbedding = (
 export interface RotaryEmbeddingOptions {
   /** Pairing layout; defaults to GPT-NeoX-style half-split pairs. */
   readonly layout?: "HalfSplit" | "InterleavedPairs"
+  /** Explicit u32/i64 positions [...batch, S], with broadcastable batch axes. */
+  readonly positions?: Any
+  /** Frequency buffer [D/2]. Zero entries leave the corresponding pairs unrotated. */
+  readonly inverseFrequencies?: Any
 }
 
 /**
@@ -4934,6 +5290,13 @@ export interface RotaryEmbeddingOptions {
  * Generation beyond a pool's finite capacity also requires an
  * attention window that can evict old blocks.
  *
+ * Supplying positions or inverse frequencies builds an explicit F32/F16/BF16
+ * rotation graph. Positions are u32/i64 [...batch, seqLen], excluding the head
+ * axis, or [seqLen] for rank-two inputs. Angles and trigonometric functions use
+ * F32, then cosine and sine round to the input dtype before multiplication and
+ * addition. Frequency buffers may use F32/F16/BF16 and are converted to F32.
+ * Explicit positions are not rebased by decode compilation.
+ *
  * @since 0.1.0
  * @category neural network
  */
@@ -4942,13 +5305,116 @@ export const rotaryEmbedding = (
   seqLen: number,
   theta: number,
   options: RotaryEmbeddingOptions = {}
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("rotaryEmbedding", () => {
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> => {
+  if (options.positions !== undefined || options.inverseFrequencies !== undefined) {
+    return rotaryEmbeddingExplicit(self, seqLen, theta, options)
+  }
+
+  return graphTry("rotaryEmbedding", () => {
     const layout = options.layout ?? "HalfSplit"
     if (layout !== "HalfSplit" && layout !== "InterleavedPairs") {
       throw new Error(`rotaryEmbedding: unsupported layout ${String(layout)}`)
     }
     return { op: "rotaryEmbedding", inputs: [self], attributes: { seqLen, theta, layout } }
+  })
+}
+
+const rotaryEmbeddingExplicit = (
+  self: Any,
+  seqLen: number,
+  theta: number,
+  options: RotaryEmbeddingOptions
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const width = self.shape.at(-1) ?? 0
+    const batch = self.shape.slice(0, -3)
+    const layout = options.layout ?? "HalfSplit"
+    const fail = (message: string) => new TensorError({ op: "rotaryEmbedding", message })
+
+    if (self.shape.length < 2 || width === 0 || width % 2 !== 0 || self.shape.at(-2) !== seqLen) {
+      return yield* fail("expected input [..., seqLen, D] with positive even D")
+    }
+
+    if (self.storage !== undefined || !["f32", "bf16", "f16"].includes(self.dtype)) {
+      return yield* fail("explicit rotary embedding requires dense F32, BF16, or F16 input")
+    }
+
+    if (layout !== "HalfSplit" && layout !== "InterleavedPairs") {
+      return yield* fail("unsupported rotary layout")
+    }
+
+    let positions = options.positions
+    if (positions === undefined) {
+      const indices = yield* arange(seqLen, undefined, { dtype: "u32" })
+      positions = yield* reshape(indices, [...batch.map(() => 1), seqLen])
+    }
+
+    if (
+      !["u32", "i64"].includes(positions.dtype) || positions.shape.length !== batch.length + 1 ||
+      positions.shape.at(-1) !== seqLen || batch.some((size, axis) =>
+        positions.shape[axis] !== 1 && positions.shape[axis] !== size
+      )
+    ) {
+      return yield* fail("positions must be u32/i64 [...batch, seqLen] with broadcastable batch axes")
+    }
+
+    let frequencies = options.inverseFrequencies
+    if (frequencies === undefined) {
+      if (!Number.isFinite(theta) || theta <= 0) {
+        return yield* fail("theta must be positive and finite")
+      }
+
+      const values = Float32Array.from(
+        { length: width / 2 },
+        (_, index) => 1 / Math.fround(Math.pow(Math.fround(theta), Math.fround(2 * index / width)))
+      )
+      frequencies = yield* fromTypedArray(values)
+    }
+
+    if (
+      frequencies.storage !== undefined || !["f32", "bf16", "f16"].includes(frequencies.dtype) ||
+      frequencies.shape.length !== 1 || frequencies.shape[0] !== width / 2
+    ) {
+      return yield* fail("inverseFrequencies must be a dense floating-point [D/2] buffer")
+    }
+
+    const positionValues = yield* cast(positions, "f32")
+    const positionColumns = yield* unsqueeze(positionValues, -1)
+    const frequencyValues = yield* cast(frequencies, "f32")
+    const angles = yield* mul(positionColumns, frequencyValues)
+    let doubled: Lazy
+
+    if (layout === "HalfSplit") {
+      doubled = yield* concat([angles, angles], { dim: -1 })
+    } else {
+      const columns = yield* unsqueeze(angles, -1)
+      const pairs = yield* broadcastTo(columns, [...angles.shape, 2])
+      doubled = yield* reshape(pairs, [...angles.shape.slice(0, -1), width])
+    }
+
+    const tableShape = [...positions.shape.slice(0, -1), ...(self.shape.length >= 3 ? [1] : []), seqLen, width]
+    const cosineFloat = yield* cos(doubled)
+    const sineFloat = yield* sin(doubled)
+    const cosine = yield* reshape(yield* cast(cosineFloat, self.dtype), tableShape)
+    const sine = yield* reshape(yield* cast(sineFloat, self.dtype), tableShape)
+    let rotated: Lazy
+
+    if (layout === "HalfSplit") {
+      const first = yield* slice(self, { end: [...self.shape.slice(0, -1), width / 2] })
+      const second = yield* slice(self, { start: [...self.shape.slice(0, -1).map(() => 0), width / 2] })
+      rotated = yield* concat([yield* neg(second), first], { dim: -1 })
+    } else {
+      const pairs = yield* reshape(self, [...self.shape.slice(0, -1), width / 2, 2])
+      const first = yield* slice(pairs, { end: [...pairs.shape.slice(0, -1), 1] })
+      const second = yield* slice(pairs, { start: [...pairs.shape.slice(0, -1).map(() => 0), 1] })
+      const swapped = yield* concat([yield* neg(second), first], { dim: -1 })
+      rotated = yield* reshape(swapped, self.shape)
+    }
+
+    const direct = yield* mul(self, cosine)
+    const cross = yield* mul(rotated, sine)
+
+    return yield* add(direct, cross)
   })
 
 /**

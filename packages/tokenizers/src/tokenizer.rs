@@ -34,6 +34,9 @@
 //!   external date library.
 //!
 //! The renderer parses the JSON context into `serde_json::Value`.
+//! `minijinja-contrib` supplies Python-style methods on maps, strings, and
+//! lists through its `pycompat` unknown-method callback. This includes
+//! `dict.get`, `dict.items`, and `str.split` used by chat templates.
 //!
 //! # Training
 //!
@@ -196,10 +199,12 @@ fn strftime_now(format: &str) -> MiniResult<String> {
 }
 
 /// Renders `template` against `context_json` with the module's `minijinja`
-/// environment and its `raise_exception` and `strftime_now` helpers.
+/// environment, Python-compatible methods, and `raise_exception` and
+/// `strftime_now` helpers.
 fn render_chat_template(template: &str, context_json: &str) -> Result<String> {
     let context: serde_json::Value = serde_json::from_str(context_json).map_err(to_napi_error)?;
     let mut environment = Environment::new();
+    environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     environment.add_function(
         "raise_exception",
         |message: String| -> MiniResult<MiniValue> {
@@ -211,6 +216,64 @@ fn render_chat_template(template: &str, context_json: &str) -> Result<String> {
         .template_from_str(template)
         .and_then(|template| template.render(&MiniValue::from_serialize(&context)))
         .map_err(to_napi_error)
+}
+
+#[cfg(test)]
+mod chat_template_tests {
+    use super::render_chat_template;
+
+    const DIFFUSION_GEMMA_TEMPLATE: &str =
+        include_str!("../test/fixtures/diffusiongemma/chat_template.jinja");
+
+    #[test]
+    fn python_methods_match_jinja2() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../test/fixtures/python-methods.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let actual = render_chat_template(
+                case["template"].as_str().unwrap(),
+                &case["context"].to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                actual,
+                case["expected"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn official_diffusion_gemma_template_matches_jinja2() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../test/fixtures/diffusiongemma/cases.json"))
+                .unwrap();
+        for case in cases.as_array().unwrap() {
+            let actual =
+                render_chat_template(DIFFUSION_GEMMA_TEMPLATE, &case["context"].to_string())
+                    .unwrap();
+            assert_eq!(
+                actual,
+                case["expected"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_python_methods_return_errors() {
+        for template in [
+            "{{ {}.get() }}",
+            "{{ {}.get('a', 'b', 'c') }}",
+            "{{ 'a,b'.split(',', 1, 2) }}",
+            "{{ {}.unknown_method() }}",
+            "{{ none.get('a') }}",
+        ] {
+            assert!(render_chat_template(template, "{}").is_err(), "{template}");
+        }
+    }
 }
 
 // Split around special-token strings and keep each match as a segment. Encoding

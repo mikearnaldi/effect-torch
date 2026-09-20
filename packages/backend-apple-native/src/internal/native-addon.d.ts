@@ -74,6 +74,7 @@ export declare class LazyTensor {
   sign(): LazyTensor
   whereCond(a: LazyTensor, b: LazyTensor): LazyTensor
   argmax(dim: number): LazyTensor
+  topKIndices(k: number): LazyTensor
   argmin(dim: number): LazyTensor
   cumsum(dim: number): LazyTensor
   indexSelect(dim: number, indexes: LazyTensor): LazyTensor
@@ -89,6 +90,7 @@ export declare class LazyTensor {
   rmsNorm(weight: LazyTensor | undefined | null, eps: number): LazyTensor
   linear(weight: LazyTensor, bias: LazyTensor): LazyTensor
   quantizedLinear(weight: LazyTensor, bias?: LazyTensor | undefined | null): LazyTensor
+  expertLinearRows(weight: LazyTensor, indexes: LazyTensor): LazyTensor
   quantizedEmbedding(weight: LazyTensor, paddingIndex?: number | undefined | null): LazyTensor
   conv1d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor

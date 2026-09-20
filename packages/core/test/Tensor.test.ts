@@ -10,6 +10,90 @@ const values = (t: Tensor.Any) =>
 // The matrix uses the real CPU backend and available Metal backend; unsupported
 // Metal operations must fail explicitly rather than fall back to CPU.
 onDevices("Tensor", (device) => (it) => {
+  describe("explicit rotary positions", () => {
+    for (const layout of ["HalfSplit", "InterleavedPairs"] as const) {
+      it.effect(layout + " supports explicit offsets and zero-frequency pairs", () =>
+        Effect.gen(function*() {
+          const input = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6, 7, 8]), [1, 2, 4])
+          const positions = yield* Tensor.fromTypedArray(new Uint32Array([0, 2]))
+          const inverseFrequencies = yield* Tensor.fromTypedArray(floats([1, 0]))
+          const output = yield* Tensor.rotaryEmbedding(input, 2, 10_000, { positions, inverseFrequencies, layout })
+          const cosine = Math.cos(2)
+          const sine = Math.sin(2)
+          const expected = layout === "HalfSplit"
+            ? [1, 2, 3, 4, 5 * cosine - 7 * sine, 6, 5 * sine + 7 * cosine, 8]
+            : [1, 2, 3, 4, 5 * cosine - 6 * sine, 5 * sine + 6 * cosine, 7, 8]
+
+          const actual = yield* values(output)
+          actual.forEach((value, index) => expect(value).toBeCloseTo(expected[index], 5))
+
+          const matrix = yield* Tensor.reshape(input, [2, 4])
+          const matrixOutput = yield* Tensor.rotaryEmbedding(matrix, 2, 10_000, {
+            positions,
+            inverseFrequencies,
+            layout
+          })
+          expect(yield* values(matrixOutput)).toEqual(actual)
+        }))
+    }
+
+    it.effect("rejects incompatible position and frequency metadata", () =>
+      Effect.gen(function*() {
+        const input = yield* Tensor.ones([2, 3, 4, 8])
+        const positions = yield* Tensor.zeros([1, 4], { dtype: "u32" })
+        const frequencies = yield* Tensor.ones([4])
+        const failures = [
+          Tensor.rotaryEmbedding(input, 4, 100, { positions: yield* Tensor.zeros([1, 4]) }),
+          Tensor.rotaryEmbedding(input, 4, 100, { positions: yield* Tensor.zeros([3, 4], { dtype: "u32" }) }),
+          Tensor.rotaryEmbedding(input, 4, 100, { positions, inverseFrequencies: yield* Tensor.ones([3]) }),
+          Tensor.rotaryEmbedding(input, 3, 100, { inverseFrequencies: frequencies })
+        ]
+
+        for (const failure of failures) {
+          expect((yield* Effect.flip(failure))._tag).toBe("TensorError")
+        }
+      }))
+  })
+
+  it.effect("gated experts support different output widths, duplicate routes and a ReLU gate", () =>
+    Effect.gen(function*() {
+      const input = yield* Tensor.fromTypedArray(floats([2, -1]), [1, 2])
+      const gateUp = yield* Tensor.fromTypedArray(floats([1, 0, 0, 1, 0, 1, 1, 0]), [2, 2, 2])
+      const down = yield* Tensor.fromTypedArray(floats([1, 2, -1, 3, -2, 5]), [2, 3, 1])
+      const indices = yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0]), [1, 3])
+      const weights = yield* Tensor.fromTypedArray(floats([0.5, 0.25, 0.75]), [1, 3])
+      const output = yield* Tensor.gatedExperts(input, gateUp, down, indices, weights, Tensor.relu)
+
+      expect(output.shape).toEqual([1, 3])
+      expect(yield* values(output)).toEqual([-2, -4, 2])
+    }))
+
+  it.effect("read-only prefixes account for heterogeneous layers and release their handles", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const [localKeys, localValues, globalKeys, globalValues] = yield* Tensor.compute([
+        yield* Tensor.ones([1, 2, 3, 4]),
+        yield* Tensor.ones([1, 2, 3, 5], { dtype: "f16" }),
+        yield* Tensor.ones([1, 1, 7, 2], { dtype: "bf16" }),
+        yield* Tensor.ones([1, 1, 7, 3], { dtype: "bf16" })
+      ]).pipe(Effect.flatMap(Tensor.clearAllScoped))
+      const prefix = Tensor.makeKvPrefix(1024, [
+        { keys: localKeys, values: localValues },
+        { keys: globalKeys, values: globalValues }
+      ])
+
+      expect(prefix.tokenCount).toBe(1024)
+      expect(prefix.bytes).toBe(96 + 60 + 28 + 42)
+
+      const [result] = yield* Tensor.compute([localKeys]).pipe(Effect.flatMap(Tensor.clearAllScoped))
+      yield* Tensor.clearKvPrefix(prefix)
+
+      for (const tensor of [localKeys, localValues, globalKeys, globalValues]) {
+        expect((yield* Effect.flip(Tensor.toNumberArray(tensor)))._tag).toBe("TensorError")
+      }
+
+      expect(yield* values(result)).toEqual(Array(24).fill(1))
+    })))
+
   describe("constructors", () => {
     it.effect("zeros/ones/full produce the right values and dtype", () =>
       Effect.gen(function*() {

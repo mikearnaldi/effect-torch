@@ -11,7 +11,7 @@ use effect_torch_runtime::{DType, StorageRepresentation};
 use objc2_metal::MTLDevice as _;
 
 /// Bump when classification or realization changes.
-pub(crate) const POLICY_REVISION: u64 = 4;
+pub(crate) const POLICY_REVISION: u64 = 6;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MetalDTypeCapabilities {
@@ -213,6 +213,8 @@ impl TargetDTypeCapabilities for MetalDTypeCapabilities {
             | NodeKind::LastTokenRow { .. }
             | NodeKind::PositionEmbedding { .. }
             | NodeKind::Argmax { .. }
+            | NodeKind::TopKIndices { .. }
+            | NodeKind::ExpertLinearRows { .. }
             | NodeKind::Argmin { .. }
             | NodeKind::Cumsum { .. } => native(),
             NodeKind::Relu { .. } if !input_dtype.is_float() => native(),

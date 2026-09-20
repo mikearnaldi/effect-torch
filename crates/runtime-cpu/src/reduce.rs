@@ -294,6 +294,62 @@ macro_rules! basic_requirements {
 }
 
 impl Tensor {
+    /// Stable last-axis F32 selection directly into the planned U32 output.
+    /// The output doubles as insertion workspace, so no temporary is allocated.
+    pub fn top_k_indices_into(
+        &self,
+        k: usize,
+        destination: &mut CpuDestination<'_>,
+    ) -> Result<(), String> {
+        let shape = self.shape();
+        let width = *shape
+            .last()
+            .ok_or("topKIndices: input must have rank >= 1")?;
+        if k == 0 || k > width || width > u32::MAX as usize {
+            return Err("topKIndices: invalid k or last-axis width".into());
+        }
+        let CpuBuffer::F32(values) = &self.buffer else {
+            return Err("topKIndices: expected f32".into());
+        };
+        if destination.shape().len() != shape.len()
+            || destination.shape().last() != Some(&k)
+            || destination.shape()[..shape.len() - 1] != shape[..shape.len() - 1]
+        {
+            return Err("topKIndices: destination shape mismatch".into());
+        }
+        destination.write_current::<u32, _>("topKIndices", |output| {
+            for (row, indices) in output.chunks_exact_mut(k).enumerate() {
+                let mut base = self.layout.offset();
+                let mut remainder = row;
+                for dim in (0..shape.len() - 1).rev() {
+                    base += (remainder % shape[dim]) * self.layout.strides()[dim];
+                    remainder /= shape[dim];
+                }
+                let stride = self.layout.strides()[shape.len() - 1];
+                for index in 0..width {
+                    let value = values[base + index * stride];
+                    if value.is_nan() {
+                        return Err("topKIndices: NaN input".to_string());
+                    }
+                    let used = index.min(k);
+                    let mut position = 0;
+                    while position < used
+                        && value <= values[base + indices[position] as usize * stride]
+                    {
+                        position += 1;
+                    }
+                    if position < k {
+                        for slot in (position + 1..=used.min(k - 1)).rev() {
+                            indices[slot] = indices[slot - 1];
+                        }
+                        indices[position] = index as u32;
+                    }
+                }
+            }
+            Ok(())
+        })?
+    }
+
     basic_requirements!(
         sum_requirements,
         sum_output_requirements,

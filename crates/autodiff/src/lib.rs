@@ -100,6 +100,34 @@ mod tests {
     }
 
     #[test]
+    fn top_k_indices_rejects_grad_and_preserves_last_axis_when_batched() {
+        let x = input(0, vec![8]);
+        let selected = Node::new(NodeKind::TopKIndices { a: x.clone(), k: 2 }).unwrap();
+        let cast = Node::new(NodeKind::Cast {
+            a: selected.clone(),
+            dtype: DType::F32,
+        })
+        .unwrap();
+        let loss = Node::new(NodeKind::Sum {
+            a: cast,
+            dims: vec![0],
+            keepdims: false,
+        })
+        .unwrap();
+        assert!(grad(&loss, std::slice::from_ref(&x))
+            .err()
+            .unwrap()
+            .contains("topKIndices is not differentiable"));
+        let mapped = vmap(&selected, &x, &input(1, vec![3, 8]), 0).unwrap();
+        assert_eq!(mapped.shape, [3, 2]);
+        assert_eq!(mapped.dtype, DType::U32);
+        assert!(vmap(&selected, &x, &input(1, vec![8, 3]), 1)
+            .err()
+            .unwrap()
+            .contains("batch axis before the last axis"));
+    }
+
+    #[test]
     fn grouped_query_attention_rejects_autodiff_explicitly() {
         let q = input(0, vec![1, 4, 2, 2]);
         let k = input(1, vec![1, 2, 2, 2]);
@@ -389,6 +417,14 @@ fn vmap_rebuild(
             a: f(a),
             dim: shift_dim(*d, dim),
         }),
+        NodeKind::TopKIndices { a, k } => {
+            if dim >= a.shape.len() {
+                return Err(
+                    "vmap: topKIndices requires the batch axis before the last axis".into(),
+                );
+            }
+            Ok(NodeKind::TopKIndices { a: f(a), k: *k })
+        }
         NodeKind::Argmin { a, dim: d } => Ok(NodeKind::Argmin {
             a: f(a),
             dim: shift_dim(*d, dim),
@@ -481,6 +517,9 @@ fn vmap_rebuild(
         }
         NodeKind::ChunkedHeadCe { .. } => {
             Err("vmap: chunked head ce nodes are not supported under vmap".to_string())
+        }
+        NodeKind::ExpertLinearRows { .. } => {
+            Err("vmap: expertLinearRows requires explicit flattened rows and routes".into())
         }
         NodeKind::ShortConv1d { .. } => {
             Err("vmap: short conv nodes are not supported under vmap".to_string())
@@ -625,6 +664,18 @@ pub fn grad(loss: &Arc<Node>, wrt: &[Arc<Node>]) -> std::result::Result<Vec<Arc<
         }
     }
     let order = topo(loss);
+    if order
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::ExpertLinearRows { .. }))
+    {
+        return Err("grad: expertLinearRows is inference-only and not differentiable".into());
+    }
+    if order
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::TopKIndices { .. }))
+    {
+        return Err("grad: topKIndices is not differentiable".to_string());
+    }
     if order.iter().any(|node| {
         matches!(
             node.kind,
@@ -1296,6 +1347,11 @@ fn backward(
             NodeKind::RmsNorm { .. } => {
                 return Err("grad: RMS norm is not differentiable yet".to_string());
             }
+            NodeKind::ExpertLinearRows { .. } => {
+                return Err(
+                    "grad: expertLinearRows is inference-only and not differentiable".into(),
+                );
+            }
             NodeKind::Linear { x, weight, bias } => {
                 // For y = x·W + b over the last dimension, dx = g·Wᵀ. Compute
                 // dw = xᵀ·g by reducing over leading dimensions. db = Σ g.
@@ -1695,6 +1751,7 @@ fn backward(
             | NodeKind::Ge { .. }
             | NodeKind::Le { .. }
             | NodeKind::Argmax { .. }
+            | NodeKind::TopKIndices { .. }
             | NodeKind::Argmin { .. } => {
                 unreachable!("non-float nodes are filtered above")
             }

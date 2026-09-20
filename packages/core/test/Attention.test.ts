@@ -46,6 +46,58 @@ onDevices("Attention", () => (it) => {
   const f32 = (data: ReadonlyArray<number>, shape: ReadonlyArray<number>) => Tensor.fromTypedArray(floats(data), shape)
 
   describe("scaledDotProductAttention", () => {
+    it.effect("stepwise BF16 scaling preserves the F32 scalar before rounding scores", () =>
+      Effect.gen(function*() {
+        const q = yield* Tensor.ones([1, 1], { dtype: "bf16" })
+        const k = yield* Tensor.cast(yield* f32([3, -2], [2, 1]), "bf16")
+        const v = yield* Tensor.cast(yield* f32([0, 1], [2, 1]), "bf16")
+        const output = yield* Tensor.scaledDotProductAttention(q, k, v, { scale: 0.3, rounding: "stepwise" })
+
+        // Rounded scores are 0.8984375 and -0.6015625. BF16 sigmoid(-1.5)
+        // differs from the result obtained by rounding 0.3 before multiplying.
+        expect(yield* values(output)).toEqual([0.1826171875])
+      }))
+
+    it.effect("stepwise GQA supports right-aligned windows and a different value width", () =>
+      Effect.gen(function*() {
+        const q = yield* Tensor.zeros([1, 4, 2, 3])
+        const k = yield* Tensor.zeros([1, 2, 4, 3])
+        const v = yield* f32([1, 10, 3, 30, 5, 50, 7, 70, 2, 20, 4, 40, 6, 60, 8, 80], [1, 2, 4, 2])
+        const output = yield* Tensor.scaledDotProductAttention(q, k, v, {
+          causal: true,
+          window: 2,
+          scale: 0.5,
+          rounding: "stepwise"
+        })
+
+        expect(output.shape).toEqual([1, 4, 2, 2])
+        expect(yield* values(output)).toEqual([4, 40, 6, 60, 4, 40, 6, 60, 5, 50, 7, 70, 5, 50, 7, 70])
+
+        const unmasked = yield* Tensor.scaledDotProductAttention(q, k, v, { rounding: "stepwise" })
+        expect(yield* values(unmasked)).toEqual([4, 40, 4, 40, 4, 40, 4, 40, 5, 50, 5, 50, 5, 50, 5, 50])
+      }))
+
+    it.effect("stepwise rank-two attention matches fused values and gradients", () =>
+      Effect.gen(function*() {
+        const q = yield* f32(pattern(6), [2, 3])
+        const k = yield* f32(pattern(9), [3, 3])
+        const v = yield* f32(pattern(6), [3, 2])
+        const stepwise = yield* Tensor.scaledDotProductAttention(q, k, v, { scale: 0.25, rounding: "stepwise" })
+        const fused = yield* Tensor.scaledDotProductAttention(q, k, v, { scale: 0.25 })
+        const expected = yield* values(fused)
+        const actual = yield* values(stepwise)
+        actual.forEach((value, index) => expect(value).toBeCloseTo(expected[index], 5))
+
+        const actualGradients = yield* Gradient.grad(yield* Tensor.sum(stepwise), [q, k, v])
+        const expectedGradients = yield* Gradient.grad(yield* Tensor.sum(fused), [q, k, v])
+
+        for (let index = 0; index < 3; index++) {
+          const actual = yield* values(actualGradients[index])
+          const expected = yield* values(expectedGradients[index])
+          actual.forEach((value, element) => expect(value).toBeCloseTo(expected[element], 5))
+        }
+      }))
+
     it.effect("matches the composed reference (values and gradients)", () =>
       Effect.gen(function*() {
         const shape = [2, 2, 3, 4]

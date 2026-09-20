@@ -1,0 +1,35 @@
+[
+  {
+    "name": "map get distinguishes absent, null, and false values",
+    "template": "{{ [data.get('missing') is none, data.get('missing', 'fallback'), data.get('null', 'fallback') is none, data.get('false', true), data.get('zero', 1), data.get('empty', 'fallback'), data.get('present', 'fallback'), data.get('missing', {}).get('nested', 'nested default')] | tojson }}",
+    "context": { "data": { "null": null, "false": false, "zero": 0, "empty": "", "present": "value" } },
+    "expected": "[true,\"fallback\",true,false,0,\"\",\"value\",\"nested default\"]"
+  },
+  {
+    "name": "string split preserves empty parts and accepts a split limit",
+    "template": "{{ ['a::b::::'.split('::'), 'a::b::c'.split('::', 1), 'a::b'.split('::', 0), '\t alpha  beta\n'.split(), ''.split('::'), 'café::猫'.split('::')] | tojson }}",
+    "context": {},
+    "expected": "[[\"a\",\"b\",\"\",\"\"],[\"a\",\"b::c\"],[\"a::b\"],[\"alpha\",\"beta\"],[\"\"],[\"café\",\"猫\"]]"
+  },
+  {
+    "name": "map iteration, string methods, and list count compose",
+    "template": "{% for key, value in data.items() | sort %}{{ key.upper() }}={{ value.strip() }};{% endfor %}{{ data.keys() | sort | join(',') }}|{{ data.values() | sort | join(',') }}|{{ ['a', 'b', 'a'].count('a') }}",
+    "context": { "data": { "b": " two ", "a": " one " } },
+    "expected": "A=one;B=two;a,b| one , two |2"
+  },
+  {
+    "name": "reasoning fallback and channel stripping use Python methods",
+    "template": "{%- set message = messages[0] -%}{%- set thinking = message.get('reasoning') or message.get('reasoning_content') -%}{{- thinking -}}|{%- for part in message.get('content', '').split('<channel|>') -%}{{- part.split('<|channel>')[0] -}}{%- endfor -%}",
+    "context": {
+      "messages": [
+        {
+          "role": "assistant",
+          "reasoning": null,
+          "reasoning_content": "Current reasoning",
+          "content": "before<|channel>thought\nHidden<channel|>after"
+        }
+      ]
+    },
+    "expected": "Current reasoning|beforeafter"
+  }
+]

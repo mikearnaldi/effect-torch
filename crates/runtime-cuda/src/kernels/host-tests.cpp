@@ -168,6 +168,30 @@ static void integers_and_roles() {
         assert(memcmp(source, target, 2 * et_bytes(dtype)) == 0);
     }
 }
+static void half_scatter_updates() {
+    for (unsigned int dtype : {2U, 3U}) {
+        float base = dtype == 2 ? 2048.0f : 256.0f;
+        unsigned short input[] = {et_to16(base, dtype == 3), et_to16(-base, dtype == 3), et_to16(7.0f, dtype == 3)};
+        unsigned short source[] = {et_to16(1.0f, dtype == 3), et_to16(-1.0f, dtype == 3), et_to16(1.0f, dtype == 3), et_to16(-1.0f, dtype == 3)};
+        unsigned int indices[] = {0, 1, 0, 1}, status = 0;
+        unsigned short guarded[] = {0xdead, 0, 0, 0, 0xbeef};
+        auto m = metadata({3}, {{3}, {4}, {4}});
+        CudaKernelArgs a{}; a.elements = 3; a.operation = 5;
+        a.inputs[0] = address(input); a.inputs[1] = address(indices); a.inputs[2] = address(source);
+        a.input_dtypes[0] = a.input_dtypes[2] = a.output_dtype = dtype; a.input_dtypes[1] = 5;
+        a.output = address(guarded + 1); a.metadata = address(m.data()); a.scratch[3] = address(&status);
+        run(et_index, a);
+        // Each unit is a half-ULP update and ties back to the base. A widened
+        // reduction would instead produce base+2 and -base-2.
+        assert(status == 0 && guarded[0] == 0xdead && guarded[4] == 0xbeef);
+        assert(et_load<float>(a.output, dtype, 0) == base);
+        assert(et_load<float>(a.output, dtype, 1) == -base);
+        assert(et_load<float>(a.output, dtype, 2) == 7);
+        indices[3] = 0xffffffffU; run(et_index, a); assert(status == 1);
+        status = 0; indices[3] = 1; run(et_index, a); assert(status == 0);
+        assert(memcmp(guarded + 1, input, sizeof(input)) == 0);
+    }
+}
 static void scalar_coercion() {
     for (unsigned int dtype : {2U, 3U}) for (int scalar_role = 0; scalar_role < 2; ++scalar_role) for (bool promoted : {false, true}) {
         float scalar = 1.0f + ldexpf(1.0f, dtype == 2 ? -11 : -8), tensor = 3, output = 0;
@@ -270,7 +294,38 @@ static void linear_bias_rounding() {
     assert(output[0] == 0xabcd && output[3] == 0xabcd);
     assert(output[1] == 0x4381 && output[2] == 0x3f80); // 258, 1.
 }
+static void top_k_indices() {
+    constexpr unsigned int width = 128, rows = 6;
+    std::vector<float> scores(width * rows);
+    for (unsigned int i = 0; i < scores.size(); ++i) scores[i] = int((i * 73 + 19) % 137) - 68;
+    scores[0] = -0.0f; scores[1] = 0.0f;
+    scores[2] = std::numeric_limits<float>::denorm_min();
+    scores[3] = -scores[2];
+    scores[4] = INFINITY; scores[5] = -INFINITY; scores[6] = INFINITY;
+    for (unsigned int k : {1U, 8U, width}) {
+        std::vector<unsigned int> output(rows * k + 2, 0xdeadbeefU);
+        unsigned int status = 0;
+        CudaKernelArgs a{}; a.elements = rows * k;
+        a.inputs[0] = address(scores.data()); a.output = address(output.data() + 1);
+        a.scratch[3] = address(&status); a.integers[0] = k; a.integers[1] = width;
+        for (unsigned int row = 0; row < rows; ++row) {
+            blockIdx.x = row; threadIdx.x = 0; et_top_k_indices(a);
+            std::vector<unsigned int> expected(width);
+            for (unsigned int i = 0; i < width; ++i) expected[i] = i;
+            std::stable_sort(expected.begin(), expected.end(), [&](unsigned int i, unsigned int j) {
+                return scores[row * width + i] > scores[row * width + j];
+            });
+            for (unsigned int i = 0; i < k; ++i) assert(output[1 + row * k + i] == expected[i]);
+        }
+        assert(status == 0 && output.front() == 0xdeadbeefU && output.back() == 0xdeadbeefU);
+        float saved = scores.back(); scores.back() = NAN;
+        et_top_k_indices(a); assert(status == 5); scores.back() = saved;
+    }
+    blockIdx.x = threadIdx.x = 0;
+}
 int main(int argc, char **argv) {
+    top_k_indices();
+    half_scatter_updates();
     casts(); integers_and_roles(); scalar_coercion(); compute_roles(); cache_storage(); linear_bias_rounding(); packed_fixtures(argc > 1 ? argv[1] : nullptr);
     puts("CUDA host scalar/ABI tests passed");
 }

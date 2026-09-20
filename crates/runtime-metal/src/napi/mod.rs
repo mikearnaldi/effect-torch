@@ -1507,6 +1507,14 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn top_k_indices(&self, k: u32) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::TopKIndices {
+            a: self.node.clone(),
+            k: k as usize
+        }))
+    }
+
+    #[napi]
     pub fn argmin(&self, dim: u32) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Argmin {
             a: self.node.clone(),
@@ -1654,6 +1662,15 @@ impl LazyTensor {
             x: self.node.clone(),
             weight: weight.node.clone(),
             bias: bias.map(|value| value.node.clone()),
+        }))
+    }
+
+    #[napi]
+    pub fn expert_linear_rows(&self, weight: &LazyTensor, indexes: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::ExpertLinearRows {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+            indexes: indexes.node.clone(),
         }))
     }
 

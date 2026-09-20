@@ -2683,6 +2683,10 @@ impl CudaRuntime {
                     _ => unreachable!(),
                 }
             }
+            "topKIndices" => NodeKind::TopKIndices {
+                a: input(&inputs, 0, &operation)?,
+                k: integer(&attributes, "k")?,
+            },
             "argmax" => NodeKind::Argmax {
                 a: input(&inputs, 0, &operation)?,
                 dim: integer(&attributes, "dim")?,
@@ -2776,6 +2780,11 @@ impl CudaRuntime {
                 x: input(&inputs, 0, &operation)?,
                 weight: inputs.get(1).cloned(),
                 eps: number(&attributes, "eps")?,
+            },
+            "expertLinearRows" => NodeKind::ExpertLinearRows {
+                x: input(&inputs, 0, &operation)?,
+                weight: input(&inputs, 1, &operation)?,
+                indexes: input(&inputs, 2, &operation)?,
             },
             "linear" => NodeKind::Linear {
                 x: input(&inputs, 0, &operation)?,

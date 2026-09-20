@@ -528,6 +528,10 @@ pub(super) enum MetalOp {
     Unary(MetalUnaryOp),
     Binary(MetalBinaryOp),
     Where,
+    ExpertLinearRows,
+    TopKIndices {
+        k: usize,
+    },
     Argmax {
         dim: usize,
     },
@@ -753,7 +757,9 @@ impl MetalOp {
             Self::Unary(_) => "unary",
             Self::Binary(_) => "binary",
             Self::Where => "where",
+            Self::ExpertLinearRows => "expertLinearRows",
             Self::Argmax { .. } | Self::Argmin { .. } => "arg_reduce",
+            Self::TopKIndices { .. } => "topKIndices",
             Self::Cumsum { .. } => "cumsum",
             Self::ScatterAdd { .. } => "scatter_add",
             Self::Gather { .. } => "gather",
@@ -949,6 +955,7 @@ pub(super) enum MetalCommandPlan {
     Direct,
     Gemm(crate::gemm::GemmRequirements),
     Linear(crate::linear::LinearRequirements),
+    ExpertLinearRows(crate::expert_linear::Plan),
     Conv(crate::conv::ConvRequirements),
     Indexing(crate::indexing::IndexingRequirements),
     CeForward(crate::loss::CeForwardRequirements),
@@ -1448,6 +1455,24 @@ fn plan_command_resources(
             resources
                 .scratch
                 .push(scratch("arg_reduce_u32", &keepdim_shape, DType::U32));
+        }
+        MetalOp::ExpertLinearRows => {
+            resources.plan = MetalCommandPlan::ExpertLinearRows(crate::expert_linear::Plan::new(
+                [
+                    declaration_layout(input(0)?),
+                    declaration_layout(input(1)?),
+                    declaration_layout(input(2)?),
+                ],
+                input(0)?.dtype,
+            )?);
+            resources
+                .status
+                .push(status("expert_route_status", &[1], DType::U32));
+        }
+        MetalOp::TopKIndices { .. } => {
+            resources
+                .status
+                .push(status("top_k_nan_status", &[1], DType::U32));
         }
         MetalOp::Cumsum { .. } => {}
         MetalOp::IndexSelect { dim } => {
@@ -3687,6 +3712,8 @@ impl<'a> Lowerer<'a> {
             NodeKind::Sign { .. } => MetalOp::Unary(MetalUnaryOp::Sign),
             NodeKind::Where { .. } => MetalOp::Where,
             NodeKind::Argmax { dim, .. } => MetalOp::Argmax { dim: *dim },
+            NodeKind::TopKIndices { k, .. } => MetalOp::TopKIndices { k: *k },
+            NodeKind::ExpertLinearRows { .. } => MetalOp::ExpertLinearRows,
             NodeKind::Argmin { dim, .. } => MetalOp::Argmin { dim: *dim },
             NodeKind::Cumsum { dim, .. } => MetalOp::Cumsum { dim: *dim },
             NodeKind::ScatterAdd { dim, .. } => MetalOp::ScatterAdd { dim: *dim },
@@ -5203,6 +5230,18 @@ impl<'a> Lowerer<'a> {
                         )?;
                         pipeline_count += 2;
                     }
+                    MetalOp::ExpertLinearRows => {
+                        let MetalCommandPlan::ExpertLinearRows(plan) = command_plan else {
+                            return Err("expertLinearRows: missing compiled plan".into());
+                        };
+                        plan.warm()?;
+                        pipeline_count += 2;
+                    }
+                    MetalOp::TopKIndices { k } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        crate::kernels::warm_top_k_indices(&declaration_layout(input), *k)?;
+                        pipeline_count += 2;
+                    }
                     MetalOp::Cumsum { dim } => {
                         let input = &self.values[command.inputs[0].index()];
                         crate::kernels::warm_cumsum(&input.shape, input.dtype, *dim)?;
@@ -5832,11 +5871,10 @@ struct DeferredCeCheck {
     classes: usize,
 }
 
-/// A quantized-embedding status readback deferred until after the GPU
-/// fence: nonzero means an out-of-range index.
-struct DeferredQuantizedEmbeddingCheck {
+/// A one-word device error status checked after the GPU fence.
+struct DeferredU32Check {
     buffer: Value,
-    rows: usize,
+    error: String,
 }
 
 /// Runs all deferred cross-entropy status checks in command order,
@@ -5877,23 +5915,15 @@ fn run_ce_checks(checks: &[DeferredCeCheck]) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs all deferred quantized-embedding status checks in command
-/// order; a nonzero status word means an index escaped `0..rows`.
-fn run_quantized_embedding_checks(
-    checks: &[DeferredQuantizedEmbeddingCheck],
-) -> Result<(), String> {
+/// Runs deferred one-word device error checks in command order.
+fn run_u32_checks(checks: &[DeferredU32Check]) -> Result<(), String> {
     for check in checks {
         let tensor = check.buffer.as_metal()?;
         if tensor.dtype != DType::U32 || !tensor.layout.is_contiguous() || tensor.numel() != 1 {
-            return Err(
-                "quantized_embedding: deferred status must be one contiguous u32".to_string(),
-            );
+            return Err("deferred status must be one contiguous u32".to_string());
         }
         if tensor.to_u32_vec()?[0] != 0 {
-            return Err(format!(
-                "quantized_embedding: index is outside 0..{}",
-                check.rows
-            ));
+            return Err(check.error.clone());
         }
     }
     Ok(())
@@ -6641,7 +6671,7 @@ struct PreparedExecution {
     sampling_result: Option<crate::run::MetalTensor>,
     sampling_encoded: usize,
     ce_checks: Vec<DeferredCeCheck>,
-    quantized_embedding_checks: Vec<DeferredQuantizedEmbeddingCheck>,
+    u32_checks: Vec<DeferredU32Check>,
     dispatch_result: Result<(), String>,
     _resources: crate::workspace::InvocationResources,
     _submission: Option<device::MetalSubmissionGuard<'static>>,
@@ -6900,7 +6930,7 @@ fn prepare_execution(
         None
     };
     let mut ce_checks = Vec::new();
-    let mut quantized_embedding_checks = Vec::new();
+    let mut u32_checks = Vec::new();
     let owned_submission = match submission {
         Some(_) => None,
         None => Some(metal.begin_submission()?),
@@ -7006,7 +7036,7 @@ fn prepare_execution(
                                     None
                                 },
                                 &mut ce_checks,
-                                &mut quantized_embedding_checks,
+                                &mut u32_checks,
                                 random_seed(invocation_nonce, *random_seed_token),
                             )
                             .map_err(|error| format!("{}: {error}", op.name()))?;
@@ -7066,7 +7096,7 @@ fn prepare_execution(
         sampling_result,
         sampling_encoded,
         ce_checks,
-        quantized_embedding_checks,
+        u32_checks,
         dispatch_result,
         _resources: resources,
         _submission: owned_submission,
@@ -7095,15 +7125,14 @@ fn finish_prepared(
     // sufficient for every deferred host check in command order.
     let sampled_tokens = if let Some(result) = prepared.sampling_result.as_ref() {
         let ce_result = run_ce_checks(&prepared.ce_checks);
-        let quantized_embedding_result =
-            run_quantized_embedding_checks(&prepared.quantized_embedding_checks);
+        let u32_result = run_u32_checks(&prepared.u32_checks);
         let sampled_result = read_sampling_results(result, prepared.sampling_encoded);
         ce_result?;
-        quantized_embedding_result?;
+        u32_result?;
         Some(sampled_result?)
     } else {
         run_ce_checks(&prepared.ce_checks)?;
-        run_quantized_embedding_checks(&prepared.quantized_embedding_checks)?;
+        run_u32_checks(&prepared.u32_checks)?;
         None
     };
     prepared.dispatch_result?;
@@ -7189,7 +7218,7 @@ impl PendingExecution {
     /// after the stream fence.
     fn run_host_checks(&self) -> Result<(), String> {
         run_ce_checks(&self.prepared.ce_checks)?;
-        run_quantized_embedding_checks(&self.prepared.quantized_embedding_checks)
+        run_u32_checks(&self.prepared.u32_checks)
     }
 
     /// Fences the stream once, finishes each pending in order, and releases its
@@ -7337,7 +7366,7 @@ fn execute_op_into(
     kv: Option<&dyn MetalDecodeContext>,
     decode_lane: Option<usize>,
     ce_checks: &mut Vec<DeferredCeCheck>,
-    quantized_embedding_checks: &mut Vec<DeferredQuantizedEmbeddingCheck>,
+    u32_checks: &mut Vec<DeferredU32Check>,
     random_seed: u64,
 ) -> Result<(), String> {
     let input = |index: usize| {
@@ -7508,6 +7537,39 @@ fn execute_op_into(
                 &contiguous_tensor_view(scratch_tensors[0], &output(0)?.shape(), 0)?,
                 output(0)?.as_metal()?,
             )
+        }
+        MetalOp::ExpertLinearRows => {
+            let MetalCommandPlan::ExpertLinearRows(plan) = plan else {
+                return Err("expertLinearRows: missing compiled plan".into());
+            };
+            plan.execute_into(
+                [
+                    input(0)?.as_metal()?,
+                    input(1)?.as_metal()?,
+                    input(2)?.as_metal()?,
+                ],
+                output(0)?.as_metal()?,
+                status[0].as_metal()?,
+            )?;
+            u32_checks.push(DeferredU32Check {
+                buffer: status[0].clone(),
+                error: "expertLinearRows: expert index is out of range".into(),
+            });
+            Ok(())
+        }
+        MetalOp::TopKIndices { k } => {
+            crate::kernels::top_k_indices_into(
+                device::MetalDevice::get(),
+                input(0)?.as_metal()?,
+                *k,
+                output(0)?.as_metal()?,
+                status[0].as_metal()?,
+            )?;
+            u32_checks.push(DeferredU32Check {
+                buffer: status[0].clone(),
+                error: "topKIndices: NaN input".to_string(),
+            });
+            Ok(())
         }
         MetalOp::Cumsum { dim } => {
             metal_ops::cumsum_into(input(0)?.as_metal()?, *dim, output(0)?.as_metal()?)
@@ -8540,9 +8602,12 @@ fn execute_op_into(
                 status[0].as_metal()?,
                 requirements,
             )?;
-            quantized_embedding_checks.push(DeferredQuantizedEmbeddingCheck {
+            u32_checks.push(DeferredU32Check {
                 buffer: status[0].clone(),
-                rows: requirements.rows,
+                error: format!(
+                    "quantized_embedding: index is outside 0..{}",
+                    requirements.rows
+                ),
             });
             Ok(())
         }

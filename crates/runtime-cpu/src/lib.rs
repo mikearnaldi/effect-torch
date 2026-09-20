@@ -33,6 +33,7 @@ pub mod capabilities;
 pub mod composed;
 pub mod conv;
 pub mod executable;
+mod expert_linear;
 pub mod fusion;
 pub mod indexing;
 pub mod linalg;

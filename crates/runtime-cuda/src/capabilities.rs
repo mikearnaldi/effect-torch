@@ -114,8 +114,8 @@ impl TargetDTypeCapabilities for CudaCapabilities {
         &self.fingerprint
     }
     fn policy_revision(&self) -> u64 {
-        // 5: status-free BF16 linear epilogues, retaining one final rounding.
-        5
+        // 8: native half scatter-add with a storage rounding after each update.
+        8
     }
     fn storage_support(&self, value: &ValueSpec<'_>) -> StorageSupport {
         let invalid = |reason| {
@@ -171,6 +171,15 @@ impl TargetDTypeCapabilities for CudaCapabilities {
                 );
             }
         }
+        if let NodeKind::TopKIndices { a, .. } = spec.operation {
+            let rows = a.shape[..a.shape.len() - 1].iter().product::<usize>();
+            if rows > i32::MAX as usize {
+                return unsupported(
+                    DTypeRequirement::Layout,
+                    "CUDA topKIndices row grid exceeds i32::MAX",
+                );
+            }
+        }
         for value in spec.operands.iter().chain(spec.results.iter()) {
             if let StorageSupport::Unsupported(error) = self.storage_support(&value.value) {
                 return DTypeDisposition::Unsupported(error);
@@ -202,6 +211,18 @@ impl TargetDTypeCapabilities for CudaCapabilities {
             );
         }
         for result in spec.operands.iter().chain(spec.results.iter()) {
+            // Storage-only sources do not launch the u32 reference kernels.
+            // Expert dots have bounded grid-stride launches and u64 offsets,
+            // including for banks with more than 2^32 stored elements.
+            if matches!(
+                spec.operation,
+                NodeKind::Input { .. }
+                    | NodeKind::Leaf(_)
+                    | NodeKind::FromBytes { .. }
+                    | NodeKind::ExpertLinearRows { .. }
+            ) {
+                continue;
+            }
             let count = match crate::value::element_count(result.value.logical_shape) {
                 Ok(count) => count,
                 Err(error) => return unsupported(DTypeRequirement::Storage, error),
@@ -288,6 +309,7 @@ impl TargetDTypeCapabilities for CudaCapabilities {
                 | NodeKind::Argmin { .. }
                 | NodeKind::IndexSelect { .. }
                 | NodeKind::Gather { .. }
+                | NodeKind::ScatterAdd { .. }
                 | NodeKind::LastTokenRow { .. }
                 | NodeKind::PositionEmbedding { .. }
         ) {
@@ -381,6 +403,39 @@ mod tests {
     }
 
     #[test]
+    fn expert_rows_are_native_f32_dots_with_one_boundary_rounding() {
+        for dtype in [DType::F32, DType::BF16] {
+            let tensor = |slot, shape: Vec<usize>, dtype| {
+                Node::new(NodeKind::Input {
+                    slot,
+                    shape,
+                    dtype,
+                    device: Device::Cuda(0),
+                    storage: effect_torch_runtime::StorageMetadata::dense(),
+                })
+                .unwrap()
+            };
+            let node = Node::new(NodeKind::ExpertLinearRows {
+                x: tensor(0, vec![16, 13], dtype),
+                weight: tensor(1, vec![3, 64, 13], dtype),
+                indexes: tensor(2, vec![16], DType::U32),
+            })
+            .unwrap();
+            for major in [7, 8, 12] {
+                let DTypeDisposition::Native(execution) = classify(&node, major) else {
+                    panic!("expert rows must read native storage on all CUDA targets");
+                };
+                assert_eq!(execution.realization, ExecutionRealization::DirectKernel);
+                let op = &execution.operations[0];
+                assert_eq!(op.compute_dtype, Some(DType::F32));
+                assert_eq!(op.accumulation.unwrap().dtype, DType::F32);
+                assert_eq!(op.rounding_boundaries.len(), 1);
+                assert_eq!(op.rounding_boundaries[0].dtype, dtype);
+            }
+        }
+    }
+
+    #[test]
     fn bf16_linear_is_native_on_ampere_and_newer() {
         for transposed in [false, true] {
             let node = bf16_linear(DType::BF16, transposed);
@@ -396,6 +451,32 @@ mod tests {
                 other => panic!("expected native BF16 linear, got {other:?}"),
             }
             assert!(matches!(classify(&node, 7), DTypeDisposition::Legalize(_)));
+        }
+    }
+
+    #[test]
+    fn half_scatter_preserves_typed_update_rounding_without_materialized_widening() {
+        for dtype in [DType::F16, DType::BF16] {
+            let tensor = |shape: Vec<usize>, dtype| {
+                Node::new(NodeKind::Zeros {
+                    shape,
+                    dtype,
+                    device: Device::Cuda(0),
+                })
+                .unwrap()
+            };
+            let node = Node::new(NodeKind::ScatterAdd {
+                a: tensor(vec![3], dtype),
+                indexes: tensor(vec![4], DType::U32),
+                src: tensor(vec![4], dtype),
+                dim: 0,
+            })
+            .unwrap();
+            let DTypeDisposition::Native(execution) = classify(&node, 12) else {
+                panic!("half scatter must use the directly rounded native kernel");
+            };
+            assert_eq!(execution.realization, ExecutionRealization::DirectKernel);
+            assert_eq!(execution.operations[0].compute_dtype, Some(dtype));
         }
     }
 
@@ -426,7 +507,7 @@ mod tests {
     #[test]
     fn target_fingerprint_records_native_bf16_realization() {
         let capabilities = CudaCapabilities::new(0, 12, 0);
-        assert_eq!(capabilities.policy_revision(), 5);
+        assert_eq!(capabilities.policy_revision(), 8);
         assert!(capabilities
             .fingerprint()
             .features

@@ -1261,6 +1261,9 @@ fn operand_role(operation: &NodeKind, index: usize) -> ValueRole {
             [ValueRole::Activation, ValueRole::Weight, ValueRole::Bias][index]
         }
         NodeKind::QuantizedEmbedding { .. } => [ValueRole::Indices, ValueRole::Weight][index],
+        NodeKind::ExpertLinearRows { .. } => {
+            [ValueRole::Activation, ValueRole::Weight, ValueRole::Indices][index]
+        }
         NodeKind::AdamWStep { .. } => match index {
             0 => ValueRole::Parameter,
             1 => ValueRole::Gradient,
@@ -1336,6 +1339,10 @@ fn numerics(
         );
     let compute_dtype = if no_compute {
         None
+    } else if matches!(semantic.kind, NodeKind::ExpertLinearRows { .. }) {
+        // The operation defines F32 arithmetic over its native storage values.
+        // This is not a materialized conversion of the expert bank.
+        Some(DType::F32)
     } else if matches!(
         semantic.kind,
         NodeKind::Eq { .. }
@@ -1344,6 +1351,7 @@ fn numerics(
             | NodeKind::Ge { .. }
             | NodeKind::Le { .. }
             | NodeKind::Argmax { .. }
+            | NodeKind::TopKIndices { .. }
             | NodeKind::Argmin { .. }
     ) {
         operands.first().map(|operand| {
@@ -1444,6 +1452,7 @@ fn numerics(
             | NodeKind::Matmul { .. }
             | NodeKind::Linear { .. }
             | NodeKind::QuantizedLinear { .. }
+            | NodeKind::ExpertLinearRows { .. }
             | NodeKind::Sdpa { .. }
             | NodeKind::SdpaBackward { .. }
             | NodeKind::KvAttention { .. }
@@ -1564,6 +1573,7 @@ pub fn operation_name(operation: &NodeKind) -> &'static str {
         NodeKind::Min { .. } => "min",
         NodeKind::Prod { .. } => "prod",
         NodeKind::Argmax { .. } => "argmax",
+        NodeKind::TopKIndices { .. } => "topKIndices",
         NodeKind::Argmin { .. } => "argmin",
         NodeKind::Cumsum { .. } => "cumsum",
         NodeKind::IndexSelect { .. } => "index_select",
@@ -1595,6 +1605,7 @@ pub fn operation_name(operation: &NodeKind) -> &'static str {
         NodeKind::LayerNormBackward { .. } => "layer_norm_backward",
         NodeKind::LayerNormBackwardOut { .. } => "layer_norm_backward_out",
         NodeKind::Linear { .. } => "linear",
+        NodeKind::ExpertLinearRows { .. } => "expertLinearRows",
         NodeKind::QuantizedLinear { .. } => "quantized_linear",
         NodeKind::QuantizedEmbedding { .. } => "quantized_embedding",
         NodeKind::Conv1d { .. } => "conv1d",

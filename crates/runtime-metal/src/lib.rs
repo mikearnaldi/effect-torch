@@ -99,6 +99,7 @@ pub mod device;
 pub(crate) mod dtype;
 pub mod emit;
 pub(crate) mod executable;
+mod expert_linear;
 pub mod gemm;
 pub mod indexing;
 pub mod kernels;

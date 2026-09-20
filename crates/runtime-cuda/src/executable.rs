@@ -164,6 +164,12 @@ impl Instruction {
                 s
             }
             Self::Matmul { a, b, .. } => KernelSpec::new("et_matmul", &[Some(*a), Some(*b)]),
+            Self::TopKIndices { a, k, width } => {
+                let mut s = KernelSpec::new("et_top_k_indices", &[Some(*a)]);
+                s.args.integers[0] = *k as u64;
+                s.args.integers[1] = *width as u64;
+                s
+            }
             Self::Index {
                 op,
                 a,
@@ -283,6 +289,27 @@ impl Instruction {
             } => {
                 let mut s = KernelSpec::new("et_linear", &[Some(*x), Some(*weight), Some(*bias)]);
                 s.args.integers[..2].copy_from_slice(&[u64::from(*k_width), u64::from(*n_width)]);
+                s
+            }
+            Self::ExpertLinearRows {
+                x,
+                weight,
+                indexes,
+                rows,
+                columns,
+                inner,
+                experts,
+            } => {
+                let mut s = KernelSpec::new(
+                    "et_expert_linear_rows",
+                    &[Some(*x), Some(*weight), Some(*indexes)],
+                );
+                s.args.integers[..4].copy_from_slice(&[
+                    *rows as u64,
+                    *columns as u64,
+                    *inner as u64,
+                    *experts as u64,
+                ]);
                 s
             }
             Self::QuantizedLinear {
@@ -625,6 +652,11 @@ pub(super) enum Instruction {
         a: usize,
         b: usize,
     },
+    TopKIndices {
+        a: usize,
+        k: usize,
+        width: usize,
+    },
     Index {
         op: u32,
         a: usize,
@@ -675,6 +707,15 @@ pub(super) enum Instruction {
         bias: usize,
         k_width: u32,
         n_width: u32,
+    },
+    ExpertLinearRows {
+        x: usize,
+        weight: usize,
+        indexes: usize,
+        rows: usize,
+        columns: usize,
+        inner: usize,
+        experts: usize,
     },
     QuantizedLinear {
         x: usize,
@@ -1054,6 +1095,11 @@ fn semantic_instruction(
             a: child_index(&index, a)?,
             b: child_index(&index, b)?,
         },
+        NodeKind::TopKIndices { a, k } => Instruction::TopKIndices {
+            a: child_index(&index, a)?,
+            k: *k,
+            width: *a.shape.last().ok_or("topKIndices: missing last axis")?,
+        },
         NodeKind::Argmax { a, dim } | NodeKind::Argmin { a, dim } => Instruction::Index {
             op: u32::from(matches!(node.kind, NodeKind::Argmin { .. })),
             a: child_index(&index, a)?,
@@ -1187,6 +1233,15 @@ fn semantic_instruction(
             op: 2,
             a: child_index(&index, weight)?,
             parameters: vec![0, 1, 0, 1],
+        },
+        NodeKind::ExpertLinearRows { x, weight, indexes } => Instruction::ExpertLinearRows {
+            x: child_index(&index, x)?,
+            weight: child_index(&index, weight)?,
+            indexes: child_index(&index, indexes)?,
+            rows: x.shape[0],
+            columns: weight.shape[1],
+            inner: x.shape[1],
+            experts: weight.shape[0],
         },
         NodeKind::Linear { x, weight, bias } => Instruction::Linear {
             x: child_index(&index, x)?,
@@ -2302,6 +2357,8 @@ impl CudaExecutable {
                         1 => return Err(format!("{name}: index is out of range")),
                         2 => return Err(format!("{name}: no active targets")),
                         3 => return Err(format!("{name}: matrix is singular")),
+                        5 => return Err("topKIndices: NaN input".into()),
+                        6 => return Err("expertLinearRows: expert index is out of range".into()),
                         _ => return Err(format!("{name}: invalid arithmetic")),
                     }
                     self.commit_kernel_state(access, &scratch_buffers, state.as_deref_mut())?;
@@ -2329,6 +2386,28 @@ impl CudaExecutable {
             .collect()
     }
     fn launch(&self, name: &str, args: &CudaKernelArgs) -> Result<(), String> {
+        if name == "et_expert_linear_rows" {
+            // One warp per output, or one per route when O=0. Bounded launch
+            // dimensions; the kernel loops over remaining work with u64 offsets.
+            let work = args.integers[0]
+                .checked_mul(args.integers[1].max(1))
+                .ok_or("expertLinearRows: work size overflow")?;
+            if work == 0 {
+                return Ok(());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = self.device.stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (work.div_ceil(8).min(65535) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         if args.elements == 0 {
             return Ok(());
         }
@@ -2339,6 +2418,9 @@ impl CudaExecutable {
             args.integers[5]
                 .checked_mul(32)
                 .ok_or("CUDA KV grid overflow")?
+        } else if name == "et_top_k_indices" {
+            // One block per row. Thread zero owns the stable insertion output.
+            (args.elements / args.integers[0]) * 256
         } else {
             args.elements
         };
@@ -2380,9 +2462,16 @@ pub(super) fn physical_counts(
                         .is_some_and(|id| program.values[id.index()].decl.bytes != 0),
                 );
             }
-            CommandKind::Kernel { args, state, .. } => {
+            CommandKind::Kernel {
+                name, args, state, ..
+            } => {
                 // Status reset, optional launch, and status readback.
-                submissions += 2 + usize::from(args.elements != 0);
+                let launches = if *name == "et_expert_linear_rows" {
+                    args.integers[0] != 0
+                } else {
+                    args.elements != 0
+                };
+                submissions += 2 + usize::from(launches);
                 completions += 1;
                 submissions += match state {
                     StateAccess::Rotary => 1,

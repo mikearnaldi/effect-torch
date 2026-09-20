@@ -54,6 +54,8 @@ const TYPED_KERNELS: &[&str] = &[
     "et_where",
     "et_concat",
     "et_index",
+    "et_top_k_indices",
+    "et_expert_linear_rows",
     "et_sequence",
     "et_last_token",
     "et_optimizer",

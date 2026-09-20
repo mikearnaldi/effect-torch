@@ -10,7 +10,7 @@
  * adapters. Models have no train/eval mode or non-parameter state; notably,
  * {@link dropout} always applies, so evaluation should use a chain without it.
  *
- * There are two distinct compiled paths. {@link Model.execute} lazily traces the
+ * {@link Model.execute} lazily traces the
  * ordinary forward graph per runtime and input-metadata signature, retaining a
  * small JavaScript LRU on that model object. It is suitable for repeated
  * stateless evaluation, while `forward` remains the path for composition,
@@ -20,6 +20,12 @@
  * prefix-cache content are pool-wide, while recurrent state belongs to each
  * sequence. The {@link InferenceProgram} is separate from the model's
  * `execute` cache and not reflected by `Model.stats`.
+ *
+ * {@link executor} runs a {@link PrefixModel} one layer at a time through
+ * ordinary invocations. It prepares token inputs and absolute positions, retains
+ * caller-owned K/V for read-only reuse, and releases intermediate hidden states.
+ * Model definitions supply lazy graphs; compilation controls and per-layer
+ * observation belong to the shared executor.
  *
  * Generation has three ownership levels. The inference artifact retains frozen
  * parameters, immutable native programs, and the shared pool; each
@@ -209,6 +215,299 @@ export interface Definition {
   readonly parameterSpecs: ReadonlyArray<ParameterSpec>
   /** Pure lazy graph builder; responsible for its own tensor and arity checks. */
   readonly forward: Model["forward"]
+}
+
+/**
+ * Runs a stack one layer at a time. Each builder returns the next hidden tensor
+ * followed by any tensors to retain for that layer, such as attention K/V.
+ * Builders and observers borrow their inputs for the duration of their effect.
+ *
+ * The final output and retained tensors belong to the caller. Intermediate
+ * hidden tensors are released as execution advances. Failure or interruption
+ * releases all outputs produced by this call. The original input is borrowed.
+ *
+ * @since 0.1.0
+ * @category execution
+ */
+export const executeLayers = <E, R, OE = never, OR = never>(
+  input: Tensor.Any,
+  count: number,
+  build: (
+    layer: number,
+    hidden: Tensor.Concrete
+  ) => Effect.Effect<readonly [Tensor.Any, ...Array<Tensor.Any>], E, R>,
+  options: Runtime.ExecutableCompileOptions & {
+    readonly observeLayer?: ((layer: number, hidden: Tensor.Concrete) => Effect.Effect<void, OE, OR>) | undefined
+  } = {}
+): Effect.Effect<
+  {
+    readonly output: Tensor.Concrete
+    readonly retained: ReadonlyArray<ReadonlyArray<Tensor.Concrete>>
+  },
+  E | OE | ModelError | Tensor.TensorError,
+  R | OR | Runtime.Runtime
+> =>
+  Effect.suspend(() => {
+    const owned = new Set<Tensor.Concrete>()
+    const retained: Array<ReadonlyArray<Tensor.Concrete>> = []
+    const compute = (roots: ReadonlyArray<Tensor.Any>) =>
+      Tensor.compute(roots, { optimize: options.optimize, constantWeights: options.constantWeights }).pipe(
+        Effect.onExit((exit) => {
+          if (Exit.isSuccess(exit)) {
+            for (const tensor of exit.value) {
+              owned.add(tensor)
+            }
+          }
+
+          return Effect.void
+        })
+      )
+
+    return Effect.onExit(
+      Effect.gen(function*() {
+        if (!Number.isSafeInteger(count) || count < 0) {
+          return yield* new ModelError({ op: "executeLayers", message: "layer count must be a non-negative integer" })
+        }
+
+        let hidden = (yield* compute([input]))[0]
+
+        for (let layer = 0; layer < count; layer++) {
+          const roots = yield* build(layer, hidden)
+          const outputs: ReadonlyArray<Tensor.Concrete> = yield* compute(roots)
+          const previous = hidden
+          hidden = outputs[0]
+          retained.push(outputs.slice(1))
+
+          yield* Tensor.clear(previous)
+          owned.delete(previous)
+
+          if (options.observeLayer !== undefined) {
+            yield* options.observeLayer(layer, hidden)
+          }
+        }
+
+        return { output: hidden, retained }
+      }),
+      (exit) => Exit.isFailure(exit) ? Tensor.clearAll(owned) : Effect.void
+    )
+  })
+
+/**
+ * Graphs for a layered model with a read-only K/V prefix. Hidden tensors have
+ * shape [1, tokens, width]; each layer may use its own K/V geometry. Builders
+ * borrow their arguments and return lazy graphs without materializing tensors.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface PrefixModel<E = never, R = never> {
+  /** Token IDs lie in [0, vocabSize). */
+  readonly vocabSize: number
+  /** Maximum logical prefix plus read length. */
+  readonly maxTokens: number
+  /** Maximum tokens supplied to one read. */
+  readonly maxReadTokens: number
+  /** Number of prefill/read layers, excluding embeddings and readout. */
+  readonly layerCount: number
+  readonly embed: (
+    ids: Tensor.Any,
+    phase: "prefill" | "read"
+  ) => Effect.Effect<Tensor.Any, E | ModelError | Tensor.TensorError, R | Runtime.Runtime>
+  readonly prefillLayer: (
+    layer: number,
+    hidden: Tensor.Any,
+    positions: Tensor.Any
+  ) => Effect.Effect<
+    Tensor.KvPair & { readonly output: Tensor.Any },
+    E | ModelError | Tensor.TensorError,
+    R | Runtime.Runtime
+  >
+  readonly readLayer: (
+    layer: number,
+    hidden: Tensor.Any,
+    positions: Tensor.Any,
+    prefix: Tensor.KvPair
+  ) => Effect.Effect<Tensor.Any, E | ModelError | Tensor.TensorError, R | Runtime.Runtime>
+  /** Projects one selected hidden row to logits, optionally restricted to the supplied label IDs. */
+  readonly readout: (
+    hidden: Tensor.Any,
+    labels: Tensor.Any | undefined
+  ) => Effect.Effect<Tensor.Any, E | ModelError | Tensor.TensorError, R | Runtime.Runtime>
+}
+
+/**
+ * Compilation and observation controls for {@link executor}. The observer
+ * borrows each materialized hidden tensor for the duration of its effect.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ExecutorOptions<E = never, R = never> extends Runtime.ExecutableCompileOptions {
+  readonly observeLayer?:
+    | ((event: {
+      readonly phase: "prefill" | "read"
+      readonly layer: number
+      readonly hidden: Tensor.Concrete
+    }) => Effect.Effect<void, E, R>)
+    | undefined
+}
+
+/**
+ * Layer-at-a-time execution of a {@link PrefixModel}. Calls borrow model
+ * parameters and read-only prefixes. Results belong to the caller.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface Executor<E = never, R = never> {
+  readonly prefill: (
+    ids: Uint32Array
+  ) => Effect.Effect<Tensor.KvPrefix, E | ModelError | Tensor.TensorError, R | Runtime.Runtime>
+  readonly read: (
+    prefix: Tensor.KvPrefix,
+    ids: Uint32Array,
+    slot: number,
+    labelIds?: Uint32Array
+  ) => Effect.Effect<Tensor.Concrete, E | ModelError | Tensor.TensorError, R | Runtime.Runtime>
+}
+
+/**
+ * Executes prefix and read graphs through ordinary tensor invocations. Token
+ * validation, absolute positions, layer materialization, and cleanup are shared
+ * across models. Prefill releases its final hidden state and returns caller-owned
+ * K/V; read returns caller-owned logits for one selected row. Neither updates the
+ * supplied model or prefix. Observers run after each model layer, before readout.
+ *
+ * Keep parameters and prefixes live while calls borrow them. Release returned
+ * prefixes with Tensor.clearKvPrefix and logits with Tensor.clear. Failure or
+ * interruption releases partial outputs, including an unreturned prefix.
+ *
+ * @since 0.1.0
+ * @category execution
+ */
+export const executor = <E, R, OE = never, OR = never>(
+  model: PrefixModel<E, R>,
+  options: ExecutorOptions<OE, OR> = {}
+): Executor<E | OE, R | OR> => {
+  const compilation: Runtime.ExecutableCompileOptions = {
+    optimize: options.optimize,
+    constantWeights: options.constantWeights
+  }
+  const validateIds = (op: string, ids: Uint32Array) =>
+    Effect.gen(function*() {
+      if (ids.length === 0) {
+        return yield* new ModelError({ op, message: "token sequence must be nonempty" })
+      }
+
+      for (const id of ids) {
+        if (id >= model.vocabSize) {
+          return yield* new ModelError({ op, message: `token ID ${id} exceeds vocabulary` })
+        }
+      }
+    })
+
+  const prefill: Executor<E | OE, R | OR>["prefill"] = (inputIds) =>
+    Effect.gen(function*() {
+      yield* validateIds("prefill", inputIds)
+
+      if (inputIds.length > model.maxTokens) {
+        return yield* new ModelError({ op: "prefill", message: "prompt exceeds model position limit" })
+      }
+
+      const ids = yield* Tensor.fromTypedArray(inputIds, [1, inputIds.length])
+      const embeddings = yield* model.embed(ids, "prefill")
+      const positions = yield* Tensor.arange(inputIds.length, undefined, { dtype: "u32" })
+      const positionIds = yield* Tensor.reshape(positions, [1, inputIds.length])
+      const execution = executeLayers(
+        embeddings,
+        model.layerCount,
+        (layer, hidden) =>
+          model.prefillLayer(layer, hidden, positionIds).pipe(
+            Effect.map(({ output, keys, values }) => [output, keys, values] as const)
+          ),
+        {
+          ...compilation,
+          observeLayer: (layer, hidden) => options.observeLayer?.({ phase: "prefill", layer, hidden }) ?? Effect.void
+        }
+      )
+      let owned: ReadonlyArray<Tensor.Concrete> = []
+
+      return yield* execution.pipe(
+        Effect.onExit((exit) => {
+          if (Exit.isFailure(exit)) {
+            return Effect.void
+          }
+
+          const { output, retained } = exit.value
+          owned = [output, ...retained.flat()]
+
+          return Tensor.clear(output)
+        }),
+        Effect.map(({ retained }) =>
+          Tensor.makeKvPrefix(inputIds.length, retained.map(([keys, values]) => ({ keys, values })))
+        ),
+        Effect.onExit((exit) => Exit.isFailure(exit) ? Tensor.clearAll(owned) : Effect.void)
+      )
+    })
+
+  const read: Executor<E | OE, R | OR>["read"] = (prefix, inputIds, slot, labelIds) =>
+    Effect.gen(function*() {
+      yield* validateIds("read", inputIds)
+
+      if (!Number.isInteger(slot) || slot < 0 || slot >= inputIds.length) {
+        return yield* new ModelError({ op: "read", message: "answer slot is outside input" })
+      }
+
+      if (inputIds.length > model.maxReadTokens) {
+        return yield* new ModelError({ op: "read", message: "input exceeds model read length" })
+      }
+
+      if (prefix.tokenCount + inputIds.length > model.maxTokens) {
+        return yield* new ModelError({ op: "read", message: "input exceeds model position limit" })
+      }
+
+      if (prefix.layers.length !== model.layerCount) {
+        return yield* new ModelError({ op: "read", message: "prefix must contain K/V for every layer" })
+      }
+
+      if (labelIds !== undefined) {
+        yield* validateIds("read", labelIds)
+      }
+
+      const ids = yield* Tensor.fromTypedArray(inputIds, [1, inputIds.length])
+      const embeddings = yield* model.embed(ids, "read")
+      const positions = yield* Tensor.arange(prefix.tokenCount, prefix.tokenCount + inputIds.length, { dtype: "u32" })
+      const positionIds = yield* Tensor.reshape(positions, [1, inputIds.length])
+      const labels = labelIds === undefined ? undefined : yield* Tensor.fromTypedArray(labelIds)
+      const result = yield* executeLayers(
+        embeddings,
+        model.layerCount + 1,
+        (layer, hidden) =>
+          Effect.gen(function*() {
+            if (layer === model.layerCount) {
+              const selected = yield* Tensor.slice(hidden, {
+                start: [0, slot, 0],
+                end: [1, slot + 1, hidden.shape[2]]
+              })
+
+              return [yield* model.readout(selected, labels)] as const
+            }
+
+            return [yield* model.readLayer(layer, hidden, positionIds, prefix.layers[layer])] as const
+          }),
+        {
+          ...compilation,
+          observeLayer: (layer, hidden) =>
+            layer < model.layerCount
+              ? options.observeLayer?.({ phase: "read", layer, hidden }) ?? Effect.void
+              : Effect.void
+        }
+      )
+
+      return result.output
+    })
+
+  return { prefill, read }
 }
 
 interface ModelDef {

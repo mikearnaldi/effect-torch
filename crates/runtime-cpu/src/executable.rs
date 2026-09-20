@@ -249,6 +249,9 @@ pub enum CpuOp {
     Unary(CpuUnaryOp),
     Binary(CpuBinaryOp),
     Where,
+    TopKIndices {
+        k: usize,
+    },
     Argmax {
         dim: usize,
     },
@@ -331,6 +334,7 @@ pub enum CpuOp {
         layout: RotaryLayout,
     },
     Linear,
+    ExpertLinearRows,
     QuantizedLinear {
         codec: GgmlKQuant,
         weight_shape: [usize; 2],
@@ -458,6 +462,7 @@ impl CpuOp {
             Self::Binary(_) => "binary",
             Self::Where => "where",
             Self::Argmax { .. } | Self::Argmin { .. } => "arg_reduce",
+            Self::TopKIndices { .. } => "topKIndices",
             Self::Cumsum { .. } => "cumsum",
             Self::ScatterAdd { .. } => "scatter_add",
             Self::Gather { .. } => "gather",
@@ -481,6 +486,7 @@ impl CpuOp {
             Self::RotaryEmbedding { .. } => "rotary_embedding",
             Self::RotaryEmbeddingBackward { .. } => "rotary_embedding_backward",
             Self::Linear => "linear",
+            Self::ExpertLinearRows => "expertLinearRows",
             Self::QuantizedLinear { .. } => "quantized_linear",
             Self::QuantizedEmbedding { .. } => "quantized_embedding",
             Self::LinearResidual => "linear_residual",
@@ -1042,7 +1048,7 @@ impl Lowerer {
                 }
                 CpuAlgorithmPlan::Solve(requirements)
             }
-            CpuOp::Binary(_) => CpuAlgorithmPlan::None,
+            CpuOp::Binary(_) | CpuOp::TopKIndices { .. } => CpuAlgorithmPlan::None,
             CpuOp::Argmax { .. } | CpuOp::Argmin { .. } => {
                 let dimension = match &op {
                     CpuOp::Argmax { dim } | CpuOp::Argmin { dim } => *dim,
@@ -2354,6 +2360,7 @@ impl Lowerer {
             NodeKind::Sign { .. } => CpuOp::Unary(CpuUnaryOp::Sign),
             NodeKind::Where { .. } => CpuOp::Where,
             NodeKind::Argmax { dim, .. } => CpuOp::Argmax { dim: *dim },
+            NodeKind::TopKIndices { k, .. } => CpuOp::TopKIndices { k: *k },
             NodeKind::Argmin { dim, .. } => CpuOp::Argmin { dim: *dim },
             NodeKind::Cumsum { dim, .. } => CpuOp::Cumsum { dim: *dim },
             NodeKind::ScatterAdd { dim, .. } => CpuOp::ScatterAdd { dim: *dim },
@@ -2459,6 +2466,7 @@ impl Lowerer {
                 }
             }
             NodeKind::Linear { .. } => CpuOp::Linear,
+            NodeKind::ExpertLinearRows { .. } => CpuOp::ExpertLinearRows,
             NodeKind::QuantizedLinear { weight, .. } => {
                 let (codec, weight_shape) = weight.value_spec().packed_matrix()?;
                 CpuOp::QuantizedLinear {
@@ -3864,6 +3872,14 @@ fn dispatch_command<'a>(
             inputs[2].tensor(),
             &mut destinations[0],
         ),
+        CpuOp::ExpertLinearRows => inputs[0].tensor().expert_linear_rows_into(
+            inputs[1].tensor(),
+            inputs[2].tensor(),
+            &mut destinations[0],
+        ),
+        CpuOp::TopKIndices { k } => inputs[0]
+            .tensor()
+            .top_k_indices_into(*k, &mut destinations[0]),
         CpuOp::Argmax { dim } => {
             inputs[0].tensor().argmax_into(*dim, &mut scratch[0])?;
             scratch_value(0)

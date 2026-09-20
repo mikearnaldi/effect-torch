@@ -651,10 +651,11 @@ export interface Tokenizer extends Pipeable {
    * filters, and `tojson`, plus `raise_exception(message)` and
    * `strftime_now(format)`. `strftime_now` uses UTC and supports only `%Y`, `%m`,
    * `%d`, `%H`, `%M`, `%S`, and `%%`. Missing values use MiniJinja's lenient
-   * undefined behavior. The renderer strips one final template newline. It has
-   * no template loader or Transformers method-compatibility callback, so it
-   * cannot handle includes, imports, or calls such as `mapping.items()`. Do not
-   * assume full compatibility with Python Jinja or Transformers extensions.
+   * undefined behavior. The renderer strips one final template newline.
+   * MiniJinja-contrib's `pycompat` callback supplies Python-style methods such
+   * as `mapping.get(key, default)`, `mapping.items()`, and `string.split(sep)`.
+   * It supports a subset of Python methods and Transformers extensions.
+   * There is no template loader, so includes and imports are unavailable.
    * Rendering runs synchronously on the JavaScript thread and cannot be
    * interrupted after it starts.
    */

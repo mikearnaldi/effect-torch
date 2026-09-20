@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 napi = { version = "3", features = ["async"] }
 napi-derive = "3"
 rayon = "1"

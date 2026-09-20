@@ -867,6 +867,11 @@ export interface NodeOperationMap {
   readonly whereCond: {
     readonly inputs: readonly [condition: TensorHandle, a: TensorHandle, b: TensorHandle]
   }
+  /** Returns stable descending top-k indices on the last axis of an F32 tensor. */
+  readonly topKIndices: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly k: number }
+  }
   /** Returns indices of maximum values along one dimension. */
   readonly argmax: {
     readonly inputs: readonly [self: TensorHandle]
@@ -954,6 +959,10 @@ export interface NodeOperationMap {
   /** Applies a linear projection with a bias. */
   readonly linear: {
     readonly inputs: readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
+  }
+  /** Applies one row-oriented expert matrix per input row, selected by U32 indices. */
+  readonly expertLinearRows: {
+    readonly inputs: readonly [self: TensorHandle, weights: TensorHandle, indices: TensorHandle]
   }
   /** Applies a row-oriented packed linear projection, with an optional dense bias. */
   readonly quantizedLinear: {

@@ -78,6 +78,17 @@ fn lower_with(
                     a: child(a),
                     parameters: dims.iter().map(|dim| *dim as u64).collect(),
                 },
+                NodeKind::ExpertLinearRows { x, weight, indexes } => {
+                    Instruction::ExpertLinearRows {
+                        x: child(x),
+                        weight: child(weight),
+                        indexes: child(indexes),
+                        rows: x.shape[0],
+                        columns: weight.shape[1],
+                        inner: x.shape[1],
+                        experts: weight.shape[0],
+                    }
+                }
                 NodeKind::Linear { x, weight, bias } => Instruction::Linear {
                     x: child(x),
                     weight: child(weight),
@@ -199,6 +210,94 @@ fn kernel_descriptor_matches_cuda_layout() {
     assert_eq!(std::mem::size_of::<CudaKernelArgs>(), 360);
     assert_eq!(std::mem::offset_of!(CudaKernelArgs, metadata), 104);
     assert_eq!(std::mem::offset_of!(CudaKernelArgs, input_dtypes), 312);
+}
+
+#[test]
+fn expert_rows_keep_native_banks_and_u64_geometry_without_tensor_scratch() {
+    for optimize in [false, true] {
+        for dtype in [DType::F32, DType::BF16] {
+            for (rows, experts, columns, inner) in [
+                (64, 3, 13, 65),
+                (1, 2, 65536, 65536), // Bank spans more than 2^32 elements.
+                (u32::MAX as usize + 1, 1, 1, 0), // Row/grid arithmetic is also u64.
+                (3, 2, 0, 13),        // Route validation still launches when O=0.
+                (0, 2, 13, 65),
+            ] {
+                let root = Node::new(NodeKind::ExpertLinearRows {
+                    x: input(0, &[rows, inner], dtype),
+                    weight: input(1, &[experts, columns, inner], dtype),
+                    indexes: input(2, &[rows], DType::U32),
+                })
+                .unwrap();
+                // This direct F32 dot kernel does not require tensor core hardware.
+                let (program, commands, memory, count, bytes) =
+                    lower_with(vec![root], optimize, None, false);
+                assert_eq!((count, bytes), (0, 0));
+                let CommandKind::Kernel {
+                    name,
+                    args,
+                    inputs,
+                    scratch,
+                    ..
+                } = &commands
+                    .iter()
+                    .find(|command| {
+                        matches!(
+                            command.kind,
+                            CommandKind::Kernel {
+                                name: "et_expert_linear_rows",
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap()
+                    .kind
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*name, "et_expert_linear_rows");
+                assert_eq!(
+                    &args.integers[..4],
+                    &[rows as u64, columns as u64, inner as u64, experts as u64]
+                );
+                assert_eq!(args.elements, (rows * columns) as u64);
+                assert!(scratch.iter().all(Option::is_none));
+                let weight = inputs[1].unwrap();
+                assert_eq!(
+                    program.values[weight.index()].decl.bytes,
+                    experts * columns * inner * dtype.size_in_bytes()
+                );
+                assert!(matches!(
+                    memory.locations[weight.index()],
+                    Location::External { slot: 1 }
+                ));
+                assert_eq!(
+                    &args.input_dtypes[..3],
+                    &[dtype_code(dtype), dtype_code(dtype), dtype_code(DType::U32)]
+                );
+                assert_eq!(args.output_dtype, dtype_code(dtype));
+                assert_eq!(
+                    program.values[program.outputs[0].index()].decl.bytes,
+                    rows * columns * dtype.size_in_bytes()
+                );
+                assert!(!program
+                    .values
+                    .iter()
+                    .any(|value| value.decl.name.starts_with("scratch")));
+                let statuses: Vec<_> = program
+                    .values
+                    .iter()
+                    .filter(|value| value.decl.name.starts_with("status"))
+                    .collect();
+                assert_eq!(statuses.len(), 1);
+                assert_eq!(statuses[0].decl.bytes, 4);
+                assert_eq!(
+                    crate::executable::physical_counts(&program, &commands).0,
+                    2 + usize::from(rows != 0)
+                );
+            }
+        }
+    }
 }
 
 #[test]

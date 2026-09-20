@@ -1,0 +1,10 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "types": ["node"],
+    "paths": { "@effect/vitest": ["../../core/node_modules/@effect/vitest/dist/index.d.ts"] }
+  },
+  "include": ["./**/*.ts", "./fixtures/**/*.json"]
+}

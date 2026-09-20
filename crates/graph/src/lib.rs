@@ -800,6 +800,12 @@ pub enum NodeKind {
         a: Arc<Node>,
         dim: usize,
     },
+    /// Stable descending last-axis top-k indices, with U32 output and F32 input.
+    /// Ties use ascending indices. Infinities are valid; NaN fails execution.
+    TopKIndices {
+        a: Arc<Node>,
+        k: usize,
+    },
     /// Indices of the minima along `dim` with i64 output.
     Argmin {
         a: Arc<Node>,
@@ -1114,6 +1120,14 @@ pub enum NodeKind {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Arc<Node>,
+    },
+    /// Row-selected dense expert projection: x [N,I], weight [E,O,I], indexes [N].
+    /// F32/BF16 storage, F32 dot accumulation, one rounding to x's dtype.
+    /// Invalid U32 expert indexes fail execution, even with zero output width.
+    ExpertLinearRows {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        indexes: Arc<Node>,
     },
     /// A linear layer with packed K-quant weights. It multiplies f32
     /// `x [.., columns]` by the dequantized
@@ -1652,6 +1666,23 @@ impl NodeKind {
                 shape.remove(*dim);
                 (shape, DType::I64, a.device.clone())
             }
+            NodeKind::TopKIndices { a, k } => {
+                let width = *a
+                    .shape
+                    .last()
+                    .ok_or("topKIndices: input must have rank >= 1")?;
+                if *k == 0 || *k > width || width > u32::MAX as usize {
+                    return Err(format!(
+                        "topKIndices: require 0 < k <= width <= u32::MAX, got k={k}, width={width}"
+                    ));
+                }
+                if a.dtype != DType::F32 {
+                    return Err(format!("topKIndices: expected f32, got {}", a.dtype));
+                }
+                let mut shape = a.shape.clone();
+                *shape.last_mut().unwrap() = *k;
+                (shape, DType::U32, a.device.clone())
+            }
             NodeKind::Cumsum { a, dim } => {
                 if a.shape.is_empty() || *dim >= a.shape.len() {
                     return Err(format!(
@@ -2096,6 +2127,29 @@ impl NodeKind {
                 require_same_dtype("linear", &[x, weight, bias])?;
                 let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
                 (out, x.dtype, x.device.clone())
+            }
+            NodeKind::ExpertLinearRows { x, weight, indexes } => {
+                require_same_dtype("expertLinearRows", &[x, weight])?;
+                if !matches!(x.dtype, DType::F32 | DType::BF16) || indexes.dtype != DType::U32 {
+                    return Err(
+                        "expertLinearRows: expected F32/BF16 input and weights, U32 indices".into(),
+                    );
+                }
+                if x.shape.len() != 2
+                    || weight.shape.len() != 3
+                    || indexes.shape.len() != 1
+                    || x.shape[1] != weight.shape[2]
+                    || x.shape[0] != indexes.shape[0]
+                {
+                    return Err(
+                        "expertLinearRows: expected input [N,I], weights [E,O,I], and indices [N]"
+                            .into(),
+                    );
+                }
+                if weight.shape[0] == 0 || weight.shape[0] > u32::MAX as usize {
+                    return Err("expertLinearRows: E must be positive and fit U32".into());
+                }
+                (vec![x.shape[0], weight.shape[1]], x.dtype, x.device.clone())
             }
             NodeKind::QuantizedLinear { x, weight, bias } => {
                 let (_, [rows, columns]) = weight.packed_matrix()?;
@@ -2653,6 +2707,7 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Round { a }
         | NodeKind::Sign { a }
         | NodeKind::Argmax { a, .. }
+        | NodeKind::TopKIndices { a, .. }
         | NodeKind::Argmin { a, .. }
         | NodeKind::Inverse { a }
         | NodeKind::Det { a }
@@ -2771,6 +2826,9 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         }
         NodeKind::LayerNormBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::Linear { x, weight, bias } => vec![x.clone(), weight.clone(), bias.clone()],
+        NodeKind::ExpertLinearRows { x, weight, indexes } => {
+            vec![x.clone(), weight.clone(), indexes.clone()]
+        }
         NodeKind::QuantizedLinear {
             x, weight, bias, ..
         } => {
@@ -3220,6 +3278,11 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             weight: f(weight),
             bias: f(bias),
         },
+        NodeKind::ExpertLinearRows { x, weight, indexes } => NodeKind::ExpertLinearRows {
+            x: f(x),
+            weight: f(weight),
+            indexes: f(indexes),
+        },
         NodeKind::QuantizedLinear { x, weight, bias } => NodeKind::QuantizedLinear {
             x: f(x),
             weight: f(weight),
@@ -3366,6 +3429,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
         NodeKind::Round { a } => NodeKind::Round { a: f(a) },
         NodeKind::Sign { a } => NodeKind::Sign { a: f(a) },
         NodeKind::Argmax { a, dim } => NodeKind::Argmax { a: f(a), dim: *dim },
+        NodeKind::TopKIndices { a, k } => NodeKind::TopKIndices { a: f(a), k: *k },
         NodeKind::Argmin { a, dim } => NodeKind::Argmin { a: f(a), dim: *dim },
         NodeKind::Inverse { a } => NodeKind::Inverse { a: f(a) },
         NodeKind::Det { a } => NodeKind::Det { a: f(a) },
@@ -3783,6 +3847,11 @@ mod tests {
                 name: "packed".into(),
             },
             NodeKind::StopGradient { a: packed.clone() },
+            NodeKind::ExpertLinearRows {
+                x: typed(&[1, 256], DType::F32),
+                weight: packed.clone(),
+                indexes: typed(&[1], DType::U32),
+            },
         ] {
             assert!(Node::new(kind).err().unwrap().contains("packed storage"));
         }
@@ -3809,6 +3878,61 @@ mod tests {
             dtype: DType::U8,
             device: Device::Cpu(0),
             storage: StorageMetadata::packed(GgmlKQuant::Q4K)
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn expert_rows_native_metadata_checks_types_shapes_and_expert_index_width() {
+        let make = |x: &[usize], w: &[usize], ids: &[usize], dtype, id_dtype| {
+            Node::new(NodeKind::ExpertLinearRows {
+                x: typed(x, dtype),
+                weight: typed(w, dtype),
+                indexes: typed(ids, id_dtype),
+            })
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            for (x, w, ids, output) in [
+                (vec![16, 13], vec![3, 64, 13], vec![16], vec![16, 64]),
+                (vec![0, 13], vec![3, 64, 13], vec![0], vec![0, 64]),
+                (vec![16, 0], vec![3, 64, 0], vec![16], vec![16, 64]),
+                (vec![16, 13], vec![3, 0, 13], vec![16], vec![16, 0]),
+                (
+                    vec![1, 0],
+                    vec![u32::MAX as usize, 0, 0],
+                    vec![1],
+                    vec![1, 0],
+                ),
+            ] {
+                let node = make(&x, &w, &ids, dtype, DType::U32).unwrap();
+                assert_eq!(node.shape, output);
+                assert_eq!(node.dtype, dtype);
+                let children = node_children(&node.kind);
+                assert_eq!(children.len(), 3);
+                let rebuilt =
+                    Node::new(remap_children(&node.kind, &|child| child.clone())).unwrap();
+                assert_eq!(rebuilt.value_spec(), node.value_spec());
+            }
+        }
+        for dtype in [DType::F16, DType::F64, DType::I64, DType::U32, DType::U8] {
+            assert!(make(&[1, 2], &[3, 4, 2], &[1], dtype, DType::U32).is_err());
+        }
+        for (x, w, ids) in [
+            (vec![2], vec![3, 4, 2], vec![1]),
+            (vec![1, 2], vec![3, 2], vec![1]),
+            (vec![1, 2], vec![3, 4, 2], vec![1, 1]),
+            (vec![2, 2], vec![3, 4, 2], vec![1]),
+            (vec![1, 2], vec![3, 4, 5], vec![1]),
+            (vec![1, 2], vec![0, 4, 2], vec![1]),
+            (vec![1, 0], vec![u32::MAX as usize + 1, 0, 0], vec![1]),
+        ] {
+            assert!(make(&x, &w, &ids, DType::F32, DType::U32).is_err());
+        }
+        assert!(make(&[1, 2], &[3, 4, 2], &[1], DType::F32, DType::I64).is_err());
+        assert!(Node::new(NodeKind::ExpertLinearRows {
+            x: typed(&[1, 2], DType::F32),
+            weight: typed(&[3, 4, 2], DType::BF16),
+            indexes: typed(&[1], DType::U32),
         })
         .is_err());
     }

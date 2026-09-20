@@ -12,6 +12,60 @@ extern "C" __global__ void et_convert(CudaKernelArgs a) {
     et_u64 i = et_thread(); if (i >= a.elements) return;
     et_convert_lane(a.inputs[0], a.input_dtypes[0], i, a.output, a.output_dtype, i);
 }
+__device__ unsigned int et_top_k_order(float value) {
+    unsigned int bits = __float_as_uint(value);
+    if ((bits & 0x7fffffffU) == 0) bits = 0; // Signed zeros tie.
+    return (bits & 0x80000000U) ? ~bits : bits ^ 0x80000000U;
+}
+// Stable O(width*k) insertion. The planned output is also the workspace.
+// No sampled tokens, host scores, or dynamically allocated device storage.
+extern "C" __global__ void et_top_k_indices(CudaKernelArgs a) {
+    if (threadIdx.x != 0) return;
+    et_u64 row = blockIdx.x, k = a.integers[0], width = a.integers[1];
+    if (row >= a.elements / k) return;
+    const float *x = (const float *)a.inputs[0] + row * width;
+    unsigned int *out = (unsigned int *)a.output + row * k;
+    for (et_u64 i = 0; i < width; ++i) {
+        float value = x[i];
+        if ((__float_as_uint(value) & 0x7fffffffU) > 0x7f800000U) { et_error(a, 5); return; }
+        unsigned int order = et_top_k_order(value);
+        et_u64 used = i < k ? i : k, position = 0;
+        while (position < used && order <= et_top_k_order(x[out[position]])) ++position;
+        if (position < k) {
+            for (et_u64 j = used < k ? used : k - 1; j > position; --j) out[j] = out[j - 1];
+            out[position] = (unsigned int)i;
+        }
+    }
+}
+// One warp cooperates on a dot, with adjacent lanes reading adjacent weights.
+// Only native F32/BF16 elements of the selected expert are loaded.
+extern "C" __global__ void et_expert_linear_rows(CudaKernelArgs a) {
+    const et_u64 rows = a.integers[0], columns = a.integers[1], inner = a.integers[2], experts = a.integers[3];
+    const et_u64 width = columns ? columns : 1, work = rows * width;
+    const unsigned int lane = threadIdx.x & 31U;
+    const et_u64 stride = (et_u64)gridDim.x * (blockDim.x / 32);
+    for (et_u64 out = et_thread() / 32; out < work; out += stride) {
+        et_u64 row = out / width, column = out % width;
+        unsigned int expert = lane == 0 ? ((const unsigned int *)a.inputs[2])[row] : 0;
+        expert = __shfl_sync(0xffffffffU, expert, 0);
+        if ((et_u64)expert >= experts) {
+            if (lane == 0) {
+                et_error(a, 6);
+                if (columns) et_store(a.output, a.output_dtype, out, 0.0f);
+            }
+            continue;
+        }
+        if (!columns) continue;
+        float sum = 0.0f;
+        const et_u64 base = ((et_u64)expert * columns + column) * inner;
+        for (et_u64 i = lane; i < inner; i += 32) {
+            sum = fmaf(et_load<float>(a.inputs[0], a.input_dtypes[0], row * inner + i),
+                et_load<float>(a.inputs[1], a.input_dtypes[1], base + i), sum);
+        }
+        for (unsigned int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        if (lane == 0) et_store(a.output, a.output_dtype, out, sum);
+    }
+}
 extern "C" __global__ void et_fill(CudaKernelArgs a) {
     et_u64 i = et_thread(); if (i < a.elements) et_store(a.output, a.output_dtype, i, a.scalars[0]);
 }
@@ -154,7 +208,14 @@ template<class T> __device__ void et_index_impl(const CudaKernelArgs &a, et_u64 
                 et_u64 c = linear % ss[d]; linear /= ss[d];
                 target += ((unsigned int)d == dim ? selected : c) * stride; stride *= s[d];
             }
-            if (target == i) total = et_add(total, et_load<T>(a.inputs[2], a.input_dtypes[2], j));
+            if (target == i) {
+                total = et_add(total, et_load<T>(a.inputs[2], a.input_dtypes[2], j));
+                // Native half scatter updates round each addition to storage,
+                // just as the CPU's typed updates do. Do not silently widen
+                // repeated updates into one F32 reduction.
+                if (a.output_dtype == 2) total = (T)et_half_float(et_to16(total, false));
+                else if (a.output_dtype == 3) total = (T)et_bfloat_float(et_to16(total, true));
+            }
         }
         et_store(a.output, a.output_dtype, i, total);
     }

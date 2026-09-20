@@ -1,0 +1,267 @@
+[
+  {
+    "name": "user generation prompt",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "  Hello, café 猫!  "
+        }
+      ]
+    },
+    "expected": "<bos><|turn>user\nHello, café 猫!<turn|>\n<|turn>model\n"
+  },
+  {
+    "name": "system prompt with thinking enabled",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": true,
+      "enable_thinking": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "  Answer briefly.  "
+        },
+        {
+          "role": "user",
+          "content": "Why?"
+        }
+      ]
+    },
+    "expected": "<bos><|turn>system\n<|think|>\nAnswer briefly.<turn|>\n<|turn>user\nWhy?<turn|>\n<|turn>model\n"
+  },
+  {
+    "name": "multi-turn history strips old thinking and uses reasoning fallback",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "First question"
+        },
+        {
+          "role": "assistant",
+          "reasoning": "Old reasoning",
+          "content": "  Before<|channel>thought\nHidden<channel|>after  "
+        },
+        {
+          "role": "user",
+          "content": "Second question"
+        },
+        {
+          "role": "assistant",
+          "reasoning": null,
+          "reasoning_content": "Current reasoning",
+          "content": " <|channel>thought\nHidden again<channel|>Final answer "
+        }
+      ]
+    },
+    "expected": "<bos><|turn>user\nFirst question<turn|>\n<|turn>model\nBeforeafter<turn|>\n<|turn>user\nSecond question<turn|>\n<|turn>model\n<|channel>thought\nCurrent reasoning\n<channel|>Final answer<turn|>\n"
+  },
+  {
+    "name": "content parts preserve modality markers and strip assistant thinking",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": false,
+      "messages": [
+        {
+          "role": "developer",
+          "content": [
+            {
+              "type": "text",
+              "text": "  Describe. "
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "image.png"
+              }
+            },
+            {
+              "type": "input_audio",
+              "input_audio": {
+                "data": "audio"
+              }
+            },
+            {
+              "type": "video"
+            },
+            {
+              "type": "text",
+              "text": " What is this? "
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": " <|channel>thought\nHidden<channel|>A cat. "
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "<bos><|turn>system\nDescribe. <turn|>\n<|turn>user\n<|image|><|audio|><|video|>What is this?<turn|>\n<|turn>model\nA cat.<turn|>\n"
+  },
+  {
+    "name": "tool definitions, tool result lookup, and assistant continuation",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": false,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Look up weather",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Weather in Paris?"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": {
+                  "city": "Paris"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "Sunny"
+            },
+            {
+              "type": "image"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": "It is sunny."
+        }
+      ]
+    },
+    "expected": "<bos><|turn>system\n<|tool>declaration:weather{description:<|\"|>Look up weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:weather{value:<|\"|>Sunny<|\"|>}<tool_response|><|image|><|turn>model\nIt is sunny.<turn|>\n"
+  },
+  {
+    "name": "pending tool call keeps the response prefix open",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Check status"
+        },
+        {
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "name": "status",
+                "arguments": null
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "<bos><|turn>user\nCheck status<turn|>\n<|turn>model\n<|tool_call>call:status{}<tool_call|><|tool_response>"
+  },
+  {
+    "name": "embedded tool response resumes the thinking channel",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": true,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Check status"
+        },
+        {
+          "role": "assistant",
+          "reasoning": "Check the service",
+          "tool_calls": [
+            {
+              "function": {
+                "name": "status",
+                "arguments": {}
+              }
+            }
+          ],
+          "tool_responses": [
+            {
+              "name": "status",
+              "response": {
+                "ok": true,
+                "data": [
+                  1,
+                  null,
+                  "ready"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nCheck status<turn|>\n<|turn>model\n<|channel>thought\nCheck the service\n<channel|><|tool_call>call:status{}<tool_call|><|tool_response>response:status{data:[1,null,<|\"|>ready<|\"|>],ok:true}<tool_response|><|channel>thought\n"
+  },
+  {
+    "name": "missing and null content render empty turns",
+    "context": {
+      "bos_token": "<bos>",
+      "add_generation_prompt": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": null
+        },
+        {
+          "role": "assistant"
+        }
+      ]
+    },
+    "expected": "<bos><|turn>user\n<turn|>\n<|turn>model\n<turn|>\n<|turn>model\n"
+  }
+]

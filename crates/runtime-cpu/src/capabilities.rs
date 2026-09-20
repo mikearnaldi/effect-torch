@@ -43,7 +43,7 @@ impl TargetDTypeCapabilities for CpuDTypeCapabilities {
         &self.fingerprint
     }
     fn policy_revision(&self) -> u64 {
-        2
+        4
     }
 
     fn storage_support(&self, value: &ValueSpec<'_>) -> StorageSupport {
@@ -316,6 +316,9 @@ fn operand_role(operation: &NodeKind, index: usize) -> ValueRole {
             [ValueRole::Activation, ValueRole::Weight, ValueRole::Bias][index]
         }
         NodeKind::QuantizedEmbedding { .. } => [ValueRole::Indices, ValueRole::Weight][index],
+        NodeKind::ExpertLinearRows { .. } => {
+            [ValueRole::Activation, ValueRole::Weight, ValueRole::Indices][index]
+        }
         NodeKind::AdamWStep { .. } => match index {
             0 => ValueRole::Parameter,
             1 => ValueRole::Gradient,
@@ -486,6 +489,7 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
         | NodeKind::Min { .. }
         | NodeKind::Prod { .. }
         | NodeKind::Argmax { .. }
+        | NodeKind::TopKIndices { .. }
         | NodeKind::Argmin { .. }
         | NodeKind::Cumsum { .. }
         | NodeKind::IndexSelect { .. }
@@ -510,6 +514,7 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
         | NodeKind::RotaryEmbeddingBackward { .. }
         | NodeKind::LayerNormBackwardOut { .. }
         | NodeKind::QuantizedLinear { .. }
+        | NodeKind::ExpertLinearRows { .. }
         | NodeKind::QuantizedEmbedding { .. }
         | NodeKind::Conv1d { .. }
         | NodeKind::Conv2d { .. }

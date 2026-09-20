@@ -1039,6 +1039,8 @@ export const createRuntimeAdapter = (
             )
           case "argmax":
             return graph(nativeGraph(request.inputs[0], operation).argmax(request.attributes.dim))
+          case "topKIndices":
+            return graph(nativeGraph(request.inputs[0], operation).topKIndices(request.attributes.k))
           case "argmin":
             return graph(nativeGraph(request.inputs[0], operation).argmin(request.attributes.dim))
           case "cumsum":
@@ -1128,6 +1130,13 @@ export const createRuntimeAdapter = (
           case "linear":
             return graph(
               nativeGraph(request.inputs[0], operation).linear(
+                nativeGraph(request.inputs[1], operation),
+                nativeGraph(request.inputs[2], operation)
+              )
+            )
+          case "expertLinearRows":
+            return graph(
+              nativeGraph(request.inputs[0], operation).expertLinearRows(
                 nativeGraph(request.inputs[1], operation),
                 nativeGraph(request.inputs[2], operation)
               )

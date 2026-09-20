@@ -357,6 +357,7 @@ name = "effect-torch-tokenizers"
 version = "0.1.0"
 dependencies = [
  "minijinja",
+ "minijinja-contrib",
  "napi",
  "napi-build 1.2.1",
  "napi-derive",
@@ -633,6 +634,16 @@ dependencies = [
  "memo-map",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
+dependencies = [
+ "minijinja",
+ "serde",
 ]
 
 [[package]]
