@@ -5776,13 +5776,11 @@ export const gatedExperts = (
     const projected = yield* project(activation, down, flatIndices)
     const routeMajor = yield* reshape(projected, [routes, rows, outputWidth])
     const tokenMajor = yield* transpose(routeMajor, [1, 0, 2])
-    const projectedRows = yield* reshape(tokenMajor, [rows * routes, outputWidth])
 
-    const projectedFloat = yield* cast(projectedRows, "f32")
-    const flatWeights = yield* reshape(routingWeights, [rows * routes, 1])
-    const weightedFloat = yield* mul(projectedFloat, flatWeights)
-    const contributions = yield* cast(weightedFloat, input.dtype)
-    const weighted = yield* reshape(contributions, [rows, routes, outputWidth])
+    const projectedFloat = yield* cast(tokenMajor, "f32")
+    const expandedWeights = yield* unsqueeze(routingWeights, -1)
+    const weightedFloat = yield* mul(projectedFloat, expandedWeights)
+    const weighted = yield* cast(weightedFloat, input.dtype)
 
     // Rank routes by (expert ID, original position) using integer comparisons.
     // This remains exact for the full U32 domain and handles repeated experts.
