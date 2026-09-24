@@ -1956,8 +1956,14 @@ export const generate = <E = never, R = never>(
     }
 
     const explicitRandom = options.random
-    const random = explicitRandom ??
-      (yield* generationRandom(options.seed ?? Math.floor(Math.random() * 0x1_0000_0000)))
+    let requestSeed: number | undefined
+    let random: GenerationRandom
+    if (explicitRandom === undefined) {
+      requestSeed = options.seed ?? randomInt(0x1_0000_0000)
+      random = yield* generationRandom(requestSeed)
+    } else {
+      random = explicitRandom
+    }
 
     let randomMilliseconds = 0
     let processingMilliseconds = 0
@@ -1993,7 +1999,7 @@ export const generate = <E = never, R = never>(
         ? ([logits, temperature]) => generationStatisticsWithDeviceNoise(logits!, temperature!, program.predictionDtype)
         : ([logits, exponentials, temperature]) =>
           generationStatistics(logits!, exponentials!, temperature!, program.predictionDtype),
-      options.compile
+      explicitRandom === undefined ? { ...options.compile, randomSeed: requestSeed } : options.compile
     )
 
     const pages: Array<Uint32Array> = []

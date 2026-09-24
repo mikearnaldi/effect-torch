@@ -136,6 +136,7 @@ export declare function loadTensors(path: string, device: number, token?: Cancel
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined
+  randomSeed?: number | undefined
   constantWeights?: boolean | undefined
 }
 

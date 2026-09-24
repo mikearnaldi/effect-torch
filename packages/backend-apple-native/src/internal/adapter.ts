@@ -1074,6 +1074,7 @@ export const createRuntimeAdapter = (
       ? undefined
       : {
         optimize: request.options.optimize,
+        randomSeed: request.options.randomSeed,
         constantWeights: request.options.constantWeights
       }
 
@@ -1589,6 +1590,7 @@ export const createRuntimeAdapter = (
 
     return {
       optimize: options.optimize,
+      randomSeed: options.randomSeed,
       constantWeights: options.constantWeights
     }
   }

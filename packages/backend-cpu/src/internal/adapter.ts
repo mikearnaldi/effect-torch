@@ -1037,6 +1037,7 @@ export const createRuntimeAdapter = (
       ? undefined
       : {
         optimize: request.options.optimize,
+        randomSeed: request.options.randomSeed,
         constantWeights: request.options.constantWeights
       }
 
@@ -2566,6 +2567,7 @@ export const createRuntimeAdapter = (
             ? undefined
             : {
               optimize: request.options.optimize,
+              randomSeed: request.options.randomSeed,
               constantWeights: request.options.constantWeights
             }
           // SAFETY: Decode-state unions match the generated napi-rs string enums.

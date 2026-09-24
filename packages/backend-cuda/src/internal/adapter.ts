@@ -2324,6 +2324,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               ? undefined
               : {
                 optimize: request.options.optimize,
+                randomSeed: request.options.randomSeed,
                 constantWeights: request.options.constantWeights
               },
             request.state === undefined ? undefined : nativeState(request.state)

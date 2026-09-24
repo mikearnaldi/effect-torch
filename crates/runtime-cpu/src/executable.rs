@@ -628,6 +628,7 @@ pub struct CpuExecutable {
     pub diagnostics: ExecutableDiagnostics,
     pub compiler_work: CompilerWorkReport,
     pub state_cursor: Option<ValueId>,
+    runs: AtomicU64,
 }
 
 impl fmt::Debug for CpuExecutable {
@@ -3079,6 +3080,7 @@ impl Lowerer {
                 diagnostics,
                 compiler_work: CompilerWorkReport::default(),
                 state_cursor: self.state_cursor,
+                runs: AtomicU64::new(0),
             },
             self.generated,
             self.generated_slots,
@@ -3369,6 +3371,7 @@ fn compile_prepared_internal(
     if slots.iter().any(|slot| !slot.device.is_cpu()) {
         return Err("compile: graph contains an unsupported device".to_string());
     }
+    let stable_random_provenance = options.random_seed.is_some();
     let random_provenance = index
         .random_source_order
         .iter()
@@ -3376,7 +3379,12 @@ fn compile_prepared_internal(
             let node = index
                 .node(source.node)
                 .ok_or_else(|| format!("compile: random source {} is out of range", source.node))?;
-            Ok((node.id, source.provenance))
+            let provenance = if stable_random_provenance {
+                source.id.index() as u64
+            } else {
+                source.provenance
+            };
+            Ok((node.id, provenance))
         })
         .collect::<Result<HashMap<_, _>, String>>()?;
     let mut lowerer = Lowerer::new(
@@ -4670,7 +4678,10 @@ fn execute_reported_with_commit(
             )
             .map_err(|error| format!("execute: {error}"))?;
     }
-    let nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
+    let nonce = executable.options.random_seed.map_or_else(
+        || INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel),
+        |seed| seed.wrapping_add(executable.runs.fetch_add(1, Ordering::AcqRel)),
+    );
     let segments = acquire_segments(executable)?;
     let values = {
         let _allocation_guard = ExecutableAllocationGuard::enter();

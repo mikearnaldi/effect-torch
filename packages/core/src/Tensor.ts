@@ -4584,6 +4584,13 @@ export const freezeProgram = (
   options: Runtime.ExecutableCompileOptions = {}
 ): Effect.Effect<CompiledProgram, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
+    if (
+      options.randomSeed !== undefined &&
+      (!Number.isInteger(options.randomSeed) || options.randomSeed < 0 || options.randomSeed > 0xffff_ffff)
+    ) {
+      return yield* new TensorError({ op: "compile", message: "randomSeed must be an unsigned 32-bit integer" })
+    }
+
     const runtime = yield* Runtime.Runtime
     const handle = yield* fromBackend("compile", runtime.compile({ roots, options }))
 
@@ -6052,6 +6059,7 @@ export const compile = <E = never, R = never>(
 
         const compileOptions: Runtime.ExecutableCompileOptions = {
           optimize: options.optimize,
+          randomSeed: options.randomSeed,
           constantWeights: options.constantWeights
         }
 

@@ -106,6 +106,9 @@ pub struct CompileOptions {
     /// Master switch for region selection. When false, the plan covers no
     /// regions, and every node lowers independently.
     pub optimize: bool,
+    /// Caller-provided base seed for reproducible random nodes. Each invocation
+    /// advances an executable-local counter from this seed.
+    pub random_seed: Option<u64>,
     /// Caller-authorized inference-only assumptions.
     pub inference: Option<InferenceOptions>,
     /// Frozen environment switches.
@@ -116,6 +119,7 @@ impl Default for CompileOptions {
     fn default() -> Self {
         Self {
             optimize: true,
+            random_seed: None,
             inference: None,
             environment: EnvironmentOptions::default(),
         }

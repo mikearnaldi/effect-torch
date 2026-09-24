@@ -260,6 +260,7 @@ impl From<NativeDType> for DType {
 #[napi(object)]
 pub struct NativeCompileOptions {
     pub optimize: Option<bool>,
+    pub random_seed: Option<u32>,
     pub constant_weights: Option<bool>,
 }
 
@@ -2491,6 +2492,7 @@ fn resolve_compile_options(native: Option<NativeCompileOptions>, stateful: bool)
         if let Some(optimize) = native.optimize {
             options.optimize = optimize;
         }
+        options.random_seed = native.random_seed.map(u64::from);
         if stateful || native.constant_weights.is_some() {
             options.inference = Some(InferenceOptions {
                 constant_weights: native.constant_weights.unwrap_or(false),
@@ -2614,6 +2616,7 @@ pub fn compile(
     let effective_cache_key = cache_key
         .filter(|_| {
             std::env::var_os("EFFECT_TORCH_NO_EXECUTABLE_CACHE").is_none()
+                && program.options.random_seed.is_none()
                 && !program
                     .options
                     .inference
@@ -10835,6 +10838,7 @@ mod tests {
         let second_root = graph(vec![3.0, 4.0]);
         let constant_options = || NativeCompileOptions {
             optimize: None,
+            random_seed: None,
             constant_weights: Some(true),
         };
         let key = Some("cpu-constant-weight-cache-suppression-test".to_string());

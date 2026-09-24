@@ -375,6 +375,7 @@ fn gpu_program(
             vec![&LazyTensor { node: root }],
             Some(NativeCompileOptions {
                 optimize: Some(false),
+                random_seed: None,
                 constant_weights: None,
             }),
             Some(NativeKvStateSchema {

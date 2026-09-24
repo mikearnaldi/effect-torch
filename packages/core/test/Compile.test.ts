@@ -200,6 +200,40 @@ onDevices("Compile", (device) => (it) => {
         expect(yield* values(first)).not.toEqual(yield* values(second))
       }))
 
+    it.effect("reproduces request-local random streams from a compile seed", () =>
+      Effect.gen(function*() {
+        const build = () =>
+          Tensor.compile(
+            ([a]) =>
+              Effect.gen(function*() {
+                const noise = yield* Tensor.uniform(a.shape)
+
+                return [yield* Tensor.add(a, noise)]
+              }),
+            { randomSeed: 42 }
+          )
+        const firstProgram = yield* build()
+        const secondProgram = yield* build()
+        const x = yield* Tensor.zeros([64])
+
+        const [first] = yield* firstProgram.call([x])
+        const [second] = yield* firstProgram.call([x])
+        const [replayedFirst] = yield* secondProgram.call([x])
+        const [replayedSecond] = yield* secondProgram.call([x])
+
+        expect(yield* values(first)).toEqual(yield* values(replayedFirst))
+        expect(yield* values(second)).toEqual(yield* values(replayedSecond))
+        expect(yield* values(first)).not.toEqual(yield* values(second))
+      }))
+
+    it.effect("rejects invalid compile seeds", () =>
+      Effect.gen(function*() {
+        const fn = yield* Tensor.compile(([a]) => Effect.succeed([a]), { randomSeed: -1 })
+        const error = yield* Effect.flip(fn.call([yield* Tensor.zeros([1])]))
+
+        expect(error.message).toContain("randomSeed must be an unsigned 32-bit integer")
+      }))
+
     it.effect("the static executable plan matches direct computation across inputs", () =>
       Effect.gen(function*() {
         // Matmuls break fusion, so the graph has real intermediates for

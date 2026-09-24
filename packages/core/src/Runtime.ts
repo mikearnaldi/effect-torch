@@ -338,6 +338,13 @@ export interface ExecutableCompileOptions {
    */
   readonly optimize?: boolean | undefined
   /**
+   * Optional unsigned 32-bit base seed for random graph nodes. The first
+   * invocation uses this seed and later invocations advance a program-local
+   * counter. Programs compiled independently with the same seed and graph
+   * reproduce the same per-invocation stream.
+   */
+  readonly randomSeed?: number | undefined
+  /**
    * Authorizes inference-only retention of eligible materialized graph leaves
    * as executable constants. The executable, rather than the source handle,
    * retains the storage it needs. Bundled runtimes bypass structural

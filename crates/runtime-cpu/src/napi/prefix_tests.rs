@@ -62,6 +62,7 @@ fn attention_program(
         vec![&root],
         Some(NativeCompileOptions {
             optimize: Some(false),
+            random_seed: None,
             constant_weights: None,
         }),
         Some(NativeKvStateSchema {

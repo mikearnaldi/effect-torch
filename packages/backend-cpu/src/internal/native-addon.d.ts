@@ -303,6 +303,7 @@ export declare function loadTensors(path: string, token?: CancellationToken | un
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined
+  randomSeed?: number | undefined
   constantWeights?: boolean | undefined
 }
 

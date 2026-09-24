@@ -2524,6 +2524,7 @@ pub(super) struct MetalExecutable {
     /// Memory report of the most recent invocation (observability).
     pub last_invocation_memory: Mutex<Option<InvocationMemoryReport>>,
     state_cursor: Option<ValueId>,
+    runs: AtomicU64,
 }
 
 /// Marks encode commands whose results feed only output 0, the logits row of a
@@ -5649,6 +5650,7 @@ impl<'a> Lowerer<'a> {
                 compiler_work: CompilerWorkReport::default(),
                 last_invocation_memory: Mutex::new(None),
                 state_cursor: self.state_cursor,
+                runs: AtomicU64::new(0),
             },
             self.generated,
             self.generated_order,
@@ -7038,7 +7040,10 @@ fn prepare_execution(
         Some(_) => None,
         None => Some(metal.begin_submission()?),
     };
-    let invocation_nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
+    let invocation_nonce = executable.options.random_seed.map_or_else(
+        || INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel),
+        |seed| seed.wrapping_add(executable.runs.fetch_add(1, Ordering::AcqRel)),
+    );
     let mut sampling_encoded = 0;
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _dispatch_guard = metal.begin_executable_dispatch()?;

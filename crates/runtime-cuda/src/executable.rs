@@ -904,7 +904,20 @@ fn semantic_instruction(
     device: &Arc<CudaDevice>,
     ordinal: u32,
     state_cursor: Option<(u32, bool)>,
+    stable_random_provenance: bool,
 ) -> Result<Instruction, String> {
+    let random_provenance = || -> Result<u64, String> {
+        if !stable_random_provenance {
+            return Ok(node.id);
+        }
+        let dense = index
+            .dense_id(node.id)
+            .ok_or_else(|| format!("compile: CUDA random source {} is missing", node.id))?;
+        let source = index.random_sources[dense.index()]
+            .ok_or_else(|| format!("compile: CUDA random source {dense} has no identity"))?;
+        Ok(source.index() as u64)
+    };
+
     Ok(match &node.kind {
         NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
             return Err("compile: semantic operation escaped native preparation".into());
@@ -981,13 +994,13 @@ fn semantic_instruction(
             normal: true,
             lo: 0.0,
             hi: 1.0,
-            provenance: node.id,
+            provenance: random_provenance()?,
         },
         NodeKind::Uniform { lo, hi, .. } => Instruction::Random {
             normal: false,
             lo: *lo,
             hi: *hi,
-            provenance: node.id,
+            provenance: random_provenance()?,
         },
         NodeKind::Arange { start, step, .. } => Instruction::Sequence {
             eye: false,
@@ -1951,6 +1964,7 @@ pub struct CudaExecutable {
     outputs: Box<[(Vec<usize>, DType)]>,
     diagnostics: ExecutableDiagnostics,
     compiler_work: CompilerWorkReport,
+    random_seed: Option<u64>,
     runs: AtomicU64,
     graph_runtime: Mutex<GraphRuntime>,
 }
@@ -3031,8 +3045,9 @@ impl CudaExecutable {
                             .map_err(|_| "execute: CUDA error context exceeds u32")?;
                     }
                     if name.starts_with("et_random_") {
-                        args.integers[0] =
-                            args.integers[0].wrapping_add(run.wrapping_mul(0x9e3779b97f4a7c15));
+                        args.integers[0] = args.integers[0]
+                            .wrapping_add(self.random_seed.unwrap_or(0))
+                            .wrapping_add(run.wrapping_mul(0x9e3779b97f4a7c15));
                     }
                     let transaction_buffers = state_buffers
                         .iter()
@@ -3487,6 +3502,7 @@ fn compile_inner(
 ) -> Result<CudaExecutable, String> {
     let device = CudaDevice::get(ordinal)?;
     let capabilities = CudaCapabilities::for_device(&device)?;
+    let random_seed = options.random_seed;
     let mut request = ProgramRequest::from_roots(roots, options);
     if let Some((slot, tensor)) = state_cursor {
         request = request.with_state_cursor(StateCursorSlot::new(slot, tensor));
@@ -3498,7 +3514,14 @@ fn compile_inner(
     driver.lower(|unit, index, optimization, plan| match unit {
         LoweringUnit::Node(dense) => {
             let node = index.node(dense).ok_or("compile: CUDA node missing")?;
-            let instruction = semantic_instruction(node, index, &device, ordinal, state_cursor)?;
+            let instruction = semantic_instruction(
+                node,
+                index,
+                &device,
+                ordinal,
+                state_cursor,
+                random_seed.is_some(),
+            )?;
             builder.add(dense, node, index, optimization, instruction, plan)
         }
         LoweringUnit::Region(region) => {
@@ -3585,6 +3608,7 @@ fn compile_inner(
         outputs,
         diagnostics,
         compiler_work: work,
+        random_seed,
         runs: AtomicU64::new(0),
         graph_runtime: Mutex::new(GraphRuntime::default()),
     };
