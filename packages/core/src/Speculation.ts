@@ -2,14 +2,14 @@
  * Defines autoregressive, history lookup, and parallel block proposers for
  * speculative decoding.
  *
- * TypeScript describes the proposer and builds its Tensor graphs. Model
- * inference traces those graphs and lowers the selected variant to Runtime
+ * TypeScript describes the proposer and builds its Tensor graphs.
+ * `AutoRegressive.compile` traces those graphs and lowers the selected variant to Runtime
  * wire plans; native runtimes own execution, state, sampling, and acceptance.
  *
  * @since 0.1.0
  */
 import type { Effect } from "effect"
-import type { Model, ModelError, Params } from "./Model.ts"
+import type { Definition, ModelError, Parameters } from "./Model.ts"
 import type * as Runtime from "./Runtime.ts"
 import type * as Tensor from "./Tensor.ts"
 
@@ -36,7 +36,7 @@ export interface HiddenTap {
   /**
    * Name of the target-model exposure routed to the proposer, matching a
    * `Tensor.expose` call in the target's `forward` (see
-   * {@link Model.hiddenExposure} for the per-layer residual contract).
+   * {@link Definition.hiddenExposure} for the per-layer residual contract).
    */
   readonly name: string
   /** Required residual element dtype. */
@@ -70,9 +70,9 @@ export interface Autoregressive {
   /** Discriminates an autoregressive proposer. */
   readonly _tag: "Autoregressive"
   /** Draft model traced into prefill and decode programs. */
-  readonly model: Model
+  readonly model: Definition
   /** Parameters supplied to the draft model. */
-  readonly params: Params
+  readonly params: Parameters
   /** Shared target and proposer vocabulary size. */
   readonly vocabulary: number
   /** Maximum candidate tokens proposed per speculative round. */
@@ -122,7 +122,7 @@ export interface ParallelBlock {
   /** Discriminates a replayable parallel-block proposer. */
   readonly _tag: "ParallelBlock"
   /** Proposer-owned parameters consumed by graph builders. */
-  readonly params: Params
+  readonly params: Parameters
   /** Target vocabulary size of emitted token ids and probability rows. */
   readonly vocabulary: number
   /** Maximum candidate tokens built by one parallel block. */
@@ -139,7 +139,7 @@ export interface ParallelBlock {
   readonly attentionWindow?: number
   /** Builds candidate token ids from anchor tokens and shared target weights. */
   readonly build: (
-    params: Params,
+    params: Parameters,
     anchorTokens: Tensor.Any,
     tokenEmbedding: Tensor.Any,
     lmHead: Tensor.Any,
@@ -147,7 +147,7 @@ export interface ParallelBlock {
   ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, Runtime.Runtime>
   /** Builds candidate token ids together with their probability rows. */
   readonly buildWithProbabilities?: (
-    params: Params,
+    params: Parameters,
     anchorTokens: Tensor.Any,
     tokenEmbedding: Tensor.Any,
     lmHead: Tensor.Any,
@@ -155,7 +155,7 @@ export interface ParallelBlock {
   ) => Effect.Effect<ParallelBlockOutput, ModelError | Tensor.TensorError, Runtime.Runtime>
   /** Rebuilds authoritative proposer key/value rows from target hidden taps. */
   readonly replay: (
-    params: Params,
+    params: Parameters,
     targetRows: ReadonlyArray<Tensor.Any>
   ) => Effect.Effect<ReadonlyArray<KeyValue>, ModelError | Tensor.TensorError, Runtime.Runtime>
 }
@@ -166,7 +166,7 @@ export interface ParallelBlock {
  * @since 0.1.0
  * @category models
  */
-export type Artifact = Autoregressive | HistoryLookup | ParallelBlock
+export type Proposer = Autoregressive | HistoryLookup | ParallelBlock
 
 /**
  * Constructs an exact autoregressive proposer without tracing or compiling it.
@@ -175,9 +175,12 @@ export type Artifact = Autoregressive | HistoryLookup | ParallelBlock
  * @category constructors
  */
 export const autoregressive = (
-  model: Model,
-  params: Params,
-  options: { readonly vocabulary: number; readonly maxDraftTokens: number }
+  model: Definition,
+  params: Parameters,
+  options: {
+    readonly vocabulary: number
+    readonly maxDraftTokens: number
+  }
 ): Autoregressive => ({ _tag: "Autoregressive", model, params, ...options })
 
 /**

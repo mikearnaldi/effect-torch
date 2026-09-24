@@ -11,7 +11,7 @@ import { Effect } from "effect"
 // layers, so this small stack has neither a position table nor RoPE. The cited
 // NoPE result applies to the global attention layers, not KDA itself.
 //
-// Model.inference rewrites KDA layers into stateful recurrent decoding with
+// AutoRegressive.compile rewrites KDA layers into stateful recurrent decoding with
 // fixed-size state for each sequence. Training uses the closed-form KDA backward
 // pass from RFC 0018 phase 4.
 //
@@ -23,39 +23,49 @@ export const CHECKPOINT = new URL("../data/fineweb-kda-model.safetensors", impor
 
 /** Training sequence length and full-attention inference window. */
 export const BLOCK = Number(process.env.FINEWEB_BLOCK ?? 256)
+
 /** Transformer residual width. */
 export const EMBED = 256
+
 /** Number of token-mixing heads per transformer block. */
 export const HEADS = 4
+
 /** Number of transformer blocks. */
 export const LAYERS = 6
 
 /** Builds the FineWeb hybrid KDA/full-attention model for a vocabulary size. */
 export const createKdaGpt = (
   vocabSize: number
-): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError> =>
+): Effect.Effect<Model.Definition, Model.ModelError | Tensor.TensorError> =>
   Effect.gen(function*() {
     const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
-    const blocks: Array<Model.Model> = []
+    const blocks: Array<Model.Definition> = []
+
     for (let i = 0; i < LAYERS; i++) {
       const isKda = i !== LAYERS - 1 && (i + 1) % 4 !== 0
+
       const core = isKda
         ? yield* Model.kimiDeltaAttention(`b${i}.attn`, EMBED, HEADS)
         : yield* Model.multiHeadAttention(`b${i}.attn`, EMBED, HEADS, { causal: true })
+
       const attn = yield* Model.chain(yield* Model.layerNorm(`b${i}.ln1`, EMBED), core)
+
       const mlp = yield* Model.chain(
         yield* Model.layerNorm(`b${i}.ln2`, EMBED),
         yield* Model.linear(`b${i}.fc`, EMBED, 4 * EMBED),
         yield* Model.gelu(),
         yield* Model.linear(`b${i}.proj`, 4 * EMBED, EMBED)
       )
+
       blocks.push(yield* Model.chain(yield* Model.residual(attn), yield* Model.residual(mlp)))
     }
+
     const model = yield* Model.chain(
       embeddings,
       ...blocks,
       yield* Model.layerNorm("lnf", EMBED),
       yield* Model.linear("head", EMBED, vocabSize)
     )
+
     return model
   })

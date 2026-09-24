@@ -6,7 +6,7 @@ import fs from "node:fs"
 import { BLOCK, CHECKPOINT, createKdaGpt, heldOutLoss, loadBin, loadTokenizer, saveParams, windows } from "./model.js"
 
 // FineWeb pilot training for the hybrid KDA model. Training uses the chunked KDA
-// forward pass and closed-form backward pass. Model.inference later converts the
+// forward pass and closed-form backward pass. AutoRegressive.compile later converts the
 // same layers to recurrent state for each sequence. `CKPT` is a resumable
 // archive. `CHECKPOINT` is the final bare-parameter artifact that generation reads.
 //
@@ -18,13 +18,19 @@ import { BLOCK, CHECKPOINT, createKdaGpt, heldOutLoss, loadBin, loadTokenizer, s
 // does not check that they are finite positive integers.
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
+
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
+
 const CKPT = new URL("../data/fineweb-kda-ckpt.safetensors", import.meta.url).pathname
 
 const BATCH = 32
+
 const STEPS = Number(process.env.FINEWEB_STEPS ?? 5000)
+
 const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 100)
+
 const LR = 6e-4
+
 const VAL_BATCHES = 20
 
 const program = Effect.gen(function*() {
@@ -46,6 +52,7 @@ const program = Effect.gen(function*() {
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (checkpoint every ${CHECKPOINT_EVERY})`)
   let sampler: Sampler.Sampler
   const optimizer = yield* Optimizer.adamW()
+
   const trainer = yield* Trainer.make(model, {
     optimizer,
     lr: LearningRate.constant(LR),
@@ -53,6 +60,7 @@ const program = Effect.gen(function*() {
     data: () =>
       Effect.gen(function*() {
         const { inputs, targets } = windows(train, sampler.next(), BATCH, BLOCK)
+
         return {
           input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
           target: yield* Tensor.fromTypedArray(targets, [BATCH, BLOCK])
@@ -70,6 +78,7 @@ const program = Effect.gen(function*() {
   let step = 0
   let resume: Trainer.Resume<Optimizer.AdamState> | undefined
   let epoch = 1
+
   if (fs.existsSync(CKPT)) {
     const checkpoint = yield* Checkpoint.loadWithSampler(CKPT, trainer)
     sampler = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
@@ -83,6 +92,7 @@ const program = Effect.gen(function*() {
   }
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
+
   while (step < STEPS) {
     const previous = params
     const previousState = resume?.state
@@ -92,10 +102,12 @@ const program = Effect.gen(function*() {
     resume = { state: trained.state, step }
     yield* Checkpoint.saveWithSampler(CKPT, trainer, trained, sampler)
     const currentEpoch = sampler.state().epoch
+
     if (currentEpoch !== epoch) {
       epoch = currentEpoch
       yield* Effect.log(`epoch ${epoch}`)
     }
+
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
     yield* Tensor.clearAll(

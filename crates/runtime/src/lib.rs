@@ -35,6 +35,7 @@ mod dtype;
 mod error;
 mod executable;
 mod gguf;
+mod inference_state;
 mod layout;
 mod memory;
 mod program;
@@ -59,6 +60,7 @@ pub use gguf::{
     parse_gguf, read_gguf_tensor_into, GgufFile, GgufMetadataArray, GgufMetadataEntry,
     GgufMetadataValue, GgufParseError, GgufTensorDescriptor, GgufTensorFormat,
 };
+pub use inference_state::{KvLayerDescriptor, StateAccessMode};
 pub use layout::{broadcast_shape, Layout};
 pub use memory::{
     AllocationReport, InvocationMemoryReport, Location, MemoryPlan, MemoryPlanError, MemoryReport,

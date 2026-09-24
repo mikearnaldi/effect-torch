@@ -19,7 +19,7 @@ path with three pieces:
    rows per attention layer, allocated once per inference artifact.
    Sequences are rows of metadata — a block table and a cursor — over
    the shared pool, in the style of vLLM's PagedAttention.
-2. **Decode compilation as a native AST rewrite.** `Model.inference`
+2. **Decode compilation as a native AST rewrite.** `AutoRegressive.compile`
    traces the *same* `Model.forward` builder used by training, then
    rewrites the graph in Rust before freezing: causal `Sdpa` becomes
    `KvAttention` (scatter the new tokens into the pool, attend over the
@@ -27,7 +27,7 @@ path with three pieces:
    `RotaryEmbedding` becomes cursor-offset rotary. Model authors write
    `forward` once; decode is a property of compilation, not of the
    model definition — and no ambient build mode exists anywhere.
-3. **`Model.inference` → `InferenceProgram`.** A compiled artifact —
+3. **`AutoRegressive.compile` → `Artifact`.** A compiled artifact —
    sibling to `CompiledModel`, not a `Model` — holding the prefill and
    decode programs plus the pool, from which cheap, Scope-managed
    `Sequence` handles are acquired: `prefill(tokens)` then `step(token)`
@@ -170,10 +170,10 @@ pipeline cache is exactly what this avoids. A dedicated paged Metal
 kernel (runtime context length, block-table indirection, no gather
 copy) is the throughput follow-up, not v1.
 
-### `Model.inference` → `InferenceProgram`
+### `AutoRegressive.compile` → `Artifact`
 
 ```ts
-export interface InferenceConfig {
+export interface CompileOptions {
   readonly maxTokens: number
   readonly blockSize?: number        // default 16, must divide maxTokens
   readonly attentionWindow?: number  // sliding window; omit for full attention
@@ -181,7 +181,7 @@ export interface InferenceConfig {
   readonly tokenDtype?: "u32" | "i64" // id dtype of prefill/step inputs; default "u32"
 }
 
-export interface InferenceProgram {
+export interface Artifact {
   readonly sequence: () => Effect.Effect<Sequence, InferenceError, Scope.Scope>
 }
 
@@ -194,15 +194,15 @@ export interface Sequence {
 export const inference: (
   model: Model,
   params: Params,
-  config: InferenceConfig
-) => Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, CurrentDevice | Scope.Scope>
+  config: CompileOptions
+) => Effect.Effect<Artifact, InferenceError | ModelError | Tensor.TensorError, CurrentDevice | Scope.Scope>
 ```
 
 Deliberate shape decisions:
 
 - **Not a `Model`.** `forward` accepts any input shape; the artifact
   accepts `[1, T]` prefill and `[1, 1]` decode against a bound pool,
-  and composing it is meaningless. `InferenceProgram` is a sibling of
+  and composing it is meaningless. `Artifact` is a sibling of
   `CompiledModel` — the method sets genuinely differ, and per the
   codebase rule that is a distinct interface, not optional members.
 - **Params are frozen once.** They may be lazy graphs (init draws), and
@@ -301,7 +301,7 @@ backend.
 
 All met, in `packages/core/test/Inference.test.ts` (CPU and Metal):
 
-1. **Parity**: greedy generation through `InferenceProgram` matches the
+1. **Parity**: greedy generation through `Artifact` matches the
    naive full-window loop token-for-token across pool block boundaries
    (`blockSize` not dividing the context length), and matches the
    prefill logits numerically (f32 tolerance).
@@ -327,7 +327,7 @@ All met, in `packages/core/test/Inference.test.ts` (CPU and Metal):
    smaller than the context, so dead-block eviction is exercised
    (unbounded generation at O(window) footprint); the rotary node
    differentiates (training loss decreases).
-8. **Migration**: `nano-gpt.ts` generates through `Model.inference` —
+8. **Migration**: `nano-gpt.ts` generates through `AutoRegressive.compile` —
    prefill once per prompt, one pooled step per token, sliding-window
    attention over the last `BLOCK` positions, EOS-terminated — with
    output quality matching the pre-RFC recompute loop.

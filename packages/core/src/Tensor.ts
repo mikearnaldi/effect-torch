@@ -187,6 +187,7 @@ const validateShape = (op: string, shape: ReadonlyArray<number>): Array<number> 
     if (!Number.isInteger(dim) || dim < 0) {
       throw new Error(`${op}: invalid shape dimension ${dim}, expected a non-negative integer`)
     }
+
     return dim
   })
 
@@ -197,14 +198,18 @@ const broadcastShapes = (
 ): Array<number> => {
   const rank = Math.max(a.length, b.length)
   const out: Array<number> = []
+
   for (let i = 0; i < rank; i++) {
     const da = a[a.length - 1 - i] ?? 1
     const db = b[b.length - 1 - i] ?? 1
+
     if (da !== db && da !== 1 && db !== 1) {
       throw new Error(`${op}: shapes [${a}] and [${b}] are not broadcastable`)
     }
+
     out.unshift(Math.max(da, db))
   }
+
   return out
 }
 
@@ -212,14 +217,18 @@ const matmulShape = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): Array<
   if (a.length < 2 || b.length < 2) {
     throw new Error(`matmul: expected tensors of rank >= 2, got [${a}] and [${b}]`)
   }
+
   const m = a[a.length - 2]
   const ka = a[a.length - 1]
   const kb = b[b.length - 2]
   const n = b[b.length - 1]
+
   if (ka !== kb) {
     throw new Error(`matmul: inner dimensions mismatch, got [${a}] and [${b}]`)
   }
+
   const batch = broadcastShapes("matmul", a.slice(0, -2), b.slice(0, -2))
+
   return [...batch, m, n]
 }
 
@@ -227,6 +236,7 @@ const checkCompatible = (op: string, a: Any, b: Any): void => {
   if (a.dtype !== b.dtype) {
     throw new Error(`${op}: dtype mismatch, got ${a.dtype} and ${b.dtype}, use cast for explicit conversion`)
   }
+
   if (a.placement.id !== b.placement.id) {
     throw new Error(`${op}: placement mismatch, got ${a.placement.id} and ${b.placement.id}`)
   }
@@ -251,6 +261,7 @@ const graphTry = (
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const request = yield* Effect.try({ try: evaluate, catch: (error) => caughtTensorError(op, error) })
+
     return yield* fromBackend(op, runtime.node(request))
   })
 
@@ -276,6 +287,7 @@ export const constant = (
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   graphTry("constant", () => {
     const dtype = options.dtype ?? "f32"
+
     return { op: "constant", inputs: [], attributes: { value, dtype } }
   })
 
@@ -317,10 +329,13 @@ const binaryOp = (
             `${op}: dtype mismatch, got ${self.dtype} and ${other.dtype}, use cast for explicit conversion`
           )
         }
+
         if (self.placement.id !== other.placement.id) {
           throw new Error(`${op}: placement mismatch, got ${self.placement.id} and ${other.placement.id}`)
         }
+
         broadcastShapes(op, self.shape, other.shape)
+
         return request(self, other)
       })
   )
@@ -333,9 +348,11 @@ const unaryOp = (
 
 const normalizeDim = (op: string, rank: number, dim: number): number => {
   const normalized = dim < 0 ? dim + rank : dim
+
   if (!Number.isInteger(normalized) || normalized < 0 || normalized >= rank) {
     throw new Error(`${op}: dimension ${dim} out of range for rank ${rank}`)
   }
+
   return normalized
 }
 
@@ -367,6 +384,7 @@ export const zeros = (
   graphTry("zeros", () => {
     const validShape = validateShape("zeros", shape)
     const dtype = options.dtype ?? "f32"
+
     return { op: "zeros", inputs: [], attributes: { shape: validShape, dtype } }
   })
 
@@ -383,6 +401,7 @@ export const ones = (
   graphTry("ones", () => {
     const validShape = validateShape("ones", shape)
     const dtype = options.dtype ?? "f32"
+
     return { op: "ones", inputs: [], attributes: { shape: validShape, dtype } }
   })
 
@@ -400,6 +419,7 @@ export const full = (
   graphTry("full", () => {
     const validShape = validateShape("full", shape)
     const dtype = options.dtype ?? "f32"
+
     return { op: "full", inputs: [], attributes: { shape: validShape, value, dtype } }
   })
 
@@ -420,6 +440,7 @@ export const randn = (
   graphTry("randn", () => {
     const validShape = validateShape("randn", shape)
     const dtype = options.dtype ?? "f32"
+
     return { op: "randn", inputs: [], attributes: { shape: validShape, dtype } }
   })
 
@@ -435,11 +456,16 @@ export const randn = (
  */
 export const uniform = (
   shape: ReadonlyArray<number>,
-  options: { readonly min?: number; readonly max?: number; readonly dtype?: "f32" | "f64" | "f16" | "bf16" } = {}
+  options: {
+    readonly min?: number
+    readonly max?: number
+    readonly dtype?: "f32" | "f64" | "f16" | "bf16"
+  } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   graphTry("uniform", () => {
     const validShape = validateShape("uniform", shape)
     const dtype = options.dtype ?? "f32"
+
     return {
       op: "uniform",
       inputs: [],
@@ -468,16 +494,20 @@ export const linspace = (
         message: `linspace: steps must be a positive integer, got ${steps}`
       })
     }
+
     if (options.dtype !== undefined && options.dtype !== "f32" && options.dtype !== "f64") {
       return yield* new TensorError({
         op: "linspace",
         message: `linspace: dtype must be f32 or f64, got ${options.dtype}`
       })
     }
+
     if (steps === 1) {
       return yield* full([1], start, options)
     }
+
     const base = yield* arange(steps, undefined, { dtype: options.dtype ?? "f32" })
+
     return yield* add(
       yield* mul(base, yield* constantLike(base, (end - start) / (steps - 1))),
       yield* constantLike(base, start)
@@ -496,13 +526,17 @@ export const linspace = (
 export const arange = (
   start: number,
   end?: number,
-  options: { readonly step?: number; readonly dtype?: DType } = {}
+  options: {
+    readonly step?: number
+    readonly dtype?: DType
+  } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   graphTry("arange", () => {
     const from = end === undefined ? 0 : start
     const to = end === undefined ? start : end
     const step = options.step ?? 1
     const dtype = options.dtype ?? "f32"
+
     return { op: "arange", inputs: [], attributes: { start: from, end: to, step, dtype } }
   })
 
@@ -518,18 +552,27 @@ export const eye = (
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   graphTry("eye", () => {
     const [size] = validateShape("eye", [n])
+
     if (size === 0) throw new Error("eye: n must be positive")
+
     const dtype = options.dtype ?? "f32"
+
     return { op: "eye", inputs: [], attributes: { n: size, dtype } }
   })
 
 const dtypeOfTypedArray = (data: TypedArray): DType => {
   if (data instanceof Float32Array) return "f32"
+
   if (data instanceof Float64Array) return "f64"
+
   if ("Float16Array" in globalThis && data instanceof globalThis.Float16Array) return "f16"
+
   if (data instanceof BigInt64Array) return "i64"
+
   if (data instanceof Uint8Array) return "u8"
+
   if (data instanceof Uint32Array) return "u32"
+
   throw new Error(`fromTypedArray: unsupported typed array ${data.constructor.name}`)
 }
 
@@ -552,12 +595,15 @@ export const fromTypedArray = (
   graphTry("fromTypedArray", () => {
     const dtype = dtypeOfTypedArray(data)
     const validShape = shape === undefined ? [data.length] : validateShape("fromTypedArray", shape)
+
     if (numel(validShape) !== data.length) {
       throw new Error(
         `fromTypedArray: data length ${data.length} does not match shape [${validShape}]`
       )
     }
+
     const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+
     return { op: "fromBytes", inputs: [], attributes: { data: bytes, shape: validShape, dtype } }
   })
 
@@ -881,6 +927,7 @@ export const reciprocal = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.
 export const expm1 = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const e = yield* exp(self)
+
     return yield* sub(e, yield* constantLike(e, 1))
   })
 
@@ -893,6 +940,7 @@ export const expm1 = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runti
 export const log1p = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const t = yield* add(self, yield* constantLike(self, 1))
+
     return yield* log(t)
   })
 
@@ -905,6 +953,7 @@ export const log1p = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runti
 export const log2 = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const t = yield* log(self)
+
     return yield* div(t, yield* constantLike(t, Math.LN2))
   })
 
@@ -917,6 +966,7 @@ export const log2 = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtim
 export const log10 = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const t = yield* log(self)
+
     return yield* div(t, yield* constantLike(t, Math.LN10))
   })
 
@@ -930,6 +980,7 @@ export const sinh = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtim
   Effect.gen(function*() {
     const e = yield* exp(self)
     const ne = yield* exp(yield* neg(self))
+
     return yield* div(yield* sub(e, ne), yield* constantLike(e, 2))
   })
 
@@ -943,6 +994,7 @@ export const cosh = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtim
   Effect.gen(function*() {
     const e = yield* exp(self)
     const ne = yield* exp(yield* neg(self))
+
     return yield* div(yield* add(e, ne), yield* constantLike(e, 2))
   })
 
@@ -1020,6 +1072,7 @@ export const remainder: {
   (self: Any, other: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     Effect.gen(function*() {
       const q = yield* floor(yield* div(self, other))
+
       return yield* sub(self, yield* mul(q, other))
     })
 )
@@ -1044,15 +1097,19 @@ export const where: {
       if (cond.dtype !== "u8") {
         throw new Error(`where: condition must be u8, got ${cond.dtype}`)
       }
+
       checkCompatible("where", a, b)
+
       if (cond.placement.id !== a.placement.id) {
         throw new Error("where: condition must use the same placement as its values")
       }
+
       broadcastShapes(
         "where",
         broadcastShapes("where", cond.shape, a.shape),
         b.shape
       )
+
       return { op: "whereCond", inputs: [cond, a, b] }
     })
 )
@@ -1068,6 +1125,7 @@ export const sigmoid = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Run
   Effect.gen(function*() {
     const half = yield* constantLike(self, 2)
     const t = yield* tanh(yield* div(self, half))
+
     return yield* add(yield* div(t, half), yield* constantLike(self, 0.5))
   })
 
@@ -1084,6 +1142,7 @@ export const softmax = dualOptions(
       const dims = normalizeDims("softmax", self.shape.length, options.dims ?? [self.shape.length - 1])
       const m = yield* max(self, { dims, keepdims: true })
       const e = yield* exp(yield* sub(self, m))
+
       return yield* div(e, yield* sum(e, { dims, keepdims: true }))
     })
 )
@@ -1102,6 +1161,7 @@ export const logSoftmax = dualOptions(
       const m = yield* max(self, { dims, keepdims: true })
       const shifted = yield* sub(self, m)
       const s = yield* sum(yield* exp(shifted), { dims, keepdims: true })
+
       return yield* sub(shifted, yield* log(s))
     })
 )
@@ -1114,7 +1174,7 @@ export const logSoftmax = dualOptions(
  */
 export interface ScaledDotProductAttentionOptions {
   /**
-   * Fused kernel by default. Stepwise builds a dense math graph: QK, scaling,
+   * Fused kernel by default. Stepwise preserves explicit rounding: QK, scaling,
    * mask addition and PV round to the input dtype; softmax computes in F32
    * and rounds probabilities back. Scaling uses an F32 multiplier before
    * rounding the result. Masks add the dtype's finite minimum.
@@ -1132,6 +1192,10 @@ export interface ScaledDotProductAttentionOptions {
    * selects full causal attention; omission inherits the decode configuration.
    */
   readonly window?: number | null
+  /** Stable persistent K/V layer identity for stateful compilation. */
+  readonly layerId?: number
+  /** Retained prefix rows, independently of the query mask. Null retains all rows. */
+  readonly retentionWindow?: number | null
 }
 
 /**
@@ -1144,10 +1208,9 @@ export interface ScaledDotProductAttentionOptions {
  * the attention probabilities instead of retaining them; it is not
  * second-order differentiable.
  *
- * `rounding: "stepwise"` builds ordinary tensor operations with explicit
- * rounding boundaries and F32 softmax. It supports F32/F16/BF16 and uses
- * ordinary graph autodiff. Its causal mask is fixed in the graph; decode
- * compilation does not rewrite it into paged K/V attention.
+ * `rounding: "stepwise"` preserves input-dtype rounding boundaries and F32
+ * softmax. It supports F32/F16/BF16, graph autodiff, and paged K/V compilation.
+ * Retention controls stored prefix rows without changing the query mask.
  *
  * @since 0.1.0
  * @category neural network
@@ -1157,156 +1220,118 @@ export const scaledDotProductAttention = (
   k: Any,
   v: Any,
   options: ScaledDotProductAttentionOptions = {}
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> => {
-  if (options.rounding === "stepwise") {
-    return attentionStepwise(q, k, v, options)
-  }
-
-  return graphTry("scaledDotProductAttention", () => {
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  graphTry("scaledDotProductAttention", () => {
     validateAttention(q, k, v, options)
 
-    return {
-      op: "scaledDotProductAttention",
-      inputs: [q, k, v],
-      attributes: {
-        scale: options.scale ?? 1 / Math.sqrt(q.shape[q.shape.length - 1]),
-        causal: options.causal ?? false,
-        window: options.window
-      }
+    const attributes = {
+      scale: options.scale ?? 1 / Math.sqrt(q.shape[q.shape.length - 1]),
+      causal: options.causal ?? false,
+      window: options.window
     }
+
+    return options.rounding === "stepwise" || options.layerId !== undefined || options.retentionWindow !== undefined
+      ? {
+        op: "scaledDotProductAttentionConfigured",
+        inputs: [q, k, v],
+        attributes: {
+          ...attributes,
+          rounding: options.rounding ?? "fused",
+          layerId: options.layerId,
+          retentionWindow: options.retentionWindow
+        }
+      }
+      : { op: "scaledDotProductAttention", inputs: [q, k, v], attributes }
   })
-}
 
 const validateAttention = (q: Any, k: Any, v: Any, options: ScaledDotProductAttentionOptions): void => {
   const op = "scaledDotProductAttention"
+
+  if (options.rounding !== undefined && options.rounding !== "fused" && options.rounding !== "stepwise") {
+    throw new Error(`${op}: unsupported rounding mode`)
+  }
+
+  if (
+    options.rounding === "stepwise" &&
+    (q.storage !== undefined || k.storage !== undefined || v.storage !== undefined ||
+      !["f32", "f16", "bf16"].includes(q.dtype))
+  ) {
+    throw new Error(`${op}: stepwise attention requires dense F32, F16, or BF16 tensors`)
+  }
+
+  if (
+    options.layerId !== undefined &&
+    (!Number.isSafeInteger(options.layerId) || options.layerId < 0 || options.layerId > 0xffffffff)
+  ) {
+    throw new Error(`${op}: layerId must be a U32 integer`)
+  }
+
+  if (
+    options.retentionWindow !== undefined && options.retentionWindow !== null &&
+    (!Number.isSafeInteger(options.retentionWindow) || options.retentionWindow < 0)
+  ) {
+    throw new Error(`${op}: retentionWindow must be a non-negative integer or null`)
+  }
+
   const rank = q.shape.length
+
   if (rank < 2 || k.shape.length !== rank || v.shape.length !== rank) {
     throw new Error(
       `${op}: q, k and v must share a rank >= 2, got [${q.shape}], [${k.shape}] and [${v.shape}]`
     )
   }
+
   const leading = q.shape.slice(0, rank < 3 ? -2 : -3)
+
   if (!leading.every((d, i) => d === k.shape[i]) || !leading.every((d, i) => d === v.shape[i])) {
     throw new Error(
       `${op}: leading dims must match, got [${q.shape}], [${k.shape}] and [${v.shape}]`
     )
   }
+
   if (rank >= 3) {
     const qHeads = q.shape[rank - 3]
     const kvHeads = k.shape[rank - 3]
+
     if (v.shape[rank - 3] !== kvHeads) {
       throw new Error(`${op}: k and v heads mismatch, got [${k.shape}] and [${v.shape}]`)
     }
+
     if (kvHeads === 0 || qHeads % kvHeads !== 0) {
       throw new Error(`${op}: query heads ${qHeads} must be divisible by K/V heads ${kvHeads}`)
     }
   }
+
   if (q.shape[rank - 1] !== k.shape[rank - 1]) {
     throw new Error(`${op}: q and k head dims mismatch, got [${q.shape}] and [${k.shape}]`)
   }
+
   if (k.shape[rank - 2] !== v.shape[rank - 2]) {
     throw new Error(`${op}: k and v sequence lengths mismatch, got [${k.shape}] and [${v.shape}]`)
   }
+
   if (!isFloat(q.dtype)) {
     throw new Error(`${op}: dtype must be floating-point, got ${q.dtype}`)
   }
+
   if (k.dtype !== q.dtype || v.dtype !== q.dtype) {
     throw new Error(`${op}: q, k and v must share a dtype, got ${q.dtype}, ${k.dtype} and ${v.dtype}`)
   }
+
   if (k.placement.id !== q.placement.id || v.placement.id !== q.placement.id) {
     throw new Error(`${op}: q, k and v must use the same placement`)
   }
+
   if (options.window !== undefined) {
     if (options.causal !== true) {
       throw new Error(`${op}: window requires causal=true`)
     }
+
     if (options.window !== null && (!Number.isSafeInteger(options.window) || options.window <= 0)) {
       throw new Error(`${op}: window must be a positive integer or null`)
     }
   }
 }
-
-const attentionStepwise = (
-  q: Any,
-  k: Any,
-  v: Any,
-  options: ScaledDotProductAttentionOptions
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    yield* Effect.try({
-      try: () => {
-        validateAttention(q, k, v, options)
-        if (
-          q.storage !== undefined || k.storage !== undefined || v.storage !== undefined ||
-          !["f32", "f16", "bf16"].includes(q.dtype)
-        ) {
-          throw new Error("stepwise attention requires dense F32, F16, or BF16 tensors")
-        }
-      },
-      catch: (cause) => caughtTensorError("scaledDotProductAttention", cause)
-    })
-
-    const rank = q.shape.length
-    const queries = q.shape[rank - 2]
-    const keys = k.shape[rank - 2]
-    const heads = rank >= 3 ? q.shape[rank - 3] : 1
-    const kvHeads = rank >= 3 ? k.shape[rank - 3] : 1
-    const batch = q.shape.slice(0, -3)
-    const repeat = (value: Any) =>
-      Effect.gen(function*() {
-        if (rank === 2) {
-          return value
-        }
-
-        const width = value.shape[rank - 1]
-        const grouped = yield* reshape(value, [...batch, kvHeads, 1, keys, width])
-        const repeated = yield* broadcastTo(grouped, [...batch, kvHeads, heads / kvHeads, keys, width])
-
-        return yield* reshape(repeated, [...batch, heads, keys, width])
-      })
-
-    const repeatedKeys = yield* repeat(k)
-    const order = Array.from({ length: rank }, (_, index) => index)
-    order[rank - 2] = rank - 1
-    order[rank - 1] = rank - 2
-    const transposedKeys = yield* transpose(repeatedKeys, order)
-    let scores = yield* matmul(q, transposedKeys)
-    const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
-
-    if (scale !== 1) {
-      const scoresFloat = yield* cast(scores, "f32")
-      const multiplier = yield* constantLike(scoresFloat, scale)
-      const scaled = yield* mul(scoresFloat, multiplier)
-      scores = yield* cast(scaled, q.dtype)
-    }
-
-    if (options.causal) {
-      const offset = Math.max(0, keys - queries)
-      const queryIndices = yield* arange(offset, offset + queries, { dtype: "i64" })
-      const keyIndices = yield* arange(keys, undefined, { dtype: "i64" })
-      const row = yield* reshape(queryIndices, [queries, 1])
-      const column = yield* reshape(keyIndices, [1, keys])
-      let allowed = yield* le(column, row)
-
-      if (options.window !== undefined && options.window !== null) {
-        const distance = yield* sub(row, column)
-        const window = yield* constantLike(row, options.window)
-        const insideWindow = yield* lt(distance, window)
-        allowed = yield* logicalAnd(allowed, insideWindow)
-      }
-
-      const minimum = q.dtype === "bf16" ? -3.3895313892515355e38 : q.dtype === "f16" ? -65504 : -3.4028234663852886e38
-      const mask = yield* where(allowed, yield* constantLike(scores, 0), yield* constantLike(scores, minimum))
-      scores = yield* add(scores, mask)
-    }
-
-    const scoresFloat = yield* cast(scores, "f32")
-    const probabilitiesFloat = yield* softmax(scoresFloat, { dims: [-1] })
-    const probabilities = yield* cast(probabilitiesFloat, q.dtype)
-    const repeatedValues = yield* repeat(v)
-
-    return yield* matmul(probabilities, repeatedValues)
-  })
 
 /**
  * Options for {@link kdaChunk}.
@@ -1358,6 +1383,7 @@ export const kdaChunk = (
   graphTry("kdaChunk", () => {
     const op = "kdaChunk"
     const rank = q.shape.length
+
     if (
       rank < 2 || k.shape.length !== rank || v.shape.length !== rank ||
       logDecay.shape.length !== rank || beta.shape.length !== rank
@@ -1366,30 +1392,39 @@ export const kdaChunk = (
         `${op}: q, k, v, logDecay and beta must share a rank >= 2, got [${q.shape}], [${k.shape}], [${v.shape}], [${logDecay.shape}] and [${beta.shape}]`
       )
     }
+
     if (!k.shape.every((d, i) => d === q.shape[i]) || !logDecay.shape.every((d, i) => d === q.shape[i])) {
       throw new Error(
         `${op}: q, k and logDecay must share a shape, got [${q.shape}], [${k.shape}] and [${logDecay.shape}]`
       )
     }
+
     if (!v.shape.slice(0, -1).every((d, i) => d === q.shape[i])) {
       throw new Error(`${op}: v must match q on all but the head dim, got [${v.shape}] and [${q.shape}]`)
     }
+
     const betaShape = [...q.shape.slice(0, -1), 1]
+
     if (!beta.shape.every((d, i) => d === betaShape[i])) {
       throw new Error(`${op}: beta must have shape [${betaShape}], got [${beta.shape}]`)
     }
+
     if (!isFloat(q.dtype)) {
       throw new Error(`${op}: dtype must be floating-point, got ${q.dtype}`)
     }
+
     for (const [name, t] of [["k", k], ["v", v], ["logDecay", logDecay], ["beta", beta]] as const) {
       if (t.dtype !== q.dtype) {
         throw new Error(`${op}: all operands must share a dtype, got ${q.dtype} and ${t.dtype} for ${name}`)
       }
+
       if (t.placement.id !== q.placement.id) {
         throw new Error(`${op}: all operands must use the same placement`)
       }
     }
+
     const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
+
     return {
       op: "kdaChunk",
       inputs: [q, k, v, logDecay, beta],
@@ -1418,24 +1453,31 @@ export const shortConv1d = (
   graphTry("shortConv1d", () => {
     const op = "shortConv1d"
     const rank = self.shape.length
+
     if (rank < 2 || weight.shape.length !== 2) {
       throw new Error(
         `${op}: expected input [..., T, C] and weight [C, K], got [${self.shape}] and [${weight.shape}]`
       )
     }
+
     const channels = self.shape[rank - 1]
+
     if (weight.shape[0] !== channels) {
       throw new Error(`${op}: weight has ${weight.shape[0]} channels, expected ${channels}`)
     }
+
     if (weight.shape[1] < 1) {
       throw new Error(`${op}: kernel size must be >= 1, got ${weight.shape[1]}`)
     }
+
     if (self.dtype !== weight.dtype) {
       throw new Error(`${op}: input and weight must share a dtype, got ${self.dtype} and ${weight.dtype}`)
     }
+
     if (self.placement.id !== weight.placement.id) {
       throw new Error(`${op}: input and weight must use the same placement`)
     }
+
     return {
       op: "shortConv1d",
       inputs: [self, weight],
@@ -1465,6 +1507,7 @@ export const softplus = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Ru
   Effect.gen(function*() {
     const head = yield* maximum(self, yield* constantLike(self, 0))
     const tail = yield* log1p(yield* exp(yield* neg(yield* abs(self))))
+
     return yield* add(head, tail)
   })
 
@@ -1492,6 +1535,7 @@ export const elu = dualOptions(
     Effect.gen(function*() {
       const alpha = options.alpha ?? 1
       const negative = yield* mul(yield* expm1(self), yield* constantLike(self, alpha))
+
       return yield* where(yield* gt(self, yield* constantLike(self, 0)), self, negative)
     })
 )
@@ -1589,9 +1633,12 @@ export const clamp = dualOptions(
     Effect.gen(function*() {
       if (options.min !== undefined) {
         const out = yield* maximum(self, yield* constantLike(self, options.min))
+
         return options.max === undefined ? out : yield* minimum(out, yield* constantLike(self, options.max))
       }
+
       if (options.max !== undefined) return yield* minimum(self, yield* constantLike(self, options.max))
+
       return yield* new TensorError({ op: "clamp", message: "clamp: at least one of min and max is required" })
     })
 )
@@ -1635,22 +1682,27 @@ export const dropout = dualOptions(
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     Effect.gen(function*() {
       const p = options.p ?? 0.5
+
       if (p < 0 || p >= 1) {
         return yield* new TensorError({ op: "dropout", message: `dropout: p must be in [0, 1), got ${p}` })
       }
+
       if (!isFloatDtype(self.dtype)) {
         return yield* new TensorError({
           op: "dropout",
           message: `dropout: dtype must be f32 or f64, got ${self.dtype}`
         })
       }
+
       if (p === 0) {
         return yield* add(self, yield* constantLike(self, 0))
       }
+
       const mask = yield* ge(
         yield* uniform(self.shape, { dtype: self.dtype === "f64" ? "f64" : "f32" }),
         yield* constantLike(self, p)
       )
+
       return yield* where(
         mask,
         yield* div(self, yield* constantLike(self, 1 - p)),
@@ -1692,6 +1744,7 @@ export const matmul: {
     graphTry("matmul", () => {
       checkCompatible("matmul", self, other)
       matmulShape(self.shape, other.shape)
+
       return { op: "matmul", inputs: [self, other] }
     })
 )
@@ -1717,15 +1770,20 @@ export interface ReduceOptions {
 const normalizeDims = (op: string, rank: number, dims: ReadonlyArray<number>): Array<number> => {
   const normalized = dims.map((d) => {
     const dim = d < 0 ? d + rank : d
+
     if (!Number.isInteger(dim) || dim < 0 || dim >= rank) {
       throw new Error(`${op}: dimension ${d} out of range for rank ${rank}`)
     }
+
     return dim
   })
+
   const unique = [...new Set(normalized)]
+
   if (unique.length !== normalized.length) {
     throw new Error(`${op}: duplicate dimensions [${dims}]`)
   }
+
   return unique.sort((a, b) => a - b)
 }
 
@@ -1736,9 +1794,11 @@ const reducedShape = (
   keepdims: boolean
 ): Array<number> => {
   const normalized = normalizeDims(op, shape.length, dims)
+
   if (keepdims) {
     return shape.map((d, i) => (normalized.includes(i) ? 1 : d))
   }
+
   return shape.filter((_, i) => !normalized.includes(i))
 }
 
@@ -1757,6 +1817,7 @@ const reduceOp = (
         const keepdims = options.keepdims ?? false
         const normalized = normalizeDims(op, self.shape.length, dims)
         reducedShape(op, self.shape, dims, keepdims)
+
         return request(self, normalized, keepdims)
       })
   )
@@ -1828,6 +1889,7 @@ export const argmax: {
   (self: Any, dim: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("argmax", () => {
       const d = normalizeDim("argmax", self.shape.length, dim)
+
       return { op: "argmax", inputs: [self], attributes: { dim: d } }
     })
 )
@@ -1852,11 +1914,15 @@ export const topKIndices: {
   (self: Any, k: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("topKIndices", () => {
       const width = self.shape[self.shape.length - 1]
+
       if (width === undefined) throw new Error("topKIndices: input must have rank >= 1")
+
       if (!Number.isSafeInteger(k) || k <= 0 || k > width) {
         throw new Error(`topKIndices: k must be a positive integer <= ${width}, got ${k}`)
       }
+
       if (self.dtype !== "f32") throw new Error(`topKIndices: expected f32, got ${self.dtype}`)
+
       return { op: "topKIndices", inputs: [self], attributes: { k } }
     })
 )
@@ -1876,6 +1942,7 @@ export const argmin: {
   (self: Any, dim: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("argmin", () => {
       const d = normalizeDim("argmin", self.shape.length, dim)
+
       return { op: "argmin", inputs: [self], attributes: { dim: d } }
     })
 )
@@ -1894,6 +1961,7 @@ export const cumsum: {
   (self: Any, dim: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("cumsum", () => {
       const d = normalizeDim("cumsum", self.shape.length, dim)
+
       return { op: "cumsum", inputs: [self], attributes: { dim: d } }
     })
 )
@@ -1925,15 +1993,18 @@ export const variance = dualOptions(
       const correction = options.correction ?? 1
       const normalized = normalizeDims("variance", self.shape.length, dims)
       const count = normalized.reduce((n, d) => n * self.shape[d], 1)
+
       if (count - correction <= 0) {
         return yield* new TensorError({
           op: "variance",
           message: `variance: ${count} elements with correction ${correction} gives a non-positive denominator`
         })
       }
+
       const m = yield* mean(self, { dims: normalized, keepdims: true })
       const centered = yield* sub(self, m)
       const ss = yield* sum(yield* square(centered), { dims: normalized, keepdims })
+
       return yield* div(ss, yield* constantLike(ss, count - correction))
     })
 )
@@ -1978,22 +2049,29 @@ export const norm = dualOptions(
       const ord = options.ord ?? 2
       const dims = options.dims ?? self.shape.map((_, i) => i)
       const keepdims = options.keepdims ?? false
+
       if (ord <= 0 && !Number.isFinite(ord)) {
         const m = yield* min(yield* abs(self), { dims, keepdims })
+
         return m
       }
+
       if (ord === Infinity) {
         return yield* max(yield* abs(self), { dims, keepdims })
       }
+
       if (ord <= 0) {
         return yield* new TensorError({ op: "norm", message: `norm: unsupported order ${ord}` })
       }
+
       if (ord === 1) {
         return yield* sum(yield* abs(self), { dims, keepdims })
       }
+
       if (ord === 2) {
         return yield* sqrt(yield* sum(yield* square(self), { dims, keepdims }))
       }
+
       return yield* pow(
         yield* sum(yield* pow(yield* abs(self), ord), { dims, keepdims }),
         1 / ord
@@ -2015,6 +2093,7 @@ export const all = dualOptions(
       if (self.dtype !== "u8") {
         return yield* new TensorError({ op: "all", message: `all: expected a u8 tensor, got ${self.dtype}` })
       }
+
       return yield* min(self, options)
     })
 )
@@ -2033,6 +2112,7 @@ export const any = dualOptions(
       if (self.dtype !== "u8") {
         return yield* new TensorError({ op: "any", message: `any: expected a u8 tensor, got ${self.dtype}` })
       }
+
       return yield* max(self, options)
     })
 )
@@ -2053,6 +2133,7 @@ export const logsumexp = dualOptions(
       const m = yield* max(self, { dims: normalized, keepdims: true })
       const s = yield* sum(yield* exp(yield* sub(self, m)), { dims: normalized, keepdims: true })
       const out = yield* add(m, yield* log(s))
+
       return keepdims ? out : yield* reshape(out, reducedShape("logsumexp", self.shape, dims, false))
     })
 )
@@ -2088,6 +2169,7 @@ export const reshape: {
   (self: Any, newShape: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("reshape", () => {
       const validShape = validateShape("reshape", newShape)
+
       if (numel(validShape) !== numel(self.shape)) {
         throw new Error(
           `reshape: cannot reshape [${self.shape}] (${numel(self.shape)} elements) to [${validShape}] (${
@@ -2095,6 +2177,7 @@ export const reshape: {
           } elements)`
         )
       }
+
       return { op: "reshape", inputs: [self], attributes: { shape: validShape } }
     })
 )
@@ -2120,16 +2203,21 @@ export const transpose: {
           `transpose: expected ${self.shape.length} dimensions, got [${dims}]`
         )
       }
+
       const normalized = dims.map((d) => {
         const dim = d < 0 ? d + self.shape.length : d
+
         if (!Number.isInteger(dim) || dim < 0 || dim >= self.shape.length) {
           throw new Error(`transpose: dimension ${d} out of range for rank ${self.shape.length}`)
         }
+
         return dim
       })
+
       if (new Set(normalized).size !== normalized.length) {
         throw new Error(`transpose: dims [${dims}] are not a permutation`)
       }
+
       return { op: "permute", inputs: [self], attributes: { dims: normalized } }
     })
 )
@@ -2174,12 +2262,15 @@ export const slice: {
     graphTry("slice", () => {
       const rank = self.shape.length
       const ranges: Array<[number, number, number]> = []
+
       for (let i = 0; i < rank; i++) {
         const dim = self.shape[i]
         const stride = options.stride?.[i] ?? 1
+
         if (!Number.isInteger(stride) || stride <= 0) {
           throw new Error(`slice: stride at dim ${i} must be a positive integer, got ${stride}`)
         }
+
         const rawStart = options.start?.[i] ?? 0
         const rawEnd = options.end?.[i] ?? dim
         const start = Math.min(Math.max(rawStart < 0 ? rawStart + dim : rawStart, 0), dim)
@@ -2188,6 +2279,7 @@ export const slice: {
         const stop = len === 0 ? start : start + (len - 1) * stride + 1
         ranges.push([start, stop, stride])
       }
+
       return {
         op: "slice",
         inputs: [self],
@@ -2217,6 +2309,7 @@ export const expose: {
       if (name.length === 0) {
         throw new Error("expose: name must be nonempty")
       }
+
       return { op: "expose", inputs: [self], attributes: { name } }
     })
 )
@@ -2238,29 +2331,37 @@ export const concat = (
     const dim = options.dim ?? 0
     const rank = first.shape.length
     const axis = dim < 0 ? dim + rank : dim
+
     if (!Number.isInteger(axis) || axis < 0 || axis >= rank) {
       return yield* new TensorError({
         op: "concat",
         message: `concat: dimension ${dim} out of range for rank ${rank}`
       })
     }
+
     const append = (out: Any, next: Any) =>
       graphTry("concat", () => {
         checkCompatible("concat", first, next)
+
         if (next.shape.length !== rank) {
           throw new Error(`concat: rank mismatch, [${out.shape}] vs [${next.shape}]`)
         }
+
         for (let i = 0; i < rank; i++) {
           if (i !== axis && out.shape[i] !== next.shape[i]) {
             throw new Error(`concat: shape mismatch at dim ${i}, [${out.shape}] vs [${next.shape}]`)
           }
         }
+
         return { op: "concat", inputs: [out, next], attributes: { dim: axis } }
       })
+
     let out = yield* append(first, second)
+
     for (const next of rest) {
       out = yield* append(out, next)
     }
+
     return out
   })
 
@@ -2280,16 +2381,20 @@ export const broadcastTo: {
   (self: Any, target: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("broadcastTo", () => {
       const validShape = validateShape("broadcastTo", target)
+
       if (validShape.length < self.shape.length) {
         throw new Error(`broadcastTo: cannot broadcast [${self.shape}] to lower rank [${validShape}]`)
       }
+
       for (let i = 0; i < self.shape.length; i++) {
         const d = self.shape[self.shape.length - 1 - i]
         const t = validShape[validShape.length - 1 - i]
+
         if (d !== t && d !== 1) {
           throw new Error(`broadcastTo: cannot broadcast [${self.shape}] to [${validShape}]`)
         }
       }
+
       return { op: "broadcastTo", inputs: [self], attributes: { shape: validShape } }
     })
 )
@@ -2304,27 +2409,36 @@ export const broadcastTo: {
 export const flatten = dualOptions(
   (
     self: Any,
-    options: { readonly startDim?: number; readonly endDim?: number | undefined } = {}
+    options: {
+      readonly startDim?: number
+      readonly endDim?: number | undefined
+    } = {}
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     Effect.gen(function*() {
       const rank = self.shape.length
       const start = options.startDim ?? 0
       const end = options.endDim ?? -1
+
       if (rank === 0) {
         if (start === 0 && (end === -1 || end === 0)) {
           return yield* reshape(self, [1])
         }
+
         return yield* new TensorError({
           op: "flatten",
           message: `flatten: dimension out of range for a rank-0 tensor`
         })
       }
+
       const s = normalizeDim("flatten", rank, start)
       const e = normalizeDim("flatten", rank, end)
+
       if (e < s) {
         return yield* new TensorError({ op: "flatten", message: `flatten: endDim ${end} precedes startDim ${start}` })
       }
+
       const collapsed = self.shape.slice(s, e + 1).reduce((a, b) => a * b, 1)
+
       return yield* reshape(self, [...self.shape.slice(0, s), collapsed, ...self.shape.slice(e + 1)])
     })
 )
@@ -2345,7 +2459,9 @@ export const squeeze = dualOptions(
       if (options.dims === undefined) {
         return yield* reshape(self, self.shape.filter((d) => d !== 1))
       }
+
       const normalized = normalizeDims("squeeze", self.shape.length, options.dims)
+
       for (const d of normalized) {
         if (self.shape[d] !== 1) {
           return yield* new TensorError({
@@ -2354,6 +2470,7 @@ export const squeeze = dualOptions(
           })
         }
       }
+
       return yield* reshape(self, self.shape.filter((_, i) => !normalized.includes(i)))
     })
 )
@@ -2371,14 +2488,17 @@ export const unsqueeze: {
   Effect.gen(function*() {
     const rank = self.shape.length
     const d = dim < 0 ? dim + rank + 1 : dim
+
     if (!Number.isInteger(d) || d < 0 || d > rank) {
       return yield* new TensorError({
         op: "unsqueeze",
         message: `unsqueeze: dimension ${dim} out of range for rank ${rank}`
       })
     }
+
     const shape = [...self.shape]
     shape.splice(d, 0, 1)
+
     return yield* reshape(self, shape)
   }))
 
@@ -2397,20 +2517,25 @@ export const stack = (
     const rank = tensors[0].shape.length
     const dim = options.dim ?? 0
     const d = dim < 0 ? dim + rank + 1 : dim
+
     if (!Number.isInteger(d) || d < 0 || d > rank) {
       return yield* new TensorError({
         op: "stack",
         message: `stack: dimension ${dim} out of range for rank ${rank}`
       })
     }
+
     const [first, second, ...rest] = tensors
+
     const expanded: [Lazy, Lazy, ...Array<Lazy>] = [
       yield* unsqueeze(first, d),
       yield* unsqueeze(second, d)
     ]
+
     for (const t of rest) {
       expanded.push(yield* unsqueeze(t, d))
     }
+
     return yield* concat(expanded, { dim: d })
   })
 
@@ -2434,10 +2559,12 @@ export const split = (
     const d = normalizeDim("split", self.shape.length, dim)
     const n = self.shape[d]
     let sizes: ReadonlyArray<number>
+
     if (Predicate.isNumber(sections)) {
       if (!Number.isInteger(sections) || sections <= 0) {
         return yield* new TensorError({ op: "split", message: `split: section size must be positive, got ${sections}` })
       }
+
       sizes = Array.from({ length: Math.ceil(n / sections) }, (_, i) => Math.min(sections, n - i * sections))
     } else {
       if (sections.reduce((a, b) => a + b, 0) !== n) {
@@ -2446,10 +2573,13 @@ export const split = (
           message: `split: section sizes sum to ${sections.reduce((a, b) => a + b, 0)}, expected ${n}`
         })
       }
+
       sizes = sections
     }
+
     const out: Array<Lazy> = []
     let offset = 0
+
     for (const size of sizes) {
       out.push(
         yield* slice(self, {
@@ -2459,6 +2589,7 @@ export const split = (
       )
       offset += size
     }
+
     return out
   })
 
@@ -2478,6 +2609,7 @@ export const chunk = (
   const d = dim < 0 ? dim + self.shape.length : dim
   const n = Number.isInteger(d) && d >= 0 && d < self.shape.length ? self.shape[d] : 0
   const size = Math.ceil(n / Math.max(1, chunks))
+
   return split(self, Math.max(1, size), options)
 }
 
@@ -2501,17 +2633,23 @@ export const tile = <Self extends Any>(
         return yield* new TensorError({ op: "tile", message: `tile: reps must be positive integers, got [${reps}]` })
       }
     }
+
     let cur: Self | Lazy = self
+
     if (reps.length > self.shape.length) {
       const extra = reps.length - self.shape.length
       cur = yield* reshape(cur, [...Array<number>(extra).fill(1), ...self.shape])
     }
+
     const rank = cur.shape.length
+
     const fullReps = reps.length < rank
       ? [...Array<number>(rank - reps.length).fill(1), ...reps]
       : reps
+
     for (let i = 0; i < rank; i++) {
       if (fullReps[i] === 1) continue
+
       // Insert a repetition axis immediately before the source axis, broadcast
       // it, then merge the adjacent axes. This preserves tile ordering without
       // requiring a backend-specific repeat operation.
@@ -2524,6 +2662,7 @@ export const tile = <Self extends Any>(
       merged.splice(i + 1, 1)
       cur = yield* reshape(wide, merged)
     }
+
     return cur
   })
 
@@ -2545,23 +2684,29 @@ export const pad = <Self extends Any>(
         message: `pad: ${pads.length} pad specs for a rank-${self.shape.length} tensor`
       })
     }
+
     let cur: Self | Lazy = self
+
     for (let d = 0; d < pads.length; d++) {
       const [before, after] = pads[d]
+
       if (before < 0 || after < 0) {
         return yield* new TensorError({ op: "pad", message: `pad: negative padding [${before}, ${after}]` })
       }
+
       if (before > 0) {
         const shape: Array<number> = [...cur.shape]
         shape[d] = before
         cur = yield* concat([yield* zeros(shape, { dtype: cur.dtype }), cur], { dim: d })
       }
+
       if (after > 0) {
         const shape: Array<number> = [...cur.shape]
         shape[d] = after
         cur = yield* concat([cur, yield* zeros(shape, { dtype: cur.dtype })], { dim: d })
       }
     }
+
     return cur
   })
 
@@ -2592,15 +2737,19 @@ export const take: {
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("take", () => {
       const d = normalizeDim("take", self.shape.length, options.dim ?? 0)
+
       if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
         throw new Error(`take: indexes must be i64 or u32, got ${indexes.dtype}`)
       }
+
       if (indexes.shape.length !== 1) {
         throw new Error(`take: indexes must be 1-D, got shape [${indexes.shape}]`)
       }
+
       if (indexes.placement.id !== self.placement.id) {
         throw new Error("take: indexes must use the same placement as the input")
       }
+
       return { op: "indexSelect", inputs: [self, indexes], attributes: { dim: d } }
     })
 )
@@ -2633,14 +2782,17 @@ export const gather: {
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("gather", () => {
       const d = normalizeDim("gather", self.shape.length, options.dim ?? 0)
+
       if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
         throw new Error(`gather: indexes must be i64 or u32, got ${indexes.dtype}`)
       }
+
       if (indexes.shape.length !== self.shape.length) {
         throw new Error(
           `gather: indexes rank ${indexes.shape.length} must match input rank ${self.shape.length}`
         )
       }
+
       for (let i = 0; i < self.shape.length; i++) {
         if (i !== d && indexes.shape[i] > self.shape[i]) {
           throw new Error(
@@ -2648,9 +2800,11 @@ export const gather: {
           )
         }
       }
+
       if (indexes.placement.id !== self.placement.id) {
         throw new Error("gather: indexes must use the same placement as the input")
       }
+
       return { op: "gather", inputs: [self, indexes], attributes: { dim: d } }
     })
 )
@@ -2671,17 +2825,21 @@ export const scatterAdd = (
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   graphTry("scatterAdd", () => {
     const d = normalizeDim("scatterAdd", self.shape.length, options.dim ?? 0)
+
     if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
       throw new Error(`scatterAdd: indexes must be i64 or u32, got ${indexes.dtype}`)
     }
+
     if (indexes.shape.length !== src.shape.length || !indexes.shape.every((s, i) => s === src.shape[i])) {
       throw new Error(
         `scatterAdd: indexes shape [${indexes.shape}] must match src shape [${src.shape}]`
       )
     }
+
     if (src.shape.length !== self.shape.length) {
       throw new Error(`scatterAdd: src rank ${src.shape.length} must match input rank ${self.shape.length}`)
     }
+
     for (let i = 0; i < self.shape.length; i++) {
       if (i !== d && src.shape[i] !== self.shape[i]) {
         throw new Error(
@@ -2689,10 +2847,13 @@ export const scatterAdd = (
         )
       }
     }
+
     checkCompatible("scatterAdd", self, src)
+
     if (indexes.placement.id !== self.placement.id) {
       throw new Error("scatterAdd: indexes must use the same placement as the input")
     }
+
     return {
       op: "scatterAdd",
       inputs: [self, indexes, src],
@@ -2713,12 +2874,14 @@ export const flip = <Self extends Any>(
   Effect.gen(function*() {
     const normalized = normalizeDims("flip", self.shape.length, dims)
     let cur: Self | Lazy = self
+
     for (const d of normalized) {
       const n = self.shape[d]
       const r = yield* arange(n, undefined, { dtype: "i64" })
       const idx = yield* add(yield* mul(r, yield* constantLike(r, -1)), yield* constantLike(r, n - 1))
       cur = yield* take(cur, idx, { dim: d })
     }
+
     return cur
   })
 
@@ -2742,11 +2905,14 @@ export const oneHot = (
         message: `oneHot: indexes must be i64 or u32, got ${indexes.dtype}`
       })
     }
+
     if (!Number.isInteger(depth) || depth < 1) {
       return yield* new TensorError({ op: "oneHot", message: `oneHot: depth must be a positive integer, got ${depth}` })
     }
+
     const classes = yield* arange(depth, undefined, { dtype: indexes.dtype })
     const expanded = yield* reshape(indexes, [...indexes.shape, 1])
+
     return yield* cast(yield* eq(expanded, classes), options.dtype ?? "f32")
   })
 
@@ -2766,40 +2932,57 @@ export const oneHot = (
  */
 export const crossEntropy: {
   (
-    options: { readonly target: Any; readonly ignoreIndex?: number }
+    options: {
+      readonly target: Any
+      readonly ignoreIndex?: number
+    }
   ): (self: Any) => Effect.Effect<Lazy, TensorError, Runtime.Runtime>
   (
     self: Any,
-    options: { readonly target: Any; readonly ignoreIndex?: number }
+    options: {
+      readonly target: Any
+      readonly ignoreIndex?: number
+    }
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } = dual(2, (
   self: Any,
-  options: { readonly target: Any; readonly ignoreIndex?: number }
+  options: {
+    readonly target: Any
+    readonly ignoreIndex?: number
+  }
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   graphTry("crossEntropy", () => {
     const { target } = options
     const ignoreIndex = options.ignoreIndex ?? -100
+
     if (self.shape.length < 1) {
       throw new Error("crossEntropy: logits must have rank >= 1")
     }
+
     if (!isFloat(self.dtype)) {
       throw new Error(`crossEntropy: logits must be floating-point, got ${self.dtype}`)
     }
+
     if (target.dtype !== "i64" && target.dtype !== "u32") {
       throw new Error(`crossEntropy: targets must be i64 or u32, got ${target.dtype}`)
     }
+
     const leading = self.shape.slice(0, -1)
+
     if (target.shape.length !== leading.length || !leading.every((d, i) => d === target.shape[i])) {
       throw new Error(
         `crossEntropy: targets shape [${target.shape}] does not match logits leading shape [${leading}]`
       )
     }
+
     if (!Number.isInteger(ignoreIndex)) {
       throw new Error(`crossEntropy: ignoreIndex must be an integer, got ${ignoreIndex}`)
     }
+
     if (target.placement.id !== self.placement.id) {
       throw new Error("crossEntropy: target must use the same placement as logits")
     }
+
     return {
       op: "crossEntropy",
       inputs: [self, target],
@@ -2826,31 +3009,37 @@ export const embedding = (
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const { paddingIndex, weight } = options
+
     if (weight.shape.length !== 2) {
       return yield* new TensorError({
         op: "embedding",
         message: `embedding: weight must be rank 2 [vocab, hidden], got shape [${weight.shape}]`
       })
     }
+
     if (weight.dtype !== "f32" && weight.dtype !== "f64" && weight.dtype !== "f16" && weight.dtype !== "bf16") {
       return yield* new TensorError({
         op: "embedding",
         message: `embedding: weight must be a float dtype, got ${weight.dtype}`
       })
     }
+
     if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
       return yield* new TensorError({
         op: "embedding",
         message: `embedding: indexes must be i64 or u32, got ${indexes.dtype}`
       })
     }
+
     if (indexes.placement.id !== weight.placement.id) {
       return yield* new TensorError({
         op: "embedding",
         message: "embedding: indexes and weight must use the same placement"
       })
     }
+
     const [vocab, hidden] = weight.shape
+
     if (
       paddingIndex !== undefined &&
       (!Number.isInteger(paddingIndex) || paddingIndex < 0 || paddingIndex >= vocab)
@@ -2860,6 +3049,7 @@ export const embedding = (
         message: `embedding: paddingIndex must be an integer in [0, ${vocab}), got ${paddingIndex}`
       })
     }
+
     if (weight.storage !== undefined) {
       return yield* graphTry("embedding", () => ({
         op: "quantizedEmbedding",
@@ -2869,17 +3059,21 @@ export const embedding = (
         }
       }))
     }
+
     const n = indexes.shape.reduce((acc, d) => acc * d, 1)
     const flat = indexes.shape.length === 1 ? indexes : yield* reshape(indexes, [n])
     let out: Any = yield* take(weight, flat, { dim: 0 })
+
     if (paddingIndex !== undefined) {
       const mask = yield* broadcastTo(
         yield* reshape(yield* cast(yield* eq(flat, yield* constantLike(flat, paddingIndex)), weight.dtype), [n, 1]),
         [n, hidden]
       )
+
       const stopped = yield* graphTry("stopGradient", () => ({ op: "stopGradient", inputs: [out] }))
       out = yield* add(yield* sub(out, yield* mul(mask, out)), yield* mul(mask, stopped))
     }
+
     return yield* reshape(out, [...indexes.shape, hidden])
   })
 
@@ -2893,6 +3087,7 @@ const triangleMask = (
     if (self.shape.length < 2) {
       return yield* new TensorError({ op, message: `${op}: expected rank >= 2, got rank ${self.shape.length}` })
     }
+
     const m = self.shape[self.shape.length - 2]
     const n = self.shape[self.shape.length - 1]
     // Broadcasting column coordinates against shifted row coordinates builds
@@ -2901,6 +3096,7 @@ const triangleMask = (
     const cols = yield* reshape(yield* arange(n, undefined, { dtype: "i64" }), [1, n])
     const shifted = yield* add(rows, yield* constantLike(rows, diagonal))
     const mask = keepUpper ? yield* ge(cols, shifted) : yield* le(cols, shifted)
+
     return yield* where(mask, self, yield* constantLike(self, 0))
   })
 
@@ -2949,6 +3145,7 @@ export const dot: {
       if (self.shape.length === 1 && other.shape.length === 1) {
         return yield* sum(yield* mul(self, other))
       }
+
       return yield* matmul(self, other)
     })
 )
@@ -2969,7 +3166,9 @@ export const trace = (
         message: `trace: expected a square rank-2 tensor, got shape [${self.shape}]`
       })
     }
+
     const id = yield* eye(self.shape[0], { dtype: self.dtype })
+
     return yield* sum(yield* mul(self, id))
   })
 
@@ -2999,7 +3198,12 @@ const checkConvOptions = (
   options: ConvOptions,
   rank: number
 ): Effect.Effect<
-  { readonly stride: number; readonly padding: number; readonly dilation: number; readonly groups: number },
+  {
+    readonly stride: number
+    readonly padding: number
+    readonly dilation: number
+    readonly groups: number
+  },
   TensorError
 > =>
   Effect.gen(function*() {
@@ -3007,6 +3211,7 @@ const checkConvOptions = (
     const padding = options.padding ?? 0
     const dilation = options.dilation ?? 1
     const groups = options.groups ?? 1
+
     if (self.shape.length !== rank + 2 || weight.shape.length !== rank + 2) {
       return yield* new TensorError({
         op,
@@ -3015,6 +3220,7 @@ const checkConvOptions = (
         } input and weight, got ranks ${self.shape.length} and ${weight.shape.length}`
       })
     }
+
     for (
       const [name, value, min] of [["stride", stride, 1], ["padding", padding, 0], [
         "dilation",
@@ -3026,6 +3232,7 @@ const checkConvOptions = (
         return yield* new TensorError({ op, message: `${op}: ${name} must be an integer >= ${min}, got ${value}` })
       }
     }
+
     return { stride, padding, dilation, groups }
   })
 
@@ -3038,12 +3245,14 @@ const convOutDim = (
   dilation: number
 ): Effect.Effect<number, TensorError> => {
   const effective = dilation * (kernel - 1) + 1
+
   if (input + 2 * padding < effective) {
     return new TensorError({
       op,
       message: `${op}: kernel of effective size ${effective} exceeds the padded input size ${input + 2 * padding}`
     })
   }
+
   return Effect.succeed(Math.floor((input + 2 * padding - effective) / stride) + 1)
 }
 
@@ -3082,20 +3291,24 @@ export const conv2d: {
       })
       const cIn = self.shape[1]
       const [cOut, cPerGroup] = [weight.shape[0], weight.shape[1]]
+
       if (cIn % opts.groups !== 0 || cOut % opts.groups !== 0) {
         return yield* new TensorError({
           op: "conv2d",
           message: `conv2d: channels [${cIn}, ${cOut}] are not divisible into ${opts.groups} groups`
         })
       }
+
       if (cPerGroup !== cIn / opts.groups) {
         return yield* new TensorError({
           op: "conv2d",
           message: `conv2d: weight has ${cPerGroup} input channels per group, expected ${cIn / opts.groups}`
         })
       }
+
       yield* convOutDim("conv2d", self.shape[2], weight.shape[2], opts.stride, opts.padding, opts.dilation)
       yield* convOutDim("conv2d", self.shape[3], weight.shape[3], opts.stride, opts.padding, opts.dilation)
+
       return yield* graphTry("conv2d", () => ({
         op: "conv2d",
         inputs: [self, weight],
@@ -3137,19 +3350,23 @@ export const conv1d: {
       })
       const cIn = self.shape[1]
       const [cOut, cPerGroup] = [weight.shape[0], weight.shape[1]]
+
       if (cIn % opts.groups !== 0 || cOut % opts.groups !== 0) {
         return yield* new TensorError({
           op: "conv1d",
           message: `conv1d: channels [${cIn}, ${cOut}] are not divisible into ${opts.groups} groups`
         })
       }
+
       if (cPerGroup !== cIn / opts.groups) {
         return yield* new TensorError({
           op: "conv1d",
           message: `conv1d: weight has ${cPerGroup} input channels per group, expected ${cIn / opts.groups}`
         })
       }
+
       yield* convOutDim("conv1d", self.shape[2], weight.shape[2], opts.stride, opts.padding, opts.dilation)
+
       return yield* graphTry("conv1d", () => ({
         op: "conv1d",
         inputs: [self, weight],
@@ -3167,6 +3384,7 @@ const dilateDim = (
     if (factor === 1) {
       return yield* add(self, yield* constantLike(self, 0))
     }
+
     const n = self.shape[dim]
     const widened = yield* unsqueeze(self, dim + 1)
     const zshape = [...self.shape]
@@ -3177,6 +3395,7 @@ const dilateDim = (
     merged.splice(dim + 1, 1)
     const wide = yield* reshape(cat, merged)
     const keep = (n - 1) * factor + 1
+
     return yield* slice(wide, { end: wide.shape.map((s, i) => (i === dim ? keep : s)) })
   })
 
@@ -3207,18 +3426,21 @@ const convTranspose2dImpl = (
   Effect.gen(function*() {
     const opts = yield* checkConvOptions(op, self, weight, options, 2)
     const outputPadding = options.outputPadding ?? 0
+
     if (!Number.isInteger(outputPadding) || outputPadding < 0) {
       return yield* new TensorError({
         op,
         message: `${op}: outputPadding must be a non-negative integer, got ${outputPadding}`
       })
     }
+
     if (outputPadding >= opts.stride) {
       return yield* new TensorError({
         op,
         message: `${op}: outputPadding ${outputPadding} must be smaller than stride ${opts.stride}`
       })
     }
+
     yield* Effect.try({
       try: () => checkCompatible(op, self, weight),
       catch: (error) =>
@@ -3230,56 +3452,70 @@ const convTranspose2dImpl = (
     const cIn = self.shape[1]
     const [wIn, , kh, kw] = weight.shape
     const groups = opts.groups
+
     if (wIn !== cIn) {
       return yield* new TensorError({
         op,
         message: `${op}: weight has ${wIn} input channels, expected ${cIn}`
       })
     }
+
     if (cIn % groups !== 0) {
       return yield* new TensorError({
         op,
         message: `${op}: ${cIn} input channels are not divisible into ${groups} groups`
       })
     }
+
     // A transposed convolution is an ordinary convolution over a zero-inserted
     // input with output/input kernel channels swapped and spatial axes flipped:
     // padding' = dilation * (kernel - 1) - requested padding.
     const padY = opts.dilation * (kh - 1) - userPadding[0]
     const padX = opts.dilation * (kw - 1) - userPadding[1]
+
     if (padY < 0 || padX < 0) {
       return yield* new TensorError({
         op,
         message: `${op}: padding [${userPadding}] is too large for kernel [${kh}, ${kw}] with dilation ${opts.dilation}`
       })
     }
+
     const convGroup = (x: Any, w: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
       Effect.gen(function*() {
         const dilated = yield* dilateDim(yield* dilateDim(x, 2, opts.stride), 3, opts.stride)
         const kernel = yield* flip(yield* transpose(w, [1, 0, 2, 3]), [2, 3])
+
         const padded = padY > 0 || padX > 0
           ? yield* pad(dilated, [[0, 0], [0, 0], [padY, padY], [padX, padX]])
           : dilated
+
         return yield* conv2d(padded, kernel, { dilation: opts.dilation })
       })
+
     let out: Lazy
+
     if (groups === 1) {
       out = yield* convGroup(self, weight)
     } else {
       const xs = yield* split(self, Array<number>(groups).fill(cIn / groups), { dim: 1 })
       const ws = yield* split(weight, Array<number>(groups).fill(wIn / groups), { dim: 0 })
+
       const outs: [Lazy, Lazy, ...Array<Lazy>] = [
         yield* convGroup(xs[0], ws[0]),
         yield* convGroup(xs[1], ws[1])
       ]
+
       for (let i = 2; i < groups; i++) {
         outs.push(yield* convGroup(xs[i], ws[i]))
       }
+
       out = yield* concat(outs, { dim: 1 })
     }
+
     if (outputPads[0] > 0 || outputPads[1] > 0) {
       out = yield* pad(out, [[0, 0], [0, 0], [0, outputPads[0]], [0, outputPads[1]]])
     }
+
     return out
   })
 
@@ -3352,6 +3588,7 @@ export const convTranspose1d: {
             `convTranspose1d: expected rank-3 input and weight, got ranks ${self.shape.length} and ${weight.shape.length}`
         })
       }
+
       const out = yield* convTranspose2dImpl(
         "convTranspose1d",
         yield* unsqueeze(self, 2),
@@ -3360,6 +3597,7 @@ export const convTranspose1d: {
         [0, options.padding ?? 0],
         [0, options.outputPadding ?? 0]
       )
+
       return yield* squeeze(out, { dims: [2] })
     })
 )
@@ -3394,33 +3632,42 @@ const pool2d = (
         message: `${op}: expected a rank-4 [N, C, H, W] input, got rank ${self.shape.length}`
       })
     }
+
     const [kh, kw] = Array.isArray(options.kernelSize)
       ? options.kernelSize
       : [options.kernelSize, options.kernelSize]
+
     const [sy, sx] = options.stride === undefined
       ? [kh, kw]
       : Array.isArray(options.stride)
       ? options.stride
       : [options.stride, options.stride]
+
     const padding = options.padding ?? 0
+
     if (kh < 1 || kw < 1 || sy < 1 || sx < 1 || padding < 0) {
       return yield* new TensorError({
         op,
         message: `${op}: invalid kernel [${kh}, ${kw}] / stride [${sy}, ${sx}] / padding ${padding}`
       })
     }
+
     const padded = padding > 0
       ? yield* pad(self, [[0, 0], [0, 0], [padding, padding], [padding, padding]])
       : self
+
     const oh = Math.floor((padded.shape[2] - kh) / sy) + 1
     const ow = Math.floor((padded.shape[3] - kw) / sx) + 1
+
     if (oh < 1 || ow < 1) {
       return yield* new TensorError({
         op,
         message: `${op}: kernel [${kh}, ${kw}] is larger than the padded input [${padded.shape[2]}, ${padded.shape[3]}]`
       })
     }
+
     const windows: Array<Lazy> = []
+
     // Each kernel offset contributes one strided view of all output windows.
     // Stacking those views turns pooling into a single reduction axis and keeps
     // both the forward and adjoint in the ordinary graph vocabulary.
@@ -3435,9 +3682,11 @@ const pool2d = (
         )
       }
     }
+
     const stacked = windows.length === 1
       ? yield* unsqueeze(windows[0], 0)
       : yield* stack([windows[0], windows[1], ...windows.slice(2)], { dim: 0 })
+
     return yield* reduce(stacked)
   })
 
@@ -3471,12 +3720,14 @@ export const avgPool2d = (
 const checkSquare = (op: string, self: Any): Effect.Effect<void, TensorError> =>
   Effect.gen(function*() {
     const rank = self.shape.length
+
     if (rank < 2 || self.shape[rank - 2] !== self.shape[rank - 1]) {
       return yield* new TensorError({
         op,
         message: `${op}: expected a tensor square on its last two dimensions, got shape [${self.shape}]`
       })
     }
+
     if (!isFloatDtype(self.dtype)) {
       return yield* new TensorError({ op, message: `${op}: dtype must be f32 or f64, got ${self.dtype}` })
     }
@@ -3493,6 +3744,7 @@ const checkSquare = (op: string, self: Any): Effect.Effect<void, TensorError> =>
 export const inverse = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSquare("inverse", self)
+
     return yield* graphTry("inverse", () => ({ op: "inverse", inputs: [self] }))
   })
 
@@ -3507,6 +3759,7 @@ export const inverse = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Run
 export const det = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSquare("det", self)
+
     return yield* graphTry("det", () => ({ op: "det", inputs: [self] }))
   })
 
@@ -3528,6 +3781,7 @@ export const solve: {
     Effect.gen(function*() {
       yield* checkSquare("solve", self)
       const rank = self.shape.length
+
       if (
         b.shape.length !== rank ||
         !self.shape.slice(0, -2).every((d, i) => d === b.shape[i]) ||
@@ -3540,11 +3794,13 @@ export const solve: {
           }], got shape [${b.shape}]`
         })
       }
+
       yield* Effect.try({
         try: () => checkCompatible("solve", self, b),
         catch: (error) =>
           new TensorError({ op: "solve", message: error instanceof Error ? error.message : String(error) })
       })
+
       return yield* graphTry("solve", () => ({ op: "solve", inputs: [self, b] }))
     })
 )
@@ -3574,6 +3830,7 @@ export const cast: {
   (self: Any, dtype: DType): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     graphTry("cast", () => ({ op: "cast", inputs: [self], attributes: { dtype } }))
 )
+
 /**
  * Materializes all roots together and returns owned concrete handles in root
  * order, including duplicates. An empty call performs no compilation or
@@ -3604,16 +3861,21 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
       // SAFETY: Zero roots correspond to an empty concrete-output tuple or array.
       return empty as { readonly [K in keyof Roots]: Concrete }
     }
+
     const runtime = yield* Runtime.Runtime
     let owned: ReadonlyArray<Concrete> = []
+
     return yield* Effect.onExit(
       Effect.gen(function*() {
         const executable = yield* fromBackend("compile", runtime.compile({ roots, options }))
+
         const values = yield* fromBackend(
           "execute",
           runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
         )
+
         owned = values
+
         if (values.length !== roots.length) {
           return yield* new TensorError({
             op: "execute",
@@ -3686,54 +3948,65 @@ const normalizeSamplingOptions = (
         message: `${op}: logits must have non-empty rank-one shape, got [${logits.shape}]`
       })
     }
+
     const vocabulary = logits.shape[0]!
+
     if (vocabulary > MAX_SAMPLING_VOCABULARY) {
       return yield* new TensorError({
         op,
         message: `${op}: vocabulary ${vocabulary} exceeds limit ${MAX_SAMPLING_VOCABULARY}`
       })
     }
+
     if (logits.storage !== undefined || !["f16", "bf16", "f32", "f64"].includes(logits.dtype)) {
       return yield* new TensorError({
         op,
         message: `${op}: logits must be a dense floating-point tensor, got ${logits.dtype}`
       })
     }
+
     const temperature = options.temperature ?? 1
     const requestedTopK = options.topK ?? 0
     const topP = options.topP ?? 1
     const counter = options.counter ?? 0
+
     if (!Number.isFinite(temperature) || temperature < 0) {
       return yield* new TensorError({
         op,
         message: `${op}: temperature must be finite and non-negative, got ${temperature}`
       })
     }
+
     if (!Number.isSafeInteger(requestedTopK) || requestedTopK < 0 || requestedTopK > vocabulary) {
       return yield* new TensorError({
         op,
         message: `${op}: topK must be an integer in [0, ${vocabulary}], got ${requestedTopK}`
       })
     }
+
     const topK = requestedTopK === vocabulary ? 0 : requestedTopK
+
     if (!Number.isFinite(topP) || topP <= 0 || topP > 1) {
       return yield* new TensorError({
         op,
         message: `${op}: topP must be finite and in (0, 1], got ${topP}`
       })
     }
+
     if (!Number.isSafeInteger(options.seed) || options.seed < 0) {
       return yield* new TensorError({
         op,
         message: `${op}: seed must be a non-negative safe integer, got ${options.seed}`
       })
     }
+
     if (!Number.isSafeInteger(counter) || counter < 0) {
       return yield* new TensorError({
         op,
         message: `${op}: counter must be a non-negative safe integer, got ${counter}`
       })
     }
+
     return { temperature, topK, topP, seed: options.seed, counter }
   })
 
@@ -3743,6 +4016,7 @@ const validateSampledToken = (
   logits: SamplingLogits
 ): Effect.Effect<number, TensorError> => {
   const vocabulary = logits.shape[0]!
+
   return !Number.isSafeInteger(token) || token < 0 || token >= vocabulary
     ? new TensorError({
       op,
@@ -3770,10 +4044,12 @@ export const sample = (
     const runtime = yield* Runtime.Runtime
     const normalized = yield* normalizeSamplingOptions("sample", logits, options)
     const extension = runtime.extensions.sampling
+
     const token = yield* fromBackend(
       "sample",
       extension.sample(logits, normalized)
     )
+
     return yield* validateSampledToken("sample", token, logits)
   })
 
@@ -3837,6 +4113,7 @@ export const clearScoped = <A extends Concrete>(
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     yield* Effect.addFinalizer(() => Effect.ignore(runtime.release(self)))
+
     return self
   })
 
@@ -3860,6 +4137,7 @@ export const clearAllScoped = <Tensors extends Iterable<Concrete>>(
     const snapshot = Array.from(tensors)
     const runtime = yield* Runtime.Runtime
     yield* Effect.addFinalizer(() => clearAllWithRuntime(runtime, snapshot))
+
     return tensors
   })
 
@@ -3886,12 +4164,17 @@ export const toTypedArray = (self: Any): Effect.Effect<TypedArray, TensorError, 
         message: `toTypedArray: ${self.storage.encoding} storage requires explicit dequantization`
       })
     }
+
     const runtime = yield* Runtime.Runtime
+
     if (isTensor(self)) {
       const buffer = yield* fromBackend("toTypedArray", runtime.readback(self))
+
       return new (typedArrayConstructor(self.dtype))(buffer)
     }
+
     const [evaluated] = yield* compute([self])
+
     return yield* Effect.ensuring(
       Effect.map(
         fromBackend("toTypedArray", runtime.readback(evaluated)),
@@ -3929,11 +4212,14 @@ const withMaterializedInputs = <A, E, R>(
   use: (inputs: ReadonlyArray<Concrete>) => Effect.Effect<A, E, R>
 ): Effect.Effect<A, E | TensorError, R | Runtime.Runtime> => {
   if (inputs.every(isTensor)) return use(inputs)
+
   const lazy = inputs.filter(isLazyTensor)
+
   return Effect.gen(function*() {
     const materialized = yield* compute(lazy)
     let index = 0
     const concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
+
     return yield* Effect.ensuring(
       use(concrete),
       releaseTensors(runtime, materialized)
@@ -3949,16 +4235,19 @@ const executeProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError> =>
   Effect.suspend(() => {
     let owned: ReadonlyArray<Concrete> = []
+
     return Effect.onExit(
       Effect.gen(function*() {
         const values = yield* fromBackend(op, runtime.execute(program.handle, invocation))
         owned = values
+
         if (values.length !== program.outputs.length) {
           return yield* new TensorError({
             op,
             message: `${op}: backend returned ${values.length} tensors for ${program.outputs.length} program outputs`
           })
         }
+
         return Array.from(values)
       }),
       (exit) => Exit.isFailure(exit) ? releaseTensors(runtime, owned) : Effect.void
@@ -4076,8 +4365,14 @@ export interface ProgramCache {
 type ProgramCacheState = ProgramCache
 
 type ProgramCacheEntry =
-  | { readonly _tag: "ready"; readonly program: CompiledProgram }
-  | { readonly _tag: "pending"; readonly deferred: Deferred.Deferred<CompiledProgram, unknown> }
+  | {
+    readonly _tag: "ready"
+    readonly program: CompiledProgram
+  }
+  | {
+    readonly _tag: "pending"
+    readonly deferred: Deferred.Deferred<CompiledProgram, unknown>
+  }
 
 /**
  * Creates empty mutable cache state for {@link cachedProgram}. `capacity`
@@ -4106,21 +4401,25 @@ export const makeProgramCache = (capacity: number = 32): ProgramCache => {
       })
     }
   }
+
   return cache
 }
 
 const evictProgramCache = (cache: ProgramCacheState): void => {
   while (cache.entries.size > cache.capacity) {
     let oldest: string | undefined
+
     for (const [key, entry] of cache.entries) {
       if (entry._tag === "ready") {
         oldest = key
         break
       }
     }
+
     if (oldest === undefined) {
       return
     }
+
     cache.entries.delete(oldest)
   }
 }
@@ -4146,6 +4445,7 @@ export const cachedProgram = <E, R>(
 ): Effect.Effect<CompiledProgram, TensorError | E, R> =>
   Effect.suspend(() => {
     const hit = cache.entries.get(key)
+
     if (hit !== undefined) {
       cache.entries.delete(key)
       cache.entries.set(key, hit)
@@ -4154,13 +4454,16 @@ export const cachedProgram = <E, R>(
         ? Effect.succeed(hit.program)
         : Deferred.await(hit.deferred) as Effect.Effect<CompiledProgram, E>
     }
+
     return Effect.gen(function*() {
       const deferred = yield* Deferred.make<CompiledProgram, unknown>()
       cache.entries.set(key, { _tag: "pending", deferred })
       cache.compiled++
       const isNewSignature = !cache.keys.has(key)
+
       if (isNewSignature) {
         cache.keys.add(key)
+
         if (!cache.warned && cache.keys.size > cache.capacity) {
           cache.warned = true
           yield* Effect.logWarning(
@@ -4168,20 +4471,26 @@ export const cachedProgram = <E, R>(
           )
         }
       }
+
       const exit = yield* Effect.exit(trace())
       yield* Deferred.done(deferred, exit)
+
       if (Exit.isFailure(exit)) {
         cache.entries.delete(key)
+
         return yield* Effect.failCause(exit.cause)
       }
+
       cache.entries.set(key, { _tag: "ready", program: exit.value })
       evictProgramCache(cache)
+
       return exit.value
     })
   })
 
 /** Process-local ids keep runtime object identities out of serialized keys. */
 const runtimeSignatureIds = new WeakMap<object, number>()
+
 let nextRuntimeSignatureId = 0
 
 /**
@@ -4197,16 +4506,20 @@ let nextRuntimeSignatureId = 0
  */
 export const signatureOf = (inputs: ReadonlyArray<Any>, runtime: Runtime.RuntimeService): string => {
   let runtimeId = runtimeSignatureIds.get(runtime.identity)
+
   if (runtimeId === undefined) {
     runtimeId = nextRuntimeSignatureId++
     runtimeSignatureIds.set(runtime.identity, runtimeId)
   }
+
   const inputsKey = inputs.map((input) => {
     const storage = input.storage === undefined
       ? "dense"
       : `${input.storage.encoding}:${input.storage.physicalShape.join("x")}:${input.storage.physicalDtype}`
+
     return `${input.placement.id}:${input.shape.join("x")}:${input.dtype}:${storage}`
   }).join("|")
+
   return `${runtimeId}|${inputsKey}`
 }
 
@@ -4273,6 +4586,7 @@ export const freezeProgram = (
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const handle = yield* fromBackend("compile", runtime.compile({ roots, options }))
+
     return {
       handle,
       outputs: roots.map((root) => ({
@@ -4309,15 +4623,16 @@ export const runProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
+
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       executeProgram(runtime, "run", program, { bindings: concrete, scalars, runtimeValues: {} }))
   })
 
 /**
  * A backend-owned immutable decode program with fixed batch width, attention
- * and recurrent geometry, and output metadata. The executable can be called
- * concurrently only when invocations use disjoint live sequences from
- * compatible pools.
+ * and recurrent geometry, and output metadata. Concurrent append calls use
+ * disjoint live sequences from compatible pools. Read-only calls may share
+ * immutable prefix snapshots.
  *
  * @since 0.1.0
  * @category compilation
@@ -4478,6 +4793,38 @@ export interface KvRecurrentGeometry {
 }
 
 /**
+ * Pool allocation from a compiled ordered state schema.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface KvPoolOptions {
+  readonly kvLayers: ReadonlyArray<Runtime.KvLayerDescriptor>
+  readonly maxTokens: number
+  readonly blockSize: number
+  readonly recurrent?: KvRecurrentGeometry | undefined
+}
+
+/** Allocates a state pool from one compiled decode schema. */
+export const makeKvPoolFromSchema = (
+  schema: Runtime.DecodeStateSchema
+): Effect.Effect<KvPool, TensorError, Runtime.Runtime> =>
+  makeKvPool({
+    kvLayers: schema.kvLayers,
+    maxTokens: schema.maxTokens,
+    blockSize: schema.blockSize,
+    recurrent: {
+      kdaLayers: schema.kdaLayers,
+      kdaHeads: schema.kdaHeads,
+      kdaHeadDim: schema.kdaHeadDim,
+      kdaValueDim: schema.kdaValueDim,
+      convLayers: schema.convLayers,
+      convChannels: schema.convChannels,
+      convKernel: schema.convKernel
+    }
+  })
+
+/**
  * Allocates a fixed-capacity state pool in the active runtime. `maxTokens` and
  * `blockSize` must be positive integers with exact divisibility. Attention
  * geometry must be either entirely zero, for stateless or recurrent-only
@@ -4491,12 +4838,36 @@ export interface KvRecurrentGeometry {
  * @since 0.1.0
  * @category compilation
  */
-export const makeKvPool = (
+export function makeKvPool(options: KvPoolOptions): Effect.Effect<KvPool, TensorError, Runtime.Runtime>
+
+/**
+ * Allocates a pool with uniform attention geometry and optional recurrent state. See the schema overload for allocation constraints.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export function makeKvPool(
   layers: number,
   kvHeads: number,
   headDim: number,
   maxTokens: number,
   blockSize: number,
+  dtype?: DType,
+  recurrent?: KvRecurrentGeometry
+): Effect.Effect<KvPool, TensorError, Runtime.Runtime>
+
+/**
+ * Allocates native pool storage from an ordered schema or uniform layer geometry.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export function makeKvPool(
+  layersOrOptions: number | KvPoolOptions,
+  kvHeads: number = 0,
+  headDim: number = 0,
+  maxTokens: number = 0,
+  blockSize: number = 0,
   dtype: DType = "f32",
   recurrent: KvRecurrentGeometry = {
     kdaLayers: 0,
@@ -4507,16 +4878,32 @@ export const makeKvPool = (
     convChannels: 0,
     convKernel: 0
   }
-): Effect.Effect<KvPool, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
+): Effect.Effect<KvPool, TensorError, Runtime.Runtime> {
+  return Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
+
     const handle = yield* fromBackend(
       "makeKvPool",
-      extension.makePool({ layers, kvHeads, headDim, maxTokens, blockSize, dtype, ...recurrent })
+      extension.makePool(
+        Predicate.isNumber(layersOrOptions)
+          ? { layers: layersOrOptions, kvHeads, headDim, maxTokens, blockSize, dtype, ...recurrent }
+          : {
+            kvLayers: layersOrOptions.kvLayers,
+            layers: layersOrOptions.kvLayers.length,
+            kvHeads: layersOrOptions.kvLayers[0]?.kvHeads ?? 0,
+            headDim: layersOrOptions.kvLayers[0]?.headDim ?? 0,
+            dtype: layersOrOptions.kvLayers[0]?.dtype ?? "f32",
+            maxTokens: layersOrOptions.maxTokens,
+            blockSize: layersOrOptions.blockSize,
+            ...(layersOrOptions.recurrent ?? recurrent)
+          }
+      )
     )
+
     return { handle }
   })
+}
 
 /**
  * Creates an independent live sequence in `pool`.
@@ -4540,6 +4927,7 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
     const handle = yield* fromBackend("makeKvSequence", extension.makeSequence(pool.handle))
+
     return { handle }
   })
 
@@ -4572,6 +4960,7 @@ export const kvPrefillMatch = (
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
+
     return yield* fromBackend("prefillMatch", extension.prefillMatch(sequence.handle, tokens))
   })
 
@@ -4593,6 +4982,7 @@ export const kvSequenceCursor = (sequence: KvSequence): Effect.Effect<number, Te
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
+
     return yield* fromBackend("sequenceCursor", extension.sequenceCursor(sequence.handle))
   })
 
@@ -4614,7 +5004,120 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
+
     return yield* fromBackend("releaseSequence", extension.releaseSequence(sequence.handle))
+  })
+
+/**
+ * Owned immutable snapshot of committed native K/V pages.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface KvSnapshot {
+  readonly handle: Runtime.KvPrefixHandle
+  readonly tokenCount: number
+  /** Physical bytes retained at acquisition. Shared pages are counted without copying. */
+  readonly retainedBytes: number
+}
+
+/**
+ * Retains the committed prefix without copying its cache. Later sequence
+ * appends preserve the snapshot through native copy-on-write tails.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const snapshotKvSequence = (sequence: KvSequence): Effect.Effect<KvSnapshot, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    const handle = yield* fromBackend("snapshotKvSequence", runtime.extensions.decode.snapshot(sequence.handle))
+
+    return { handle, tokenCount: handle.tokenCount, retainedBytes: handle.retainedBytes }
+  })
+
+/**
+ * Creates an independently appendable native sequence sharing a snapshot.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const forkKvPrefix = (prefix: KvSnapshot): Effect.Effect<KvSequence, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    const handle = yield* fromBackend("forkKvPrefix", runtime.extensions.decode.fork(prefix.handle))
+
+    return { handle }
+  })
+
+/**
+ * Releases the caller-owned snapshot handle. Native invocations that already
+ * borrowed it retain their storage through completion. Other snapshots, forked
+ * sequences, and previously returned outputs remain valid.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const releaseKvPrefix = (prefix: KvSnapshot): Effect.Effect<void, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+
+    return yield* fromBackend("releaseKvPrefix", runtime.extensions.decode.releasePrefix(prefix.handle))
+  })
+
+/**
+ * Exports retained layer K/V and physical sharing counters for diagnostics.
+ * This host export is separate from normal native prefix execution.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const inspectKvPrefix = (
+  prefix: KvSnapshot
+): Effect.Effect<Runtime.KvSnapshotInspection, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+
+    return yield* fromBackend("inspectKvPrefix", runtime.extensions.decode.inspectPrefix(prefix.handle))
+  })
+
+/**
+ * Evaluates current rows against an immutable prefix. Current K/V is
+ * invocation-owned and discarded when execution completes. Calls may share a
+ * snapshot concurrently and each returned tensor owns its output handle.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const runReadOnlyDecodeProgram = (
+  program: DecodeProgram,
+  inputs: ReadonlyArray<Any>,
+  prefix: KvSnapshot,
+  validLength: number
+): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    if (program.batch !== 1 || program.access !== "ReadOnly") {
+      return yield* new TensorError({
+        op: "readOnlyDecode",
+        message: "readOnlyDecode: requires a batch-one read-only program"
+      })
+    }
+
+    const runtime = yield* Runtime.Runtime
+
+    return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
+      executeProgram(runtime, "readOnlyDecode", program, {
+        bindings: concrete,
+        scalars: [],
+        runtimeValues: {},
+        state: {
+          access: "ReadOnly",
+          prefixes: [prefix.handle],
+          slots: [0],
+          activeMask: [true],
+          validLengths: [validLength]
+        }
+      }))
   })
 
 /**
@@ -4641,41 +5144,55 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
  * bypasses bundled runtimes' native structural executable cache. The returned
  * program has no explicit release operation.
  *
+ * `state.access` separates append transactions from immutable prefix reads.
+ * Explicit rotary positions remain caller bindings in both modes. The optional
+ * third argument controls compilation, including `optimize: false` for parity
+ * checks. Ordered `kvLayers` descriptors determine compatible pool storage.
+ *
  * @since 0.1.0
  * @category compilation
  */
 export const compileDecodeProgram = (
   roots: ReadonlyArray<Any>,
-  state: Runtime.DecodeStateRequest
+  state: Runtime.DecodeStateRequest,
+  options?: Runtime.ExecutableCompileOptions
 ): Effect.Effect<DecodeProgram, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
+
     const handle = yield* fromBackend(
       "compileDecode",
       runtime.compile({
         roots,
         options: {
-          constantWeights: true
+          constantWeights: true,
+          ...options
         },
         state
       })
     )
+
     if (handle.state === undefined) {
       return yield* new TensorError({
         op: "compileDecode",
         message: "compileDecode: backend returned a stateless executable"
       })
     }
+
     return {
       handle,
       ...handle.state,
       packedCausalChains: state.packedCausalChains,
       outputs: roots.flatMap((root, index) => {
         const base = { dtype: root.dtype, placement: root.placement }
+
         const selection = state.outputSelections?.[index]
           ?? (state.lastTokenRow === true ? "splitLastTokenRow" : "allRows")
+
         if (selection === "allRows") return [{ shape: root.shape, ...base }]
+
         if (selection === "batchedLastTokenRow") return [{ shape: [state.batch, root.shape[2]!], ...base }]
+
         return Array.from({ length: state.batch }, () => ({ shape: [root.shape[2]!], ...base }))
       })
     }
@@ -4712,13 +5229,16 @@ export const runDecodeProgram = (
         message: `decode: single-sequence execution requires a batch-one program, got batch ${program.batch}`
       })
     }
+
     const runtime = yield* Runtime.Runtime
+
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       executeProgram(runtime, "decode", program, {
         bindings: concrete,
         scalars: [],
         runtimeValues: {},
         state: {
+          access: "Append",
           sequences: [seq.handle],
           slots: [0],
           activeMask: [true],
@@ -4755,16 +5275,20 @@ export const runDecodeProgramSampled = (
         message: `decodeSampled: single-sequence execution requires a batch-one program, got batch ${program.batch}`
       })
     }
+
     const runtime = yield* Runtime.Runtime
     const executeDecode = runtime.extensions.sampling.executeDecode
     const output = program.outputs[0]
+
     if (output === undefined) {
       return yield* new TensorError({
         op: "decodeSampled",
         message: "decodeSampled: program has no active output to sample"
       })
     }
+
     const normalized = yield* normalizeSamplingOptions("decodeSampled", output, sampling)
+
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       Effect.gen(function*() {
         const sampled = yield* fromBackend(
@@ -4774,6 +5298,7 @@ export const runDecodeProgramSampled = (
             scalars: [],
             runtimeValues: {},
             state: {
+              access: "Append",
               sequences: [seq.handle],
               slots: [0],
               activeMask: [true],
@@ -4783,12 +5308,14 @@ export const runDecodeProgramSampled = (
             }
           }, [normalized])
         )
+
         if (sampled.length !== 1) {
           return yield* new TensorError({
             op: "decodeSampled",
             message: `decodeSampled: backend returned ${sampled.length} tokens for 1 active output`
           })
         }
+
         return yield* validateSampledToken("decodeSampled", sampled[0]!, output)
       }))
   })
@@ -4819,12 +5346,14 @@ export const runBatchedDecodeProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
+
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       executeProgram(runtime, "decodeBatched", program, {
         bindings: concrete,
         scalars: [],
         runtimeValues: {},
         state: {
+          access: "Append",
           sequences: seqs.map((sequence) =>
             sequence.handle
           ),
@@ -4832,10 +5361,12 @@ export const runBatchedDecodeProgram = (
           activeMask: Array.from({ length: program.batch }, (_, slot) => slots.includes(slot)),
           validLengths: Array.from({ length: program.batch }, (_, slot) => {
             const index = slots.indexOf(slot)
+
             return index < 0 ? 0 : tokens[index]!.length
           }),
           advances: Array.from({ length: program.batch }, (_, slot) => {
             const index = slots.indexOf(slot)
+
             return index < 0 ? 0 : tokens[index]!.length
           }),
           tokens
@@ -4867,6 +5398,7 @@ export const runBatchedDecodeProgramSampled = (
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const executeDecode = runtime.extensions.sampling.executeDecode
+
     if (sampling.length !== seqs.length) {
       return yield* new TensorError({
         op: "decodeBatchedSampled",
@@ -4874,9 +5406,11 @@ export const runBatchedDecodeProgramSampled = (
           `decodeBatchedSampled: expected one sampling options object per active sequence, got ${sampling.length} for ${seqs.length}`
       })
     }
+
     const normalized = yield* Effect.forEach(sampling, (options, index) => {
       const slot = slots[index]
       const output = slot === undefined ? undefined : program.outputs[slot]
+
       return output === undefined
         ? new TensorError({
           op: "decodeBatchedSampled",
@@ -4884,6 +5418,7 @@ export const runBatchedDecodeProgramSampled = (
         })
         : normalizeSamplingOptions("decodeBatchedSampled", output, options)
     })
+
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       Effect.gen(function*() {
         const sampled = yield* fromBackend(
@@ -4893,21 +5428,25 @@ export const runBatchedDecodeProgramSampled = (
             scalars: [],
             runtimeValues: {},
             state: {
+              access: "Append",
               sequences: seqs.map((sequence) => sequence.handle),
               slots,
               activeMask: Array.from({ length: program.batch }, (_, slot) => slots.includes(slot)),
               validLengths: Array.from({ length: program.batch }, (_, slot) => {
                 const index = slots.indexOf(slot)
+
                 return index < 0 ? 0 : tokens[index]!.length
               }),
               advances: Array.from({ length: program.batch }, (_, slot) => {
                 const index = slots.indexOf(slot)
+
                 return index < 0 ? 0 : tokens[index]!.length
               }),
               tokens
             }
           }, normalized)
         )
+
         if (sampled.length !== normalized.length) {
           return yield* new TensorError({
             op: "decodeBatchedSampled",
@@ -4915,6 +5454,7 @@ export const runBatchedDecodeProgramSampled = (
               `decodeBatchedSampled: backend returned ${sampled.length} tokens for ${normalized.length} active outputs`
           })
         }
+
         return yield* Effect.forEach(
           sampled,
           (token, index) => validateSampledToken("decodeBatchedSampled", token, program.outputs[slots[index]!]!)
@@ -4937,6 +5477,7 @@ export const linear = (
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const k = self.shape[self.shape.length - 1]
+
     if (
       self.shape.length < 2 ||
       weight.shape.length !== 2 ||
@@ -4947,7 +5488,9 @@ export const linear = (
         message: `linear: expected input [.., K] and weight [K, N], got [${self.shape}] x [${weight.shape}]`
       })
     }
+
     const n = weight.shape[1]
+
     const flatBias = yield* (
       bias.shape.length === 1 && bias.shape[0] === n
         ? Effect.succeed(bias)
@@ -4958,6 +5501,7 @@ export const linear = (
           message: `linear: bias must be [N] or [1, N], got [${bias.shape}] for N ${n}`
         })
     )
+
     yield* Effect.try({
       try: () => {
         checkCompatible("linear", self, weight)
@@ -4966,6 +5510,7 @@ export const linear = (
       catch: (error) =>
         new TensorError({ op: "linear", message: error instanceof Error ? error.message : String(error) })
     })
+
     return yield* graphTry("linear", () => ({ op: "linear", inputs: [self, weight, flatBias] }))
   })
 
@@ -4989,14 +5534,17 @@ export const linearRows = (
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const k = self.shape[self.shape.length - 1]
+
     if (self.shape.length < 2 || weight.shape.length !== 2 || weight.shape[1] !== k) {
       return yield* new TensorError({
         op: "linearRows",
         message: `linearRows: expected input [.., K] and weight [N, K], got [${self.shape}] x [${weight.shape}]`
       })
     }
+
     const n = weight.shape[0]
     let flatBias: Any | undefined
+
     if (bias !== undefined) {
       flatBias = yield* (
         bias.shape.length === 1 && bias.shape[0] === n
@@ -5009,22 +5557,56 @@ export const linearRows = (
           })
       )
     }
+
     yield* Effect.try({
       try: () => {
         checkCompatible("linearRows", self, weight)
+
         if (flatBias !== undefined) checkCompatible("linearRows", self, flatBias)
       },
       catch: (error) =>
         new TensorError({ op: "linearRows", message: error instanceof Error ? error.message : String(error) })
     })
+
     if (weight.storage === undefined) {
       const transposed = yield* transpose(weight, [1, 0])
+
       return flatBias === undefined ? yield* matmul(self, transposed) : yield* linear(self, transposed, flatBias)
     }
+
     return yield* graphTry("linearRows", () => ({
       op: "quantizedLinear",
       inputs: flatBias === undefined ? [self, weight] : [self, weight, flatBias]
     }))
+  })
+
+const expertRows = (
+  op: "expertLinearRows" | "groupedExpertLinearRows",
+  self: Any,
+  weights: Any,
+  indices: Any
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  graphTry(op, () => {
+    checkCompatible(op, self, weights)
+
+    if (self.dtype !== "f32" && self.dtype !== "bf16") {
+      throw new Error(`${op}: expected f32 or bf16, got ${self.dtype}`)
+    }
+
+    if (
+      self.shape.length !== 2 || weights.shape.length !== 3 || indices.shape.length !== 1 ||
+      self.shape[1] !== weights.shape[2] || self.shape[0] !== indices.shape[0]
+    ) {
+      throw new Error(`${op}: expected input [N,I], weights [E,O,I], and indices [N]`)
+    }
+
+    if (weights.shape[0] <= 0 || weights.shape[0] > 0xffffffff) {
+      throw new Error(`${op}: E must be positive and fit U32`)
+    }
+
+    if (indices.dtype !== "u32") throw new Error(`${op}: indices must be u32`)
+
+    return { op, inputs: [self, weights, indices] }
   })
 
 /**
@@ -5045,24 +5627,31 @@ export const expertLinearRows = (
   self: Any,
   weights: Any,
   indices: Any
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("expertLinearRows", () => {
-    checkCompatible("expertLinearRows", self, weights)
-    if (self.dtype !== "f32" && self.dtype !== "bf16") {
-      throw new Error(`expertLinearRows: expected f32 or bf16, got ${self.dtype}`)
-    }
-    if (
-      self.shape.length !== 2 || weights.shape.length !== 3 || indices.shape.length !== 1 ||
-      self.shape[1] !== weights.shape[2] || self.shape[0] !== indices.shape[0]
-    ) {
-      throw new Error("expertLinearRows: expected input [N,I], weights [E,O,I], and indices [N]")
-    }
-    if (weights.shape[0] <= 0 || weights.shape[0] > 0xffffffff) {
-      throw new Error("expertLinearRows: E must be positive and fit U32")
-    }
-    if (indices.dtype !== "u32") throw new Error("expertLinearRows: indices must be u32")
-    return { op: "expertLinearRows", inputs: [self, weights, indices] }
-  })
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> => expertRows("expertLinearRows", self, weights, indices)
+
+/**
+ * Groups input `[N, I]` rows by U32 expert indices `[N]` and projects each
+ * group with its borrowed `[E, O, I]` weight bank, returning `[N, O]`. Groups
+ * retain input row order and use their exact active row counts. Results return
+ * in original row order. The bank is never replicated per row.
+ *
+ * Each group uses the backend's ordinary bias-free linearRows/matmul numerical
+ * contract for matching dense F32 or BF16 inputs and weights. BF16 GEMM may
+ * round split-K partials before its final result. Unlike expertLinearRows,
+ * this does not require a single final BF16 rounding of an F32-only dot.
+ *
+ * Views, broadcast operands, repeated indices, and zero N/I/O are supported.
+ * Requires `0 < E <= 2^32 - 1`. Invalid indices fail execution even when O is
+ * zero. Inputs remain borrowed. This inference-only operation is not differentiable.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const groupedExpertLinearRows = (
+  self: Any,
+  weights: Any,
+  indices: Any
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> => expertRows("groupedExpertLinearRows", self, weights, indices)
 
 /**
  * Layer normalization over the last dim as a single semantic operation:
@@ -5081,6 +5670,7 @@ export const layerNorm = (
   graphTry("layerNorm", () => {
     const k = weight.shape.length
     const suffix = self.shape.slice(self.shape.length - k)
+
     if (
       self.shape.length < k ||
       weight.shape.some((dim, i) => suffix[i] !== dim) ||
@@ -5091,8 +5681,10 @@ export const layerNorm = (
         `layerNorm: weight and bias must match the input's trailing dims [${self.shape}], got [${weight.shape}] and [${bias.shape}]`
       )
     }
+
     checkCompatible("layerNorm", self, weight)
     checkCompatible("layerNorm", self, bias)
+
     return {
       op: "layerNorm",
       inputs: [self, weight, bias],
@@ -5106,6 +5698,9 @@ export const layerNorm = (
  * [experts, outputWidth, intermediateWidth], and indices and routing weights
  * are [rows, routes]. Only activations expand per route; weight banks remain
  * indexed. activate builds a graph over the gate half of the projection.
+ * project defaults to expertLinearRows; groupedExpertLinearRows selects ordinary
+ * backend GEMM numerics. Both projections receive rows ordered by route, then
+ * token, matching the eager expert loop's stable group order.
  *
  * Routing weights use F32. Each weighted contribution rounds to the input dtype
  * before summation in ascending expert-ID order. Duplicate IDs keep route order.
@@ -5120,7 +5715,9 @@ export const gatedExperts = (
   down: Any,
   indices: Any,
   routingWeights: Any,
-  activate: (gate: Any) => Effect.Effect<Any, TensorError, Runtime.Runtime>
+  activate: (gate: Any) => Effect.Effect<Any, TensorError, Runtime.Runtime>,
+  project: (input: Any, weights: Any, indices: Any) => Effect.Effect<Any, TensorError, Runtime.Runtime> =
+    expertLinearRows
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const rows = input.shape[0]
@@ -5157,21 +5754,24 @@ export const gatedExperts = (
       )
     }
 
-    const tokenRows = yield* reshape(input, [rows, 1, inputWidth])
-    const routedRows = yield* broadcastTo(tokenRows, [rows, routes, inputWidth])
+    const tokenRows = yield* reshape(input, [1, rows, inputWidth])
+    const routedRows = yield* broadcastTo(tokenRows, [routes, rows, inputWidth])
     const expanded = yield* reshape(routedRows, [rows * routes, inputWidth])
 
-    const flatIndices = yield* reshape(indices, [rows * routes])
+    const flatIndices = yield* reshape(yield* transpose(indices, [1, 0]), [rows * routes])
 
-    const gateUpOutput = yield* expertLinearRows(expanded, gateUp, flatIndices)
+    const gateUpOutput = yield* project(expanded, gateUp, flatIndices)
     const gate = yield* slice(gateUpOutput, { end: [rows * routes, intermediateWidth] })
     const up = yield* slice(gateUpOutput, { start: [0, intermediateWidth] })
 
     const activated = yield* activate(gate)
     const activation = yield* mul(activated, up)
-    const projected = yield* expertLinearRows(activation, down, flatIndices)
+    const projected = yield* project(activation, down, flatIndices)
+    const routeMajor = yield* reshape(projected, [routes, rows, outputWidth])
+    const tokenMajor = yield* transpose(routeMajor, [1, 0, 2])
+    const projectedRows = yield* reshape(tokenMajor, [rows * routes, outputWidth])
 
-    const projectedFloat = yield* cast(projected, "f32")
+    const projectedFloat = yield* cast(projectedRows, "f32")
     const flatWeights = yield* reshape(routingWeights, [rows * routes, 1])
     const weightedFloat = yield* mul(projectedFloat, flatWeights)
     const contributions = yield* cast(weightedFloat, input.dtype)
@@ -5207,6 +5807,7 @@ export const gatedExperts = (
         start: [0, route, 0],
         end: [rows, route + 1, outputWidth]
       })
+
       const contribution = yield* reshape(selected, [rows, outputWidth])
       output = yield* add(output, contribution)
     }
@@ -5228,13 +5829,17 @@ export const rmsNorm = (
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   graphTry("rmsNorm", () => {
     const width = self.shape.at(-1)
+
     if (width === undefined) throw new Error("rmsNorm: input must have rank at least 1")
+
     if (weight !== undefined) {
       if (weight.shape.length !== 1 || weight.shape[0] !== width) {
         throw new Error(`rmsNorm: weight must be [${width}], got [${weight.shape}]`)
       }
+
       checkCompatible("rmsNorm", self, weight)
     }
+
     return {
       op: "rmsNorm",
       inputs: weight === undefined ? [self] : [self, weight],
@@ -5262,6 +5867,7 @@ export const positionEmbedding = (
         `positionEmbedding: weight must be [maxPositions, E], got [${weight.shape}]`
       )
     }
+
     return { op: "positionEmbedding", inputs: [weight], attributes: { seqLen } }
   })
 
@@ -5290,8 +5896,8 @@ export interface RotaryEmbeddingOptions {
  * Generation beyond a pool's finite capacity also requires an
  * attention window that can evict old blocks.
  *
- * Supplying positions or inverse frequencies builds an explicit F32/F16/BF16
- * rotation graph. Positions are u32/i64 [...batch, seqLen], excluding the head
+ * Supplying positions or inverse frequencies records an explicit F32/F16/BF16
+ * rotation node. Positions are u32/i64 [...batch, seqLen], excluding the head
  * axis, or [seqLen] for rank-two inputs. Angles and trigonometric functions use
  * F32, then cosine and sine round to the input dtype before multiplication and
  * addition. Frequency buffers may use F32/F16/BF16 and are converted to F32.
@@ -5312,9 +5918,11 @@ export const rotaryEmbedding = (
 
   return graphTry("rotaryEmbedding", () => {
     const layout = options.layout ?? "HalfSplit"
+
     if (layout !== "HalfSplit" && layout !== "InterleavedPairs") {
       throw new Error(`rotaryEmbedding: unsupported layout ${String(layout)}`)
     }
+
     return { op: "rotaryEmbedding", inputs: [self], attributes: { seqLen, theta, layout } }
   })
 }
@@ -5344,6 +5952,7 @@ const rotaryEmbeddingExplicit = (
     }
 
     let positions = options.positions
+
     if (positions === undefined) {
       const indices = yield* arange(seqLen, undefined, { dtype: "u32" })
       positions = yield* reshape(indices, [...batch.map(() => 1), seqLen])
@@ -5359,6 +5968,7 @@ const rotaryEmbeddingExplicit = (
     }
 
     let frequencies = options.inverseFrequencies
+
     if (frequencies === undefined) {
       if (!Number.isFinite(theta) || theta <= 0) {
         return yield* fail("theta must be positive and finite")
@@ -5368,6 +5978,7 @@ const rotaryEmbeddingExplicit = (
         { length: width / 2 },
         (_, index) => 1 / Math.fround(Math.pow(Math.fround(theta), Math.fround(2 * index / width)))
       )
+
       frequencies = yield* fromTypedArray(values)
     }
 
@@ -5378,43 +5989,14 @@ const rotaryEmbeddingExplicit = (
       return yield* fail("inverseFrequencies must be a dense floating-point [D/2] buffer")
     }
 
-    const positionValues = yield* cast(positions, "f32")
-    const positionColumns = yield* unsqueeze(positionValues, -1)
-    const frequencyValues = yield* cast(frequencies, "f32")
-    const angles = yield* mul(positionColumns, frequencyValues)
-    let doubled: Lazy
+    const explicitPositions = positions
+    const inverseFrequencies = frequencies
 
-    if (layout === "HalfSplit") {
-      doubled = yield* concat([angles, angles], { dim: -1 })
-    } else {
-      const columns = yield* unsqueeze(angles, -1)
-      const pairs = yield* broadcastTo(columns, [...angles.shape, 2])
-      doubled = yield* reshape(pairs, [...angles.shape.slice(0, -1), width])
-    }
-
-    const tableShape = [...positions.shape.slice(0, -1), ...(self.shape.length >= 3 ? [1] : []), seqLen, width]
-    const cosineFloat = yield* cos(doubled)
-    const sineFloat = yield* sin(doubled)
-    const cosine = yield* reshape(yield* cast(cosineFloat, self.dtype), tableShape)
-    const sine = yield* reshape(yield* cast(sineFloat, self.dtype), tableShape)
-    let rotated: Lazy
-
-    if (layout === "HalfSplit") {
-      const first = yield* slice(self, { end: [...self.shape.slice(0, -1), width / 2] })
-      const second = yield* slice(self, { start: [...self.shape.slice(0, -1).map(() => 0), width / 2] })
-      rotated = yield* concat([yield* neg(second), first], { dim: -1 })
-    } else {
-      const pairs = yield* reshape(self, [...self.shape.slice(0, -1), width / 2, 2])
-      const first = yield* slice(pairs, { end: [...pairs.shape.slice(0, -1), 1] })
-      const second = yield* slice(pairs, { start: [...pairs.shape.slice(0, -1).map(() => 0), 1] })
-      const swapped = yield* concat([yield* neg(second), first], { dim: -1 })
-      rotated = yield* reshape(swapped, self.shape)
-    }
-
-    const direct = yield* mul(self, cosine)
-    const cross = yield* mul(rotated, sine)
-
-    return yield* add(direct, cross)
+    return yield* graphTry("rotaryEmbedding", () => ({
+      op: "rotaryEmbeddingExplicit",
+      inputs: [self, explicitPositions, inverseFrequencies],
+      attributes: { layout }
+    }))
   })
 
 /**
@@ -5455,26 +6037,33 @@ export const compile = <E = never, R = never>(
 ): Effect.Effect<CompiledFn<E, R>> =>
   Effect.gen(function*() {
     const cache = makeProgramCache(options.cacheCapacity)
+
     const trace = (
       inputs: ReadonlyArray<Any>
     ): Effect.Effect<CompiledProgram, TensorError | E, Runtime.Runtime | R> =>
       Effect.gen(function*() {
         const placeholders: Array<Lazy> = []
+
         for (let i = 0; i < inputs.length; i++) {
           placeholders.push(yield* makeInput(i, inputs[i]))
         }
+
         const roots = yield* build(placeholders)
+
         const compileOptions: Runtime.ExecutableCompileOptions = {
           optimize: options.optimize,
           constantWeights: options.constantWeights
         }
+
         return yield* freezeProgram(roots, compileOptions)
       })
+
     const self: CompiledFn<E, R> = {
       call: (inputs) =>
         Effect.gen(function*() {
           const runtime = yield* Runtime.Runtime
           const program = yield* cachedProgram(cache, signatureOf(inputs, runtime), () => trace(inputs))
+
           return yield* runProgram(program, inputs)
         }),
       get stats() {
@@ -5484,5 +6073,6 @@ export const compile = <E = never, R = never>(
         return cache.clear
       }
     }
+
     return self
   })

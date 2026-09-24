@@ -3,7 +3,7 @@
   "private": true,
   "packageManager": "pnpm@10.13.1",
   "scripts": {
-    "build": "pnpm run build:native:matrix && pnpm --filter @effect-torch/core run build",
+    "build": "pnpm run build:native:matrix && pnpm --filter @effect-torch/core run build && pnpm --filter @effect-torch/serve run build && pnpm --filter @effect-torch/models run build",
     "build:native:matrix": "node scripts/build-native.mjs --matrix && pnpm --filter @effect-torch/backend-cpu --filter @effect-torch/backend-apple-native --filter @effect-torch/backend-cuda --filter @effect-torch/tokenizers run build:ts && node scripts/verify-native-packages.mjs --artifacts",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
@@ -18,6 +18,12 @@
     "bench:muse-glimmer": "pnpm --filter @effect-torch/bench bench:muse-glimmer",
     "bench:muse-glimmer-concurrency": "pnpm --filter @effect-torch/bench bench:muse-glimmer-concurrency",
     "bench:muse-glimmer-sglang": "pnpm --filter @effect-torch/bench bench:muse-glimmer-sglang",
+    "bench:diffusion-gemma": "pnpm --filter @effect-torch/bench bench:diffusion-gemma",
+    "bench:diffusion-gemma-vllm-setup": "pnpm --filter @effect-torch/bench bench:diffusion-gemma-vllm-setup",
+    "bench:diffusion-gemma-vllm": "pnpm --filter @effect-torch/bench bench:diffusion-gemma-vllm",
+    "bench:diffusion-gemma-http": "pnpm --filter @effect-torch/bench bench:diffusion-gemma-http",
+    "bench:diffusion-gemma-summary": "pnpm --filter @effect-torch/bench bench:diffusion-gemma-summary",
+    "bench:diffusion-gemma-telemetry": "pnpm --filter @effect-torch/bench bench:diffusion-gemma-telemetry",
     "verify:native-packages": "node scripts/verify-native-packages.mjs"
   },
   "devDependencies": {

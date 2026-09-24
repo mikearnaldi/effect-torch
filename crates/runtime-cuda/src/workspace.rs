@@ -178,7 +178,10 @@ pub(crate) fn acquire(
         if segment.memory_space != CudaMemorySpace::Device {
             return Err(format!("unsupported CUDA memory space for segment {index}"));
         }
-        if segment.ownership != SegmentOwnership::ProvisionalOutput {
+        if !matches!(
+            segment.ownership,
+            SegmentOwnership::ProvisionalOutput | SegmentOwnership::StateTransaction
+        ) {
             workspace_indices.push(index);
             workspace_requests.push(request(device_ordinal, segment)?);
         }
@@ -205,7 +208,10 @@ pub(crate) fn acquire(
         }
     }
     for (index, segment) in segments.iter().enumerate() {
-        if segment.ownership != SegmentOwnership::ProvisionalOutput {
+        if !matches!(
+            segment.ownership,
+            SegmentOwnership::ProvisionalOutput | SegmentOwnership::StateTransaction
+        ) {
             continue;
         }
         let lease = Arc::new(

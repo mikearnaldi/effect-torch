@@ -26,6 +26,10 @@ static void __syncthreads() {}
 static void __syncwarp() {}
 template<class T> T __shfl_down_sync(unsigned int, T value, unsigned int) { return value; }
 template<class T> T __shfl_sync(unsigned int, T value, unsigned int) { return value; }
+// Compile-only stubs. Grouping scheduling is covered by the CUDA hardware tests.
+static unsigned int __ballot_sync(unsigned int, bool selected) { return selected ? 1U : 0U; }
+static unsigned int __popc(unsigned int value) { return __builtin_popcount(value); }
+static unsigned int atomicAdd(unsigned int *p, unsigned int value) { unsigned int old = *p; *p += value; return old; }
 static unsigned int atomicCAS(unsigned int *p, unsigned int expected, unsigned int value) {
     unsigned int old = *p; if (old == expected) *p = value; return old;
 }
@@ -268,19 +272,87 @@ static void cache_storage() {
         alignas(8) unsigned char keys[16], values[16]; memset(keys, 0xcd, sizeof(keys)); memset(values, 0xcd, sizeof(values));
         float ks = 0, vs = 0; CudaKernelArgs a{}; a.elements = 2; a.metadata = address(m.data()); a.output = address(output); a.output_dtype = 1;
         a.inputs[0] = address(q); a.inputs[1] = address(k); a.inputs[2] = address(v); a.inputs[3] = address(keys); a.inputs[4] = address(values);
-        a.inputs[5] = address(&ks); a.inputs[6] = address(&vs); a.inputs[7] = address(&cursor); a.scratch[0] = address(&valid); a.scratch[3] = address(&status);
+        et_u64 table[] = {0, 0, 1, 4, address(keys), address(values), address(&ks), address(&vs)};
+        a.inputs[3] = address(table); a.inputs[7] = address(&cursor); a.scratch[0] = address(&valid); a.scratch[3] = address(&status);
         a.input_dtypes[0] = a.input_dtypes[1] = a.input_dtypes[2] = 1;
         a.integers[0] = 1; a.integers[1] = dtype; a.integers[2] = 1; a.integers[5] = 1; a.scalars[0] = 1;
         // Host shims cannot emulate warp synchronization. Check the scalar
         // storage helpers here; cache-tests.py executes attention on the GPU.
         et_cache_append(a, 0, 0, 1, 1, 2);
-        for (unsigned int d = 0; d < 2; ++d) output[d] = et_cache_load(a, 4, 0, d, 2);
+        for (unsigned int d = 0; d < 2; ++d) output[d] = et_cache_load(a, 1, 0, 0, 0, d, 2);
         assert(status == 0);
         for (unsigned int i = 2 * et_bytes(dtype); i < sizeof(keys); ++i) assert(keys[i] == 0xcd && values[i] == 0xcd);
         if (dtype == 6) {
             assert(keys[0] == 192 && keys[1] == 1 && ks == 2.0f / 127 && vs == 4.0f / 127);
             assert(fabsf(output[0] - 3) <= vs && output[1] == -4);
         } else assert(output[0] == 3 && output[1] == -4);
+    }
+}
+// Executes the production scalar math with a single-lane host reduction. CUDA
+// scheduling and shuffle behavior still require the separate GPU fixture.
+static void cache_prefix_canvas() {
+    for (unsigned int dtype : {1U, 2U, 3U}) for (bool causal : {false, true}) for (unsigned int retained : {0U, 2U}) {
+        const unsigned int heads = 2, dim = 3, tokens = 3, count = 2, cursor = 44;
+        unsigned int valid = count, status = 0;
+        auto m = metadata({1, heads, tokens, dim}, {{1, heads, tokens, dim}, {1, 1, tokens, dim}, {1, 1, tokens, dim}});
+        alignas(8) unsigned char q[72]{}, k[36]{}, v[36]{}, prefix_k[24]{}, prefix_v[24]{}, tail_k[24]{}, tail_v[24]{};
+        float out[heads * tokens * dim]{};
+        for (unsigned int i = 0; i < heads * tokens * dim; ++i) et_store(address(q), dtype, i, sinf(i * .739f) * 3.7f);
+        for (unsigned int i = 0; i < tokens * dim; ++i) {
+            et_store(address(k), dtype, i, cosf(i * .313f) * 2.9f);
+            et_store(address(v), dtype, i, sinf(i * 1.137f) * 5.3f);
+        }
+        for (unsigned int i = 0; i < 2 * dim; ++i) {
+            et_store(address(prefix_k), dtype, i, sinf(i * .47f) * 1.3f);
+            et_store(address(prefix_v), dtype, i, cosf(i * .81f) * 4.7f);
+        }
+        unsigned char before_k[sizeof(prefix_k)], before_v[sizeof(prefix_v)];
+        memcpy(before_k, prefix_k, sizeof(prefix_k)); memcpy(before_v, prefix_v, sizeof(prefix_v));
+        et_u64 table[20] = {cursor - retained, cursor, cursor + count, 4};
+        for (unsigned int row = 0; row < retained + count; ++row) {
+            bool prefix = row < retained;
+            unsigned int source = prefix ? row + 2 - retained : row - retained;
+            table[4 + row * 4] = address(prefix ? prefix_k : tail_k) + source * dim * et_bytes(dtype);
+            table[5 + row * 4] = address(prefix ? prefix_v : tail_v) + source * dim * et_bytes(dtype);
+        }
+        CudaKernelArgs a{}; a.elements = heads * tokens * dim; a.compute_dtype = a.output_dtype = 1;
+        a.inputs[0] = address(q); a.inputs[1] = address(k); a.inputs[2] = address(v); a.inputs[3] = address(table); a.inputs[7] = address(&cursor);
+        a.input_dtypes[0] = a.input_dtypes[1] = a.input_dtypes[2] = dtype;
+        a.scratch[0] = address(&valid); a.scratch[3] = address(&status); a.metadata = address(m.data()); a.output = address(out);
+        a.integers[1] = dtype; a.integers[2] = a.integers[5] = 1; a.integers[4] = !causal; a.integers[6] = dtype != 1; a.integers[8] = dtype;
+        a.scalars[0] = .30157f; blockIdx.x = threadIdx.x = 0;
+        float probabilities[heads * tokens * 4]{};
+        a.inputs[4] = address(probabilities); a.integers[9] = 4;
+        for (unsigned int repetition = 0; repetition < 2; ++repetition) {
+            for (unsigned int t = 0; t < tokens; ++t) { threadIdx.x = t; et_kv_store(a); }
+            for (unsigned int query = 0; query < heads * tokens; ++query) { threadIdx.x = query * 32; et_kv_attention(a); }
+            assert(status == 0 && memcmp(prefix_k, before_k, sizeof(prefix_k)) == 0 && memcmp(prefix_v, before_v, sizeof(prefix_v)) == 0);
+            auto round = [dtype](float x) { unsigned short bits = et_to16(x, dtype == 3); return dtype == 1 ? x : dtype == 2 ? et_half_float(bits) : et_bfloat_float(bits); };
+            for (unsigned int head = 0; head < heads; ++head) for (unsigned int t = 0; t < tokens; ++t) {
+                unsigned int base = (head * tokens + t) * dim;
+                if (t >= count) { for (unsigned int d = 0; d < dim; ++d) assert(out[base + d] == 0); continue; }
+                unsigned int n = retained + (causal ? t + 1 : count);
+                float scores[4]{}, weights[4]{}, maximum = -INFINITY, total = 0;
+                for (unsigned int row = 0; row < n; ++row) {
+                    bool prefix = row < retained; unsigned int source = prefix ? row + 2 - retained : row - retained;
+                    float dot = 0;
+                    for (unsigned int d = 0; d < dim; ++d) dot += et_load<float>(address(q), dtype, base + d) * et_load<float>(address(prefix ? prefix_k : k), dtype, source * dim + d);
+                    scores[row] = round(round(dot) * float(a.scalars[0])); maximum = fmaxf(maximum, scores[row]);
+                }
+                for (unsigned int row = 0; row < n; ++row) { weights[row] = expf(scores[row] - maximum); total += weights[row]; }
+                for (unsigned int d = 0; d < dim; ++d) {
+                    float expected = 0;
+                    for (unsigned int row = 0; row < n; ++row) {
+                        bool prefix = row < retained; unsigned int source = prefix ? row + 2 - retained : row - retained;
+                        expected += round(weights[row] / total) * et_load<float>(address(prefix ? prefix_v : v), dtype, source * dim + d);
+                    }
+                    expected = round(expected);
+                    assert(fabsf(out[base + d] - expected) < 1e-6f);
+                }
+            }
+            // A second invocation changes its canvas while sharing the same prefix.
+            et_store(address(v), dtype, 0, 17.0f);
+        }
     }
 }
 static void linear_bias_rounding() {
@@ -326,6 +398,6 @@ static void top_k_indices() {
 int main(int argc, char **argv) {
     top_k_indices();
     half_scatter_updates();
-    casts(); integers_and_roles(); scalar_coercion(); compute_roles(); cache_storage(); linear_bias_rounding(); packed_fixtures(argc > 1 ? argv[1] : nullptr);
+    casts(); integers_and_roles(); scalar_coercion(); compute_roles(); cache_storage(); cache_prefix_canvas(); linear_bias_rounding(); packed_fixtures(argc > 1 ? argv[1] : nullptr);
     puts("CUDA host scalar/ABI tests passed");
 }

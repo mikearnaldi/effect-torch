@@ -4,7 +4,9 @@
 //!
 //! - [`GemmAlgorithm::Tiled`] uses one threadgroup per 16×16 output tile and
 //!   stages through threadgroup memory. It is the reference path for small
-//!   shapes and for `EFFECT_TORCH_NO_MMA`.
+//!   shapes and for `EFFECT_TORCH_NO_MMA`. F32 dot products spanning multiple
+//!   tiles compensate product and addition roundoff to retain small terms
+//!   through cancellation. Single-tile dots use ordinary FMA accumulation.
 //! - [`GemmAlgorithm::SimdgroupMma`] uses 8×8 simdgroup matrix operations and
 //!   one threadgroup per 64×64 output tile, or 32×32 on devices with less
 //!   threadgroup memory. bf16/f16 multiply natively with f32 accumulation; f32
@@ -112,6 +114,35 @@ fn gemm_source(bias: bool, epilogue: Epilogue, ty: &str) -> String {
     } else {
         ""
     };
+    let fp_contract = if ty == "float" {
+        "#pragma clang fp contract(off)"
+    } else {
+        ""
+    };
+    // The tiled kernel is the small/reference GEMM path. Its serial F32 dot
+    // product otherwise loses low terms across long, cancelling projections.
+    // Carry both product and addition roundoff into a second accumulator.
+    // TwoProduct and TwoSum require separately rounded intermediate values.
+    let (accumulator, accumulate, finish) = if ty == "float" {
+        (
+            "float correction = 0.0f;",
+            r#"float a = As[tpitg.y][p], b = Bs[p][tpitg.x];
+            if (!compensate) {
+                acc = fma(a, b, acc);
+                continue;
+            }
+            float product = a * b;
+            float product_error = fma(a, b, -product);
+            float sum = acc + product;
+            float recovered = sum - acc;
+            float sum_error = (acc - (sum - recovered)) + (product - recovered);
+            correction += product_error + sum_error;
+            acc = sum;"#,
+            "if (isfinite(acc)) acc += correction;",
+        )
+    } else {
+        ("", "acc += As[tpitg.y][p] * Bs[p][tpitg.x];", "")
+    };
     let store = match (epilogue.gelu_fn(), epilogue.dual()) {
         (Some(g), true) => format!("D[d_idx] = {ty}(v);\n        D2[d_idx] = {ty}({g}(v));"),
         (Some(g), false) => format!("D[d_idx] = {ty}({g}(v));"),
@@ -122,6 +153,7 @@ fn gemm_source(bias: bool, epilogue: Epilogue, ty: &str) -> String {
 #include <metal_stdlib>
 using namespace metal;
 {act_fns}
+{fp_contract}
 kernel void et_gemm(
     device const {ty}* A [[buffer(0)]],
     device const {ty}* B [[buffer(1)]],
@@ -143,6 +175,8 @@ kernel void et_gemm(
     const ulong b_batch = (ulong)batch * strideB;
     const ulong d_batch = (ulong)batch * M * N;
     float acc = 0.0f;
+    {accumulator}
+    const bool compensate = K > {TILE}u;
     for (uint t = 0; t < K; t += {TILE}) {{
         const uint ak = t + tpitg.x;
         const uint bk = t + tpitg.y;
@@ -150,10 +184,11 @@ kernel void et_gemm(
         Bs[tpitg.y][tpitg.x] = (bk < K && j < N) ? float(B[b_batch + (ulong)bk * N + j]) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint p = 0; p < {TILE}; ++p) {{
-            acc += As[tpitg.y][p] * Bs[p][tpitg.x];
+            {accumulate}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
+    {finish}
     if (i < M && j < N) {{
         const ulong d_idx = d_batch + (ulong)i * N + j;
         const float linear = float({ty}(acc{bias_add}));
@@ -606,13 +641,7 @@ fn mma_key_for(bias: bool, epilogue: Epilogue, dtype: DType, cfg: MmaConfig) -> 
     key_for(bias, epilogue, dtype) ^ 0xA11A_0000_0000 ^ ((cfg.tile as u64) << 48)
 }
 
-fn splitk_key(
-    name: &'static str,
-    dtype: DType,
-    cfg: MmaConfig,
-    splits: usize,
-    total: usize,
-) -> u64 {
+fn splitk_key(name: &'static str, dtype: DType, cfg: MmaConfig, splits: usize) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -623,7 +652,7 @@ fn splitk_key(
         cfg.tile,
         cfg.threads,
         splits,
-        total,
+        "runtime-total-v1",
         MetalDevice::WIDE,
     )
         .hash(&mut hasher);
@@ -635,16 +664,12 @@ fn splitk_key(
 // of A and B, so K is partitioned across threadgroups; each element
 // is read once, writing f32 partials that a second kernel reduces in
 // a fixed order for deterministic results. Biases and epilogues are
-// unsupported. Only plain backward gemms take this path. Staging stays
+// unsupported. Plain matmuls, including grouped experts, can take this path.
+// TOTAL is a runtime parameter so exact group sizes share pipelines without
+// changing the split count, partial arithmetic, or reduction order. Staging stays
 // single-buffered. Double buffering wins the head-dX microbench but
 // loses 6.5% over 400 FineWeb steps on M4 Max due to thermal throttling.
-fn gemm_splitk_source(
-    ty: &str,
-    sg_ty: &str,
-    cfg: MmaConfig,
-    splits: usize,
-    total: usize,
-) -> String {
+fn gemm_splitk_source(ty: &str, sg_ty: &str, cfg: MmaConfig, splits: usize) -> String {
     let t = cfg.tile;
     let threads = cfg.threads;
     let sg_per_col = t / 16;
@@ -680,6 +705,7 @@ kernel void et_gemm_splitk(
     constant uint& K [[buffer(6)]],
     constant uint& strideA [[buffer(7)]],
     constant uint& strideB [[buffer(8)]],
+    constant ulong& total [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {{
@@ -728,7 +754,7 @@ kernel void et_gemm_splitk(
         for (uint dj = 0; dj < {DJ}u; dj++)
             simdgroup_store(acc[di][dj], &Cs[qm + 8u * di][qn + 8u * dj], {T});
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const ulong p_base = (ulong)slice * {TOTAL}ul + (ulong)batch * M * N;
+    const ulong p_base = (ulong)slice * total + (ulong)batch * M * N;
     for (uint e = tid; e < {STORE_N}u; e += {THREADS}u) {{
         const uint r = e / {T}u, c = e % {T}u;
         const uint i = m0 + r, j = n0 + c;
@@ -741,13 +767,14 @@ kernel void et_gemm_splitk(
 kernel void et_gemm_splitk_reduce(
     device const float* P [[buffer(0)]],
     device {ty}* D [[buffer(1)]],
+    constant ulong& total [[buffer(2)]],
     uint2 gid2 [[thread_position_in_grid]]
 ) {{
     const ulong i = ulong(gid2.y) * {WIDE}ul + ulong(gid2.x);
-    if (i < {TOTAL}ul) {{
+    if (i < total) {{
         float acc = 0.0f;
         for (uint s = 0u; s < {SPLITS}u; s++) {{
-            acc += P[(ulong)s * {TOTAL}ul + i];
+            acc += P[(ulong)s * total + i];
         }}
         D[i] = {ty}(acc);
     }}
@@ -767,7 +794,6 @@ kernel void et_gemm_splitk_reduce(
         B_LOAD = b_load,
         SPLITS = splits,
         WIDE = MetalDevice::WIDE,
-        TOTAL = total,
     )
 }
 
@@ -789,11 +815,11 @@ fn gemm_splitk_into(
 ) -> Result<(), String> {
     let esz = a.dtype.size_in_bytes();
     let total = batch * m * n;
-    let key = splitk_key("et_gemm_splitk", a.dtype, cfg, splits, total);
+    let key = splitk_key("et_gemm_splitk", a.dtype, cfg, splits);
     let pipeline = dev.pipeline_cached(key).ok_or_else(|| {
         format!("gemm: split-K pipeline {key:#x} was not precompiled for exact requirements")
     })?;
-    let rkey = splitk_key("et_gemm_splitk_reduce", a.dtype, cfg, splits, total);
+    let rkey = splitk_key("et_gemm_splitk_reduce", a.dtype, cfg, splits);
     let rpipeline = dev.pipeline_cached(rkey).ok_or_else(|| {
         format!(
             "gemm: split-K reduce pipeline {rkey:#x} was not precompiled for exact requirements"
@@ -816,6 +842,7 @@ fn gemm_splitk_into(
         set_bytes(e, 6, &ku);
         set_bytes(e, 7, &sa);
         set_bytes(e, 8, &sb);
+        set_bytes(e, 9, &(total as u64));
         e.dispatchThreadgroups_threadsPerThreadgroup(
             MetalDevice::grid(n.div_ceil(cfg.tile), m.div_ceil(cfg.tile), batch * splits),
             MetalDevice::grid(cfg.threads, 1, 1),
@@ -831,6 +858,7 @@ fn gemm_splitk_into(
             scratch.layout.offset() * DType::F32.size_in_bytes(),
         );
         set_buffer(e, 1, &out.buffer, out.layout.offset() * esz);
+        set_bytes(e, 2, &(total as u64));
         let (g, tg) = MetalDevice::grid_flat(padded);
         e.dispatchThreads_threadsPerThreadgroup(g, tg);
     });
@@ -880,26 +908,19 @@ pub fn precompile_gemm_fused(
             splits,
         } => {
             let cfg = MmaConfig { tile, threads };
-            let total = requirements.output_elements;
             let sg_ty = if requirements.dtype == DType::F32 {
                 "float"
             } else {
                 ty
             };
-            let source = gemm_splitk_source(ty, sg_ty, cfg, splits, total);
+            let source = gemm_splitk_source(ty, sg_ty, cfg, splits);
             dev.compile_lazy(
-                splitk_key("et_gemm_splitk", requirements.dtype, cfg, splits, total),
+                splitk_key("et_gemm_splitk", requirements.dtype, cfg, splits),
                 "et_gemm_splitk",
                 || source.clone(),
             )?;
             dev.compile_lazy(
-                splitk_key(
-                    "et_gemm_splitk_reduce",
-                    requirements.dtype,
-                    cfg,
-                    splits,
-                    total,
-                ),
+                splitk_key("et_gemm_splitk_reduce", requirements.dtype, cfg, splits),
                 "et_gemm_splitk_reduce",
                 || source,
             )?;
@@ -1557,6 +1578,65 @@ mod tests {
     }
 
     #[test]
+    fn tiled_f32_matmul_preserves_small_terms_after_cancellation() {
+        let dev = MetalDevice::get();
+        let (m, n, k) = (2, 2, 32);
+        let delta = 2.0f32.powi(-13);
+        let a: Vec<f32> = (0..k)
+            .map(|i| [1e8, 1.0, -1e8, 1.0][i % 4])
+            .chain((0..k).map(|i| if i % 2 == 0 { 1.0 + delta } else { 1.0 }))
+            .collect();
+        let b: Vec<f32> = (0..k)
+            .flat_map(|i| [1.0, if i % 2 == 0 { 1.0 - delta } else { -1.0 }])
+            .collect();
+        let expected: Vec<f32> = (0..m)
+            .flat_map(|row| {
+                let a = &a;
+                let b = &b;
+                (0..n).map(move |column| {
+                    (0..k)
+                        .map(|inner| a[row * k + inner] as f64 * b[inner * n + column] as f64)
+                        .sum::<f64>() as f32
+                })
+            })
+            .collect();
+        // These exact results exercise addition and multiplication roundoff.
+        assert_eq!(expected[0], 16.0);
+        assert_eq!(expected[3], -2.0f32.powi(-22));
+        let a = MetalTensor::from_f32(dev, a, vec![m, k]);
+        let b = MetalTensor::from_f32(dev, b, vec![k, n]);
+        let requirements = matmul_requirements(dev, &[m, k], &[k, n], DType::F32, false).unwrap();
+        assert_eq!(requirements.algorithm, GemmAlgorithm::Tiled);
+        precompile_matmul(dev, &requirements).unwrap();
+        let output = MetalTensor::empty(dev, vec![m, n], DType::F32);
+        matmul_into(dev, &a, &b, &output, None, &requirements).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(output.read_f32().unwrap(), expected);
+    }
+
+    #[test]
+    fn tiled_f32_matmul_preserves_nonfinite_results() {
+        let dev = MetalDevice::get();
+        let k = 32;
+        let mut values = vec![1.0; 3 * k];
+        values[0] = f32::INFINITY;
+        values[k] = f32::NEG_INFINITY;
+        values[2 * k] = f32::INFINITY;
+        values[2 * k + 1] = f32::NEG_INFINITY;
+        let a = MetalTensor::from_f32(dev, values, vec![3, k]);
+        let b = MetalTensor::from_f32(dev, vec![1.0; k], vec![k, 1]);
+        let requirements = matmul_requirements(dev, &[3, k], &[k, 1], DType::F32, false).unwrap();
+        precompile_matmul(dev, &requirements).unwrap();
+        let output = MetalTensor::empty(dev, vec![3, 1], DType::F32);
+        matmul_into(dev, &a, &b, &output, None, &requirements).unwrap();
+        dev.synchronize().unwrap();
+        let values = output.read_f32().unwrap();
+        assert_eq!(values[0], f32::INFINITY);
+        assert_eq!(values[1], f32::NEG_INFINITY);
+        assert!(values[2].is_nan());
+    }
+
+    #[test]
     fn plain_matmul_into_matches_allocating_wrapper() {
         let dev = MetalDevice::get();
         let (m, n, k) = (13usize, 17usize, 11usize);
@@ -1777,14 +1857,8 @@ mod tests {
         };
         let use_mma = std::env::var_os("EFFECT_TORCH_NO_MMA").is_none();
         assert_eq!(
-            dev.pipeline_cached(splitk_key(
-                "et_gemm_splitk",
-                DType::F32,
-                cfg,
-                16,
-                batch * m * n
-            ))
-            .is_some(),
+            dev.pipeline_cached(splitk_key("et_gemm_splitk", DType::F32, cfg, 16,))
+                .is_some(),
             use_mma
         );
         let biased = gemm(dev, &ta, &tb, Some(&tbias), batch, m, n, k, m * k, 0).unwrap();
@@ -1822,14 +1896,78 @@ mod tests {
     }
 
     #[test]
+    fn splitk_reuses_pipelines_across_exact_totals_and_batch_counts() {
+        let dev = MetalDevice::get();
+        let (n, k) = (1024, 2049);
+        for dtype in [DType::F32, DType::BF16] {
+            let mut warmed = Vec::new();
+            for (batch, m) in [(1, 33), (1, 34), (1, 128), (1, 129), (2, 33), (2, 34)] {
+                let requirements =
+                    gemm_requirements(dev, dtype, false, Epilogue::None, batch, m, n, k, true)
+                        .unwrap();
+                assert!(matches!(
+                    requirements.algorithm,
+                    GemmAlgorithm::SplitK { .. }
+                ));
+                // Warm only the first TOTAL for each numerical algorithm. Later
+                // TOTALs must dispatch under the no-compilation guard.
+                if !warmed.contains(&requirements.algorithm) {
+                    precompile_matmul(dev, &requirements).unwrap();
+                    warmed.push(requirements.algorithm);
+                }
+                let a = MetalTensor::from_f32(
+                    dev,
+                    (0..batch * m * k).map(|i| (i / k % 3 + 1) as f32).collect(),
+                    vec![batch, m, k],
+                );
+                let b = MetalTensor::from_f32(
+                    dev,
+                    (0..k * n).map(|i| (i % n % 7) as f32 - 3.0).collect(),
+                    vec![k, n],
+                );
+                let a = crate::ops::cast(&a, dtype).unwrap();
+                let b = crate::ops::cast(&b, dtype).unwrap();
+                let output = MetalTensor::empty(dev, vec![batch, m, n], dtype);
+                let partials = MetalTensor::empty(
+                    dev,
+                    requirements.split_k_scratch.unwrap().shape.to_vec(),
+                    DType::F32,
+                );
+                {
+                    let _guard = dev.begin_executable_dispatch().unwrap();
+                    matmul_into(dev, &a, &b, &output, Some(&partials), &requirements).unwrap();
+                }
+                let actual = crate::ops::cast(&output, DType::F32)
+                    .unwrap()
+                    .read_f32()
+                    .unwrap();
+                for (index, &value) in actual.iter().enumerate() {
+                    let expected =
+                        ((index / n % 3 + 1) * k) as f32 * ((index % n % 7) as f32 - 3.0);
+                    let expected = if dtype == DType::BF16 {
+                        half::bf16::from_f32(expected).to_f32()
+                    } else {
+                        expected
+                    };
+                    assert_eq!(
+                        value, expected,
+                        "{dtype:?}, batch={batch}, M={m}, index={index}"
+                    );
+                }
+            }
+            assert_eq!(warmed.len(), 2);
+        }
+    }
+
+    #[test]
     fn gemm_splitk_keys_separate_pipeline_sources() {
         let cfg = MmaConfig {
             tile: 32,
             threads: 128,
         };
-        let f32_main = splitk_key("et_gemm_splitk", DType::F32, cfg, 16, 65_536);
-        let f16_main = splitk_key("et_gemm_splitk", DType::F16, cfg, 16, 65_536);
-        let f32_reduce = splitk_key("et_gemm_splitk_reduce", DType::F32, cfg, 16, 65_536);
+        let f32_main = splitk_key("et_gemm_splitk", DType::F32, cfg, 16);
+        let f16_main = splitk_key("et_gemm_splitk", DType::F16, cfg, 16);
+        let f32_reduce = splitk_key("et_gemm_splitk_reduce", DType::F32, cfg, 16);
         assert_ne!(f32_main, f16_main);
         assert_ne!(f32_main, f32_reduce);
     }

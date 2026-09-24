@@ -248,6 +248,11 @@ impl CudaValue {
             storage: self.storage.as_spec(),
         }
     }
+    /// Identity and full capacity of the backing allocation retained by this value.
+    pub(crate) fn allocation(&self) -> (usize, usize) {
+        self.buffer.allocation()
+    }
+
     pub(crate) fn storage_bytes(&self) -> usize {
         self.buffer.len()
     }

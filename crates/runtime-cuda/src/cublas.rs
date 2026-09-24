@@ -7,9 +7,12 @@
 //! Both feed the same call through a different transpose operation and leading
 //! dimension, so no weight copy is required.
 //!
-//! Inputs and outputs are BF16. Accumulation is F32 (CUBLAS_COMPUTE_32F),
-//! never TF32 or a reduced-precision compute type. The hardware suite checks
-//! BF16 subnormals explicitly; there is no data-dependent widening fallback.
+//! Products accumulate in F32 (CUBLAS_COMPUTE_32F), never TF32. BF16 results
+//! use cuBLAS default math, which permits BF16 rounding of split-K partials
+//! before the final reduction, matching the standard PyTorch BF16 GEMM path.
+//! F32 accumulator outputs prohibit that partial rounding so the following
+//! bias operation retains its single BF16 result boundary. The hardware suite
+//! checks BF16 subnormals explicitly; there is no data-dependent widening fallback.
 
 use cudarc::cublas::sys;
 use cudarc::driver::CudaStream;
@@ -19,8 +22,11 @@ use std::sync::{Arc, Mutex};
 /// Minimum compute capability with BF16 tensor-core GEMM.
 pub(crate) const BF16_GEMM_MIN_MAJOR: i32 = 8;
 
-/// Declared by each GEMM instruction and reused by the memory planner.
-pub(crate) const CUBLAS_WORKSPACE_BYTES: usize = 1 << 20;
+/// Declared by each GEMM instruction, accounted in static diagnostics, and
+/// reused by the invocation memory planner. A 1 MiB workspace excludes the
+/// default split-K algorithms at larger projection shapes and changes BF16
+/// results. 32 MiB matches the deterministic :4096:8 cuBLAS workspace.
+pub(crate) const CUBLAS_WORKSPACE_BYTES: usize = 32 << 20;
 
 /// Which semantic operation the row-major GEMM realizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,16 +216,6 @@ impl CudaBlas {
         unsafe { sys::cublasSetStream_v2(handle.0, stream.cu_stream() as _) }
             .result()
             .map_err(|error| format!("CUDA cuBLAS stream binding failed: {error}"))?;
-        // This flag adds to DEFAULT_MATH (zero). BF16 output must not let
-        // split-K algorithms truncate partial reductions back to BF16.
-        unsafe {
-            sys::cublasSetMathMode(
-                handle.0,
-                sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
-            )
-        }
-        .result()
-        .map_err(|error| format!("CUDA cuBLAS math-mode setup failed: {error}"))?;
         unsafe {
             sys::cublasSetPointerMode_v2(
                 handle.0,
@@ -267,6 +263,17 @@ impl CudaBlas {
             .handle
             .lock()
             .map_err(|_| "CUDA cuBLAS handle lock poisoned")?;
+        // Select the reduction contract for this output under the same lock
+        // as workspace binding and submission. A preceding F32 bias GEMM must
+        // not leave its stricter mode active for a subsequent BF16 result.
+        let math_mode = if out_is_f32 {
+            sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
+        } else {
+            sys::cublasMath_t::CUBLAS_DEFAULT_MATH
+        };
+        unsafe { sys::cublasSetMathMode(handle.0, math_mode) }
+            .result()
+            .map_err(|error| format!("CUDA cuBLAS math-mode setup failed: {error}"))?;
         unsafe {
             sys::cublasSetWorkspace_v2(handle.0, workspace as *mut c_void, CUBLAS_WORKSPACE_BYTES)
         }

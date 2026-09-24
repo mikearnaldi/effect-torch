@@ -18,12 +18,17 @@ pub(crate) struct CudaCapabilities {
 impl CudaCapabilities {
     pub(crate) fn new(ordinal: u32, major: i32, minor: i32) -> Self {
         let mut fingerprint =
-            TargetFingerprint::new(TargetBackend::Cuda, format!("sm_{major}{minor}"), 4);
+            TargetFingerprint::new(TargetBackend::Cuda, format!("sm_{major}{minor}"), 5);
         let bf16_gemm = major >= BF16_GEMM_MIN_MAJOR;
         let mut features = vec!["typed-reference-kernels-v1".into()];
+        features.push("grouped-expert-stable-exact-rows-host-control-v1".into());
+        features.push("rms-f32-warp-four-partials-mean-factor-rsqrt-v1".into());
+        features.push("sum-f32-warp-or-block1024-vector4-v2".into());
         if bf16_gemm {
-            features.push("cublas-bf16-row-major-f32-accum-v2".into());
-            features.push("cublas-no-reduced-precision-reduction".into());
+            features.push("stepwise-bf16-kv-f32-gemm-active-rows-v1".into());
+            features.push("cublas-bf16-row-major-f32-accum-v3".into());
+            features.push("cublas-bf16-default-reduction".into());
+            features.push("cublas-f32-output-no-reduced-precision-reduction".into());
             features.push("cublas-status-free-bias-epilogue-v1".into());
             features.push(format!(
                 "cublas-workspace-bytes-{}",
@@ -114,8 +119,8 @@ impl TargetDTypeCapabilities for CudaCapabilities {
         &self.fingerprint
     }
     fn policy_revision(&self) -> u64 {
-        // 8: native half scatter-add with a storage rounding after each update.
-        8
+        // 13: Wide F32-opmath sums use vector-four partials across a full block.
+        13
     }
     fn storage_support(&self, value: &ValueSpec<'_>) -> StorageSupport {
         let invalid = |reason| {
@@ -157,6 +162,15 @@ impl TargetDTypeCapabilities for CudaCapabilities {
         }
     }
     fn classify_node(&self, spec: &OperationDTypeSpec<'_>) -> DTypeDisposition {
+        if matches!(
+            spec.operation,
+            NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. }
+        ) {
+            return unsupported(
+                DTypeRequirement::Realization,
+                "semantic operation requires native semantic preparation",
+            );
+        }
         if spec.placement != &self.device {
             return unsupported(
                 DTypeRequirement::Layout,
@@ -220,6 +234,7 @@ impl TargetDTypeCapabilities for CudaCapabilities {
                     | NodeKind::Leaf(_)
                     | NodeKind::FromBytes { .. }
                     | NodeKind::ExpertLinearRows { .. }
+                    | NodeKind::GroupedExpertLinearRows { .. }
             ) {
                 continue;
             }
@@ -290,6 +305,29 @@ impl TargetDTypeCapabilities for CudaCapabilities {
                 DTypeRequirement::Compute,
                 "CUDA operation has no exact integer kernel",
             );
+        }
+        if let NodeKind::GroupedExpertLinearRows { x, weight, .. } = spec.operation {
+            if [x.shape[0], x.shape[1], weight.shape[1]]
+                .iter()
+                .any(|&n| n > i32::MAX as usize)
+                || weight.shape[0] > (u32::MAX - 2) as usize
+            {
+                return unsupported(
+                    DTypeRequirement::Layout,
+                    "CUDA grouped expert dimensions exceed bounded control or GEMM limits",
+                );
+            }
+            if x.dtype == DType::BF16
+                && !self.bf16_gemm
+                && x.shape.iter().all(|&n| n != 0)
+                && weight.shape[1] != 0
+            {
+                return unsupported(
+                    DTypeRequirement::Compute,
+                    "CUDA grouped BF16 GEMM requires compute capability >= 8.0",
+                );
+            }
+            return DTypeDisposition::Native(spec.native_execution());
         }
         if let Some(execution) = self.native_bf16_gemm(spec) {
             return DTypeDisposition::Native(execution);
@@ -436,6 +474,70 @@ mod tests {
     }
 
     #[test]
+    fn semantic_preparation_legalizes_half_attention_and_explicit_rotary_on_cuda() {
+        use effect_torch_compiler::{CompileOptions, CompilerDriver, ProgramRequest};
+        use effect_torch_graph::{AttentionRounding, AttentionWindow, RotaryLayout};
+        for dtype in [DType::F16, DType::BF16] {
+            let input = |slot, shape: Vec<usize>, dtype| {
+                Node::new(NodeKind::Input {
+                    slot,
+                    shape,
+                    dtype,
+                    device: Device::Cuda(0),
+                    storage: effect_torch_runtime::StorageMetadata::dense(),
+                })
+                .unwrap()
+            };
+            let q = input(0, vec![1, 4, 2, 8], dtype);
+            let attention = Node::new(NodeKind::SdpaConfigured {
+                q: q.clone(),
+                k: input(1, vec![1, 2, 4, 8], dtype),
+                v: input(2, vec![1, 2, 4, 8], dtype),
+                scale: 0.3,
+                causal: true,
+                window: AttentionWindow::Local(2),
+                rounding: AttentionRounding::Stepwise,
+                layer_id: Some(7),
+                retention: AttentionWindow::Local(0),
+            })
+            .unwrap();
+            let rotary = Node::new(NodeKind::RotaryEmbeddingExplicit {
+                x: q,
+                positions: input(3, vec![1, 2], DType::U32),
+                inverse_frequencies: input(4, vec![4], DType::F32),
+                layout: RotaryLayout::InterleavedPairs,
+            })
+            .unwrap();
+            for optimize in [false, true] {
+                let prepared = ProgramRequest::from_roots(
+                    vec![attention.clone(), rotary.clone()],
+                    CompileOptions {
+                        optimize,
+                        ..Default::default()
+                    },
+                )
+                .prepare()
+                .unwrap();
+                for major in [7, 8] {
+                    let target = CudaCapabilities::new(0, major, 0);
+                    CompilerDriver::new(&prepared, &target).unwrap();
+                }
+                assert!(prepared
+                    .roots
+                    .iter()
+                    .all(|root| root.dtype == dtype && root.device == Device::Cuda(0)));
+                assert!(prepared.index.order.iter().any(|node| matches!(
+                    node.kind,
+                    NodeKind::Cast {
+                        dtype: DType::F32,
+                        ..
+                    }
+                )));
+            }
+        }
+    }
+
+    #[test]
     fn bf16_linear_is_native_on_ampere_and_newer() {
         for transposed in [false, true] {
             let node = bf16_linear(DType::BF16, transposed);
@@ -507,19 +609,41 @@ mod tests {
     #[test]
     fn target_fingerprint_records_native_bf16_realization() {
         let capabilities = CudaCapabilities::new(0, 12, 0);
-        assert_eq!(capabilities.policy_revision(), 8);
+        assert_eq!(capabilities.policy_revision(), 13);
         assert!(capabilities
             .fingerprint()
             .features
             .iter()
-            .any(|feature| feature == "cublas-bf16-row-major-f32-accum-v2"));
+            .any(|feature| feature == "sum-f32-warp-or-block1024-vector4-v2"));
+        assert!(capabilities
+            .fingerprint()
+            .features
+            .iter()
+            .any(|feature| feature == "cublas-bf16-row-major-f32-accum-v3"));
         assert_eq!(capabilities.fingerprint().architecture, "sm_120");
         let off = CudaCapabilities::new(0, 7, 0);
+        assert!(capabilities
+            .fingerprint()
+            .features
+            .iter()
+            .any(|feature| feature == "stepwise-bf16-kv-f32-gemm-active-rows-v1"));
         assert!(!off
             .fingerprint()
             .features
             .iter()
-            .any(|feature| feature == "cublas-bf16-row-major-f32-accum-v2"));
+            .any(|feature| feature == "stepwise-bf16-kv-f32-gemm-active-rows-v1"));
+        for target in [&capabilities, &off] {
+            assert!(target
+                .fingerprint()
+                .features
+                .iter()
+                .any(|feature| feature == "rms-f32-warp-four-partials-mean-factor-rsqrt-v1"));
+        }
+        assert!(!off
+            .fingerprint()
+            .features
+            .iter()
+            .any(|feature| feature == "cublas-bf16-row-major-f32-accum-v3"));
     }
 
     #[test]

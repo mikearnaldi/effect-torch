@@ -54,11 +54,14 @@
       commonPackages = pkgs: system: with pkgs; [
         nodejs_22
         corepack
+        python312
+        uv
         rustup
         zig
         cargo-zigbuild
         dprint
         cmake
+        ninja
         pkg-config
         git
         jq
@@ -97,6 +100,9 @@
                 cuda.libcublas.dev
                 cuda.libcublas.include
                 cuda.libcublas.lib
+                cuda.libcurand
+                cuda.libcurand.include
+                cuda.libcurand.lib
               ];
               pathsToLink = [
                 "/bin"
@@ -106,9 +112,12 @@
               ];
             };
             cudaLibraryPath = pkgs.lib.makeLibraryPath [
+              pkgs.stdenv.cc.cc.lib
+              pkgs.zlib
               cuda.cuda_cudart
               cuda.cuda_nvrtc.lib
               cuda.libcublas.lib
+              cuda.libcurand.lib
             ];
           in
           {
@@ -120,6 +129,7 @@
                 cuda.cccl
                 cuda.cuda_nvrtc
                 cuda.libcublas
+                cuda.libcurand
               ];
 
               CUDA_HOME = cudaToolkit;
@@ -138,6 +148,7 @@
                     ln -sfn "$path" "$driverLibraryPath/$soname"
                   done < <("$hostLdconfig" -p | awk '/^[[:space:]]+(libcuda\.so|libnvidia-)/ { print $1, $NF }')
                 fi
+                export LIBRARY_PATH="$driverLibraryPath''${LIBRARY_PATH:+:''${LIBRARY_PATH}}"
                 export LD_LIBRARY_PATH="$driverLibraryPath:${cudaLibraryPath}''${LD_LIBRARY_PATH:+:''${LD_LIBRARY_PATH}}"
               '';
             };

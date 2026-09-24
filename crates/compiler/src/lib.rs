@@ -8,7 +8,9 @@
 //! 2. Optional `decode` specialization replaces training-time operations with
 //!    stateful KV attention, KDA recurrence, and convolution state operations.
 //!    It also defines the geometry contract for runtime state.
-//! 3. `schedule` builds one [`GraphIndex`] per program generation. The index
+//! 3. Mandatory native semantic preparation decomposes ordinary configured
+//!    attention and explicit rotary operations after state specialization.
+//!    `schedule` builds one [`GraphIndex`] for that prepared generation. The index
 //!    contains a dense postorder, adjacency, slot declarations, and random
 //!    source metadata.
 //! 4. `optimization` selects codegen regions without rebuilding semantic
@@ -39,6 +41,7 @@ mod optimization;
 mod planner;
 mod request;
 mod schedule;
+mod semantic;
 #[cfg(test)]
 mod test_target;
 

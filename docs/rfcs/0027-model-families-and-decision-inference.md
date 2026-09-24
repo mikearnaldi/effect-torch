@@ -1,6 +1,6 @@
 # RFC 0027: Model families and decision inference
 
-- **Status**: Draft
+- **Status**: Implementation in progress. See [implementation progress](0027-implementation.md).
 - **Created**: 2026-09-20
 - **Depends on**: [RFC 0005](0005-models.md), [RFC 0010](0010-inference.md),
   [RFC 0013](0013-batched-decode.md),
@@ -18,11 +18,11 @@ Organize the public API into four modules:
 
 - `Model`: generic graph building blocks, parameters, composition, and ordinary
   forward execution.
-- `AutoRegressiveModel`: causal inference, sequence progression, sampling, and
+- `AutoRegressive`: causal inference, sequence progression, sampling, and
   speculative generation.
-- `DiffusionModel`: encoder and denoiser contracts, self-conditioning, iterative
+- `Diffusion`: encoder and denoiser contracts, self-conditioning, iterative
   refinement, stopping, and completed-block commits.
-- `DecisionModel`: selected-answer scoring, independent evaluations, repeated-read
+- `Decision`: selected-answer scoring, independent evaluations, repeated-read
   aggregation, and decision distributions.
 
 All four use the existing graph/compiler/runtime pipeline. Model families have
@@ -35,12 +35,15 @@ the limits of diffusion support. Completion requires both multi-step, multi-bloc
 generation and independent decision reads to work through shared inference
 infrastructure.
 
-This RFC is an implementation plan. The new family modules and native state
-extensions described below are not implemented by the current prefix executor.
+This RFC records the design and acceptance gates. The family APIs and shared-state
+implementations pass CPU, Metal, and CUDA tests. Prepared full-checkpoint
+four-read parity passes. Normal generation completes two blocks, but strict
+replay still differs during refinement. Generation acceptance and workload
+measurements remain open. See the implementation tracker for current results.
 
-## Current state and problem
+## Starting state and problem
 
-`packages/core/src/Model.ts` combines generic model construction, ordinary forward
+Before this work, `packages/core/src/Model.ts` combined generic model construction, ordinary forward
 execution, autoregressive inference compilation, generation sessions, stateful
 logits execution, and speculative-decoding orchestration.
 
@@ -51,15 +54,15 @@ and `Model.executeLayers`. They build and materialize one layer at a time throug
 Moving that code from the model module to `Model.ts` did not integrate the two
 inference paths.
 
-The current DiffusionGemma executor implements independent reads with initial
-self-conditioning and selected logits. Repeating a read resets that state. It
-does not implement iterative denoising or normal block generation. CPU/Metal
+The interim DiffusionGemma executor implemented independent reads with initial
+self-conditioning and selected logits. Repeating a read reset that state. It
+did not implement iterative denoising or normal block generation. CPU/Metal
 tiny-model parity and component checks establish a reference for those reads;
 they do not establish full-model parity or complete diffusion-generation support.
 
 Several existing facilities should be reused:
 
-- `InferenceProgram.execution()` already returns caller-owned logits for
+- `Artifact.execution()` already returns caller-owned logits for
   caller-selected tokens.
 - `Tensor.compileDecodeProgram` and native `KvAttentionMode::BidirectionalBlock`
   already support bidirectional blocks for DFlash.
@@ -67,7 +70,7 @@ Several existing facilities should be reused:
   selection, and speculative state management already exist.
 - `Tensor.expose` already identifies diagnostic and proposer-visible graph values.
 
-There are also real gaps:
+The initial gaps were:
 
 - Decode compilation currently requires uniform K/V head geometry across layers.
 - Existing stateful execution appends K/V and advances sequences. Bidirectional
@@ -82,18 +85,19 @@ runtime would reproduce the same work with different ownership rules.
 
 ## Decisions
 
-1. Add `AutoRegressiveModel.ts`, `DiffusionModel.ts`, and `DecisionModel.ts` to
+1. Add `AutoRegressive.ts`, `Diffusion.ts`, and `Decision.ts` to
    `packages/core/src`, with exports from `packages/core/src/index.ts`.
 2. Keep `Model.ts` responsible for architecture and ordinary graph execution.
    Family-specific inference configuration and sessions move to their family.
 3. Keep DiffusionGemma architecture, configuration, and checkpoint interpretation
-   in `packages/core/src/models/DiffusionGemma.ts`.
+   in `packages/models/src/DiffusionGemma.ts`.
 4. Implement full diffusion generation and raw diffusion evaluation over the same
    compiled model operations and retained parameter generation.
-5. Let `DecisionModel` consume scoring operations supplied by either family. It
+5. Let `Decision` consume scoring operations supplied by either family. It
    does not require a `generate()` call or generated JSON.
-6. Reuse common inference internals and native execution. There is no new public
-   peer executor that builds a model layer by layer for production serving.
+6. Share inference operations through `Model`, `Tensor`, and `Runtime`, with
+   family orchestration in its public module. Add no internal modules for this
+   design. Production execution uses reusable compiled programs.
 7. Describe state access, attention visibility, output selection, and per-layer
    geometry explicitly. Required operations belong to distinct interfaces or
    tagged variants, rather than a universal model with optional hooks.
@@ -102,15 +106,15 @@ runtime would reproduce the same work with different ownership rules.
 
 ## Public module responsibilities
 
-AutoRegressiveModel and DiffusionModel depend on Model and shared inference
-internals. DecisionModel's adapters depend on the family APIs; the family modules
-do not depend on DecisionModel. Shared core code does not import concrete models
+AutoRegressive and Diffusion depend on Model, Tensor, and Runtime.
+Decision's adapters depend on the family APIs; the family modules
+do not depend on Decision. Shared core code does not import concrete models
 or backends. Applications continue to select a runtime through an Effect Layer.
 
 ### Model
 
-Retain `Model`, `Definition`, `Params`, parameter specifications, initialization,
-composition, generic layers, model errors, and ordinary `Model.execute` caching.
+Retain `Model`, `Definition`, `Parameters`, parameter specifications, initialization,
+composition, generic layers, model errors, and ordinary `Model.compile` caching.
 The pure graph path remains usable for training and autodiff. Generic graph
 exposure names such as `Model.hiddenExposure` also remain here.
 
@@ -118,9 +122,9 @@ Family definitions compose these building blocks and ordinary Tensor graphs.
 The existing single-input/single-output `Model.forward` need not become an
 optional multi-mode interface to describe encoder and denoiser entry points.
 
-### AutoRegressiveModel
+### AutoRegressive
 
-Move the existing `Model.inference` API to `AutoRegressiveModel.inference`, together
+Move the existing `Model.inference` API to `AutoRegressive.compile`, together
 with its inference configuration, errors, program, generation, and stateful
 execution types. Preserve behavior during this move:
 
@@ -136,7 +140,7 @@ as a standalone diffusion model merely because it processes a parallel block.
 The public nonempty-token-page contract from RFC 0023 remains valid for
 autoregressive generation.
 
-### DiffusionModel
+### Diffusion
 
 Provide a family definition and compiled artifact for block-diffusion language
 models, starting with DiffusionGemma. The initial contract covers causal context
@@ -156,7 +160,7 @@ share tied parameters while retaining distinct parameters where the model define
 them, including DiffusionGemma's independent layer scalars. A mutable ambient
 encoder/decoder mode must not change the meaning of a traced graph.
 
-Use `DiffusionModel.inference` as the family compilation entry point. Its artifact
+Use `Diffusion.compile` as the family compilation entry point. Its artifact
 offers both a normal generation session and lower-level evaluation operations:
 
 | Operation              | State contract                                                       | Result                                                    |
@@ -166,10 +170,12 @@ offers both a normal generation session and lower-level evaluation operations:
 | Commit completed block | Encode accepted tokens causally into a new prefix version            | An extended prefix with the original snapshot still valid |
 | Generate               | Own canvas, feedback, sampler state, and progress across evaluations | Committed output token pages                              |
 
-These are behavioral contracts; exact session and method signatures are to be
-settled with the shared state API in phase 2. A caller-supplied initial state and
-a carried refinement state must be distinguishable without an optional collection
-of unrelated tensors.
+The artifact exposes these operations as `encode`, `evaluate`, `commit`, and
+`generate`, plus selected `score`, prefix `inspect`, and `release`. Prediction is
+an explicit `Initial` or `Refinement` variant. Refinement accepts
+`[1, canvasLength, vocabSize]` feedback in the definition's required
+`predictionDtype`; full readout logits remain F32. DiffusionGemma temperature
+processing preserves F32 logits until the single cast to its feedback dtype.
 
 The normal driver performs the full model algorithm:
 
@@ -190,7 +196,7 @@ progress, separate from a committed token page or completion. A high-level strea
 publishes committed pages; it does not mistake an empty refinement result for EOS.
 This extends internal scheduling without weakening autoregressive page guarantees.
 
-### DecisionModel
+### Decision
 
 Provide a small scoring contract over prepared, tokenized inputs, with adapters
 for each family's compiled artifact. The contract describes ordered
@@ -226,10 +232,11 @@ does not depend on those wire formats.
 
 ### One compilation and execution path
 
-Extract common TypeScript preparation into private core internals. Reuse
-`Tensor`, `Runtime`, and the existing Rust compiler and backend executables.
-Shared responsibilities are parameter materialization/retention, graph tracing,
+Put shared parameter preparation in `Model` and shared compilation and state
+operations in `Tensor` and `Runtime`. Reuse the existing Rust compiler and backend
+executables. These APIs own parameter materialization/retention, graph tracing,
 state-schema validation, executable construction, output metadata, and cleanup.
+Keep model-specific graphs and policies in their model module.
 Autoregressive sampling and diffusion refinement remain family policies.
 
 Compile reusable entry points for the configured shapes. Token IDs, positions,
@@ -308,6 +315,60 @@ feedback on-device where the model contract permits it.
 The numerical reference stays independent of fused backend choices. Unsupported
 operations fail on the chosen backend under the existing capability policy.
 
+#### Grouped expert projections
+
+Full-checkpoint diagnostics establish that the pinned BF16 expert GEMMs permit
+intermediate BF16 rounding. Captured results include values outside the error
+bound for any F32 reduction order followed by one BF16 result rounding. The
+existing `Tensor.expertLinearRows` contract requires that latter behavior and
+remains unchanged.
+
+Add `Tensor.groupedExpertLinearRows` as a distinct semantic operation. Given
+input `[N, I]`, weights `[E, O, I]`, and U32 indices `[N]`, it groups input rows
+by expert, preserving their original order within each group. Each exact-size
+group uses ordinary `linearRows`/matmul semantics on the selected backend, then
+the operation restores the original output-row order. BF16 matrix semantics
+permit intermediate BF16 partial rounding where backend matmul does. The
+weight bank stays borrowed. Duplicate indices, strided views, empty rows, and
+zero inner/output widths retain explicit behavior; invalid expert IDs fail
+even when output width is zero. The operation is inference-only.
+
+`Tensor.gatedExperts` accepts a projection builder alongside its activation
+builder, defaulting to the existing F32-accumulating operation. DiffusionGemma
+explicitly selects grouped projection and supplies route-major row order to
+match the reference expert groups. Weighted contributions still accumulate in
+ascending expert-ID order, preserving route order for duplicate IDs.
+
+Identity, validation, required numerical behavior, and backend capability
+decisions for this operation must agree through graph construction, compilation,
+and execution. CPU and Metal use their own native matrix implementations. CUDA
+may transfer bounded group-control metadata to obtain dynamic GEMM dimensions;
+activations and weights stay on device. Such synchronization, planned scratch,
+and capture restrictions must be explicit in diagnostics. Fixed padding cannot
+replace the declared exact group geometry.
+
+#### Initialized model state
+
+The pinned DiffusionGemma reference initializes rotary inverse-frequency
+buffers with its CPU math implementation. Full-checkpoint controls show that
+one F32 difference in this state can change later decision reads. Preserve
+that initialized state explicitly when preparing the pinned model.
+
+Generate both named F32 frequency buffers from configuration with the pinned
+reference constructor and export them as a small safetensors asset. Record
+configuration, geometry, source versions, and content hashes. A configuration
+change requires a newly generated asset. The producer uses the reference
+environment once; inference consumes the resulting tensors through existing
+Safetensors loading and `DiffusionGemma.define` named bindings.
+
+For the target checkpoint, the two buffers contain 384 F32 values, or 1,536
+payload bytes. Verification and generation use the same prepared asset.
+Preparation validates its provenance and compatibility and owns both additional
+concrete tensors through acquisition and release, including failed preparation
+and interruption. They join the artifact's existing retained parameter
+generation. This decision preserves the current tensor numerical contracts
+and keeps the reference runtime out of inference.
+
 ### Ownership and cancellation
 
 Share one retained parameter generation across family entry points and decision
@@ -356,8 +417,11 @@ evaluation each have acceptance gates. Passing one does not establish the others
 
 ### Phase 1: Extract autoregressive APIs without behavior changes
 
+The extracted symbols and shared parameter-preparation contract are documented
+in the [autoregressive migration map](../autoregressive-model-migration.md).
+
 - Move inference configuration, program/session types, `inference`, generation,
-  stateful execution, and autoregressive orchestration to `AutoRegressiveModel.ts`.
+  stateful execution, and autoregressive orchestration to `AutoRegressive.ts`.
 - Update `Chat.ts`, `Speculation.ts` references, model documentation, examples,
   benchmarks, tests, and root exports. Preserve generic graph utilities in `Model`.
 - Publish a symbol migration map. Update in-repository consumers together;
@@ -391,7 +455,7 @@ evaluation each have acceptance gates. Passing one does not establish the others
 - Verify these operations using small graphs independent of DiffusionGemma before
   integrating the full model. Preserve existing causal and DFlash behavior.
 
-### Phase 4: Implement complete DiffusionModel inference
+### Phase 4: Implement complete Diffusion inference
 
 - Add the diffusion definition/artifact and normal generation driver.
 - Adapt DiffusionGemma graphs to compiled encoder, denoiser, feedback, and readout
@@ -405,7 +469,7 @@ evaluation each have acceptance gates. Passing one does not establish the others
   shared path passes its gates. Preserve a focused reference harness in tests or
   verification examples; reassess `executeLayers` for genuine generic callers.
 
-### Phase 5: Add DecisionModel and migrate the Jev application
+### Phase 5: Add Decision and migrate the Jev application
 
 - Add family scoring adapters, ordered selections, restricted normalization, and
   independent-read aggregation. Reuse compiled artifacts and parameter owners.

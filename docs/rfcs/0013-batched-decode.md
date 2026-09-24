@@ -37,7 +37,7 @@ the block table removes the copy entirely.
 
 ### The batched decode program
 
-`Model.inference` compiles three programs eagerly: prefill `[1,
+`AutoRegressive.compile` compiles three programs eagerly: prefill `[1,
 prefillChunk]` (one sequence, many tokens — unchanged), decode `[1,
 1]` (unchanged — single-sequence steps stay optimal at B=1), and
 **batched decode `[B, 1]`** where `B = decodeBatch` (config, default
@@ -96,7 +96,7 @@ boundary.
 ### API: `stepAll`
 
 ```ts
-interface InferenceProgram {
+interface Artifact {
   sequence(): Effect<Sequence, InferenceError, Scope>
   // Steps each entry's sequence one token in a single batched run.
   // Entries are independent sequences (they may share pool blocks via

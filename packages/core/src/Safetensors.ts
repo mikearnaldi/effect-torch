@@ -112,7 +112,7 @@ const safetensorsElementBytes = {
   i64: 8,
   u8: 1,
   u32: 4
-} satisfies Readonly<Record<Tensor.DType, number>>
+}
 
 /**
  * Reads tensor descriptors from a safetensors file or a Hugging Face
@@ -368,14 +368,14 @@ export const load = (
  * with the parameter array into the record {@link save} takes.
  * Fails with a {@link Model.ModelError} if the parameter array's length does
  * not match the model's arity. It does not compare tensor shapes or dtypes with
- * {@link Model.Model.parameterSpecs}. Saving borrows parameters and does not clear them.
+ * {@link Model.Definition.parameterSpecs}. Saving borrows parameters and does not clear them.
  *
  * @since 0.1.0
  * @category destructors
  */
-export const saveModel = (
-  model: Model.Model,
-  params: Model.Params,
+export const saveParameters = (
+  model: Model.Definition,
+  params: Model.Parameters,
   path: string
 ): Effect.Effect<void, Model.ModelError | Tensor.TensorError, Runtime.Runtime> =>
   params.length !== model.parameterSpecs.length
@@ -404,8 +404,8 @@ export const saveModel = (
  * @since 0.1.0
  * @category destructors
  */
-export const loadModel = (
-  model: Model.Model,
+export const loadParameters = (
+  model: Model.Definition,
   path: string
 ): Effect.Effect<ReadonlyArray<Tensor.Concrete>, Model.ModelError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.flatMap(

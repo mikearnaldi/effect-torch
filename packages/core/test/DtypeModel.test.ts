@@ -128,7 +128,6 @@ onDevices("Same-definition dtype model", () => (it) => {
     it.effect(`${dtype} attention inference preserves semantic precision and reuses bindings`, () =>
       Effect.scoped(Effect.gen(function*() {
         const model = yield* attentionModel
-        yield* Effect.addFinalizer(() => model.clear)
         const parameterGraphs = yield* Effect.forEach(fixtures, ({ shape, values }) =>
           Effect.gen(function*() {
             const source = yield* Tensor.fromTypedArray(new Float32Array(values), shape)
@@ -138,6 +137,8 @@ onDevices("Same-definition dtype model", () => (it) => {
             return cast
           }))
         const params = yield* Tensor.compute(parameterGraphs).pipe(Effect.flatMap(Tensor.clearAllScoped))
+        const modelProgram = yield* Model.compile(model, params)
+        yield* Effect.addFinalizer(() => modelProgram.clear)
         const tokenGraphs = yield* Effect.forEach(
           tokenBatches,
           (tokens) => Tensor.fromTypedArray(new Uint32Array(tokens), [1, 3])
@@ -163,10 +164,10 @@ onDevices("Same-definition dtype model", () => (it) => {
             expect(output.shape).toEqual([1, 3, 3])
             expect(yield* Tensor.toNumberArray(output)).toEqual(expected[index])
           }
-          const cached = yield* model.execute(params, inputs[index]).pipe(Effect.flatMap(Tensor.clearScoped))
+          const cached = yield* modelProgram.run(inputs[index]).pipe(Effect.flatMap(Tensor.clearScoped))
           expect(cached.dtype).toBe(dtype)
           expect(yield* Tensor.toNumberArray(cached)).toEqual(expected[index])
-          expect(yield* model.stats).toEqual({ cached: 1, compiled: 1 })
+          expect(yield* modelProgram.stats).toEqual({ cached: 1, compiled: 1 })
         }
       })))
   }

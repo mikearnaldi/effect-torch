@@ -231,11 +231,11 @@ into a new `Trainer` module whose value encapsulates the configuration:
 
 ```ts
 export interface Trainer<S, EL, RL, ED, RD, EO, RO> {
-  readonly model: Model.Model
+  readonly model: Model.Definition
   readonly config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
   /** The training loop, identical semantics for both forms. */
   readonly train: (
-    params: Model.Params
+    params: Model.Parameters
   ) => Effect.Effect<Trained<S>, ...>
 }
 
@@ -245,7 +245,7 @@ export interface CompiledTrainer<S, ...> extends Trainer<S, ...> {
 }
 
 export const make: <S, ...>(
-  model: Model.Model,
+  model: Model.Definition,
   config: TrainConfig<S, ...>
 ) => Effect.Effect<Trainer<S, ...>>
 

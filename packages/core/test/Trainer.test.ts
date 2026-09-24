@@ -164,7 +164,7 @@ onDevices("Trainer", (device) => (it) => {
         const model = yield* mlp
         const data = yield* xor
         const initial = yield* Tensor.compute(yield* Model.initialize(model))
-        const lossOf = (params: Model.Params) =>
+        const lossOf = (params: Model.Parameters) =>
           Effect.gen(function*() {
             const [value] = yield* Tensor.compute([
               yield* Loss.mse(yield* model.forward(params, data.input), data.target)

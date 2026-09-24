@@ -8,12 +8,19 @@ mod capabilities;
 mod cublas;
 mod device;
 mod executable;
+mod kv_matmul;
 mod lowering;
 mod value;
 mod workspace;
 
 #[cfg(test)]
 mod cublas_tests;
+#[cfg(test)]
+mod grouped_expert_tests;
+#[cfg(test)]
+mod rms_tests;
+#[cfg(test)]
+mod sum_tests;
 
 #[cfg(feature = "napi-addon")]
 #[cfg_attr(test, allow(dead_code))]

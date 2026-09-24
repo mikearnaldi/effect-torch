@@ -35,6 +35,7 @@ pub mod conv;
 pub mod executable;
 mod expert_linear;
 pub mod fusion;
+mod grouped_expert_linear;
 pub mod indexing;
 pub mod linalg;
 pub mod matmul;

@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub(crate) struct CudaBuffer<T> {
     ptr: sys::CUdeviceptr,
     len: usize,
+    allocation_bytes: usize,
     stream: Arc<CudaStream>,
     _owner: Arc<dyn Send + Sync>,
     _retention: Option<Arc<dyn Send + Sync>>,
@@ -32,10 +33,12 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         let (ptr, sync) = slice.device_ptr(&stream);
         drop(sync);
         let len = slice.len();
+        let allocation_bytes = len * std::mem::size_of::<T>();
         let owner: Arc<dyn Send + Sync> = slice;
         Self {
             ptr,
             len,
+            allocation_bytes,
             stream,
             _owner: owner,
             _retention: None,
@@ -67,6 +70,7 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
                 owner.len()
             ));
         }
+        let allocation_bytes = owner.len();
         let stream = Arc::clone(owner.stream());
         let (base, sync) = owner.device_ptr(&stream);
         drop(sync);
@@ -79,11 +83,20 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         Ok(Self {
             ptr,
             len,
+            allocation_bytes,
             stream,
             _owner: owner,
             _retention: retention,
             _marker: PhantomData,
         })
+    }
+
+    /// Identity and byte capacity of the complete allocation retained by this view.
+    pub(crate) fn allocation(&self) -> (usize, usize) {
+        (
+            Arc::as_ptr(&self._owner) as *const () as usize,
+            self.allocation_bytes,
+        )
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -113,6 +126,7 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
                 .checked_add(byte_offset)
                 .ok_or_else(|| "CUDA buffer slice pointer overflow".to_string())?,
             len: range.end - range.start,
+            allocation_bytes: self.allocation_bytes,
             stream: Arc::clone(&self.stream),
             _owner: Arc::clone(&self._owner),
             _retention: self._retention.clone(),
@@ -145,6 +159,7 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         Ok(CudaBuffer {
             ptr: self.ptr,
             len,
+            allocation_bytes: self.allocation_bytes,
             stream: Arc::clone(&self.stream),
             _owner: Arc::clone(&self._owner),
             _retention: self._retention.clone(),

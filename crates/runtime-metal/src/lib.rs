@@ -101,6 +101,7 @@ pub mod emit;
 pub(crate) mod executable;
 mod expert_linear;
 pub mod gemm;
+mod grouped_expert_linear;
 pub mod indexing;
 pub mod kernels;
 #[cfg(feature = "napi-addon")]
@@ -117,6 +118,7 @@ pub mod layer_norm;
 pub mod linear;
 pub mod loss;
 pub mod paged;
+pub(crate) mod paged_state;
 pub mod quantized;
 pub mod rotary;
 pub mod sampling;

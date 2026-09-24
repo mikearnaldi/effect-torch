@@ -66,6 +66,66 @@ extern "C" __global__ void et_expert_linear_rows(CudaKernelArgs a) {
         if (lane == 0) et_store(a.output, a.output_dtype, out, sum);
     }
 }
+// Control is [error, offsets[E+1]], initially zero. During counting the
+// count for expert e occupies slot e+2. No payload ever crosses the host.
+extern "C" __global__ void et_grouped_counts(CudaKernelArgs a) {
+    unsigned int *control = (unsigned int *)a.output;
+    for (et_u64 row = et_thread(); row < a.elements; row += (et_u64)gridDim.x * blockDim.x) {
+        unsigned int expert = ((const unsigned int *)a.inputs[0])[row];
+        if ((et_u64)expert >= a.integers[0]) atomicCAS(control, 0U, 6U);
+        else atomicAdd(control + (et_u64)expert + 2, 1U);
+    }
+}
+extern "C" __global__ void et_grouped_offsets(CudaKernelArgs a) {
+    if (et_thread()) return;
+    unsigned int *control = (unsigned int *)a.output;
+    unsigned int total = 0;
+    for (et_u64 e = 0; e < a.integers[0]; ++e) {
+        unsigned int count = control[e + 2];
+        control[e + 1] = total; total += count;
+    }
+    control[a.integers[0] + 1] = total;
+}
+// One warp per expert, scanning input rows in ascending order. Ballot prefix
+// ranks make the permutation stable independently of warp/block scheduling.
+extern "C" __global__ void et_grouped_rows(CudaKernelArgs a) {
+    const unsigned int lane = threadIdx.x & 31U;
+    for (et_u64 e = et_thread() / 32; e < a.integers[0]; e += (et_u64)gridDim.x * (blockDim.x / 32)) {
+        unsigned int offset = ((const unsigned int *)a.inputs[1])[e + 1];
+        for (et_u64 base = 0; base < a.elements; base += 32) {
+            et_u64 row = base + lane;
+            bool selected = row < a.elements && ((const unsigned int *)a.inputs[0])[row] == e;
+            unsigned int mask = __ballot_sync(0xffffffffU, selected);
+            if (selected) ((unsigned int *)a.output)[offset + __popc(mask & ((1U << lane) - 1U))] = (unsigned int)row;
+            offset += __popc(mask);
+        }
+    }
+}
+extern "C" __global__ void et_grouped_gather(CudaKernelArgs a) {
+    for (et_u64 i = et_thread(); i < a.elements; i += (et_u64)gridDim.x * blockDim.x) {
+        et_u64 width = a.integers[0], row = ((const unsigned int *)a.inputs[1])[i / width];
+        et_copy(a.inputs[0], a.output, a.output_dtype, row * width + i % width, i);
+    }
+}
+extern "C" __global__ void et_grouped_scatter(CudaKernelArgs a) {
+    for (et_u64 i = et_thread(); i < a.elements; i += (et_u64)gridDim.x * blockDim.x) {
+        et_u64 width = a.integers[0], row = ((const unsigned int *)a.inputs[1])[i / width];
+        et_copy(a.inputs[0], a.output, a.output_dtype, i, row * width + i % width);
+    }
+}
+// Same sequential F32 multiply/add order as et_matmul_f32, with row-oriented
+// weights. Both modules compile with fmad=false.
+// This is the ordinary CUDA F32 matrix contract, not the strict warp expert dot.
+extern "C" __global__ void et_grouped_matmul_f32(CudaKernelArgs a) {
+    for (et_u64 i = et_thread(); i < a.elements; i += (et_u64)gridDim.x * blockDim.x) {
+        et_u64 columns = a.integers[0], inner = a.integers[1];
+        et_u64 row = i / columns, column = i % columns;
+        float sum = 0.0f;
+        for (et_u64 k = 0; k < inner; ++k)
+            sum += ((const float *)a.inputs[0])[row * inner + k] * ((const float *)a.inputs[1])[column * inner + k];
+        ((float *)a.output)[i] = sum;
+    }
+}
 extern "C" __global__ void et_fill(CudaKernelArgs a) {
     et_u64 i = et_thread(); if (i < a.elements) et_store(a.output, a.output_dtype, i, a.scalars[0]);
 }
@@ -200,15 +260,30 @@ template<class T> __device__ void et_index_impl(const CudaKernelArgs &a, et_u64 
         et_copy(a.inputs[0], a.output, a.output_dtype, base + selected * inner, i);
     } else {
         T total = et_load<T>(a.inputs[0], a.input_dtypes[0], i);
-        const et_u64 *ss = et_shape(a, 2); et_u64 count = et_numel(a, 2);
-        for (et_u64 j = 0; j < count; ++j) {
+        const et_u64 *ss = et_shape(a, 2);
+        // Public scatter geometry fixes every coordinate outside the scatter
+        // axis. Only that source slice can contribute to this output. Visit it
+        // in the original flattened source order, without atomic updates.
+        bool same_axes = et_meta(a)[3] == rank;
+        for (unsigned int d = 0; d < rank && same_axes; ++d)
+            if (d != dim && ss[d] != s[d]) same_axes = false;
+        et_u64 coordinate = (i / inner) % s[dim];
+        et_u64 begin = same_axes ? (i / (inner * s[dim])) * inner * ss[dim] + i % inner : 0;
+        et_u64 step = same_axes ? inner : 1;
+        et_u64 end = same_axes ? begin + ss[dim] * inner : et_numel(a, 2);
+        for (et_u64 j = begin; j < end; j += step) {
             et_u64 selected; if (!et_selected(a, 1, j, s[dim], &selected)) return;
-            et_u64 linear = j, target = 0, stride = 1;
-            for (int d = rank - 1; d >= 0; --d) {
-                et_u64 c = linear % ss[d]; linear /= ss[d];
-                target += ((unsigned int)d == dim ? selected : c) * stride; stride *= s[d];
+            bool contributes = selected == coordinate;
+            if (!same_axes) {
+                // Retain native partial-shape indexing behavior as well.
+                et_u64 linear = j, target = 0, stride = 1;
+                for (int d = rank - 1; d >= 0; --d) {
+                    et_u64 c = linear % ss[d]; linear /= ss[d];
+                    target += ((unsigned int)d == dim ? selected : c) * stride; stride *= s[d];
+                }
+                contributes = target == i;
             }
-            if (target == i) {
+            if (contributes) {
                 total = et_add(total, et_load<T>(a.inputs[2], a.input_dtypes[2], j));
                 // Native half scatter updates round each addition to storage,
                 // just as the CPU's typed updates do. Do not silently widen

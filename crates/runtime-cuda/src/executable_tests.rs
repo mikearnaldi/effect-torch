@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "paged_state_tests.rs"]
+mod paged_state_tests;
 use crate::capabilities::CudaCapabilities;
 use crate::executable::CudaKernelArgs;
 use effect_torch_compiler::{
@@ -89,6 +92,13 @@ fn lower_with(
                         experts: weight.shape[0],
                     }
                 }
+                NodeKind::GroupedExpertLinearRows { x, weight, indexes } => {
+                    Instruction::GroupedExpertLinearRows {
+                        x: child(x),
+                        weight: child(weight),
+                        indexes: child(indexes),
+                    }
+                }
                 NodeKind::Linear { x, weight, bias } => Instruction::Linear {
                     x: child(x),
                     weight: child(weight),
@@ -168,7 +178,7 @@ fn lower_with(
                     layer,
                     window,
                     mode,
-                    ..
+                    rounding,
                 } => Instruction::KvAttention {
                     q: child(q),
                     k: child(k),
@@ -178,6 +188,7 @@ fn lower_with(
                     scale: *scale,
                     layer: *layer as usize,
                     window: *window,
+                    rounding: *rounding,
                     bidirectional: matches!(
                         mode,
                         effect_torch_graph::KvAttentionMode::BidirectionalBlock
@@ -210,6 +221,72 @@ fn kernel_descriptor_matches_cuda_layout() {
     assert_eq!(std::mem::size_of::<CudaKernelArgs>(), 360);
     assert_eq!(std::mem::offset_of!(CudaKernelArgs, metadata), 104);
     assert_eq!(std::mem::offset_of!(CudaKernelArgs, input_dtypes), 312);
+}
+
+#[test]
+fn grouped_experts_plan_bounded_scratch_borrow_banks_and_report_host_completion() {
+    for dtype in [DType::F32, DType::BF16] {
+        for (rows, experts, columns, inner) in [
+            (69, 7, 13, 37),
+            (2, 512, 4096, 4096),
+            (3, 2, 0, 5),
+            (0, 1, 4, 5),
+            (3, 2, 4, 0),
+        ] {
+            let root = Node::new(NodeKind::GroupedExpertLinearRows {
+                x: input(0, &[rows, inner], dtype),
+                weight: input(1, &[experts, columns, inner], dtype),
+                indexes: input(2, &[rows], DType::U32),
+            })
+            .unwrap();
+            let (program, commands, _, conversions, _) = lower(vec![root], true, None);
+            assert_eq!(conversions, 0);
+            let group = commands
+                .iter()
+                .find(|c| matches!(c.kind, CommandKind::GroupedExpert { .. }))
+                .unwrap();
+            let CommandKind::GroupedExpert {
+                control,
+                row_map,
+                gathered,
+                projected,
+                weight,
+                workspace,
+                ..
+            } = &group.kind
+            else {
+                unreachable!()
+            };
+            let bytes = |id: &ValueId| program.values[id.index()].decl.bytes;
+            assert_eq!(bytes(control), (experts + 2) * 4);
+            assert_eq!(bytes(row_map), rows * 4);
+            assert_eq!(bytes(gathered), rows * inner * dtype.size_in_bytes());
+            assert_eq!(bytes(projected), rows * columns * dtype.size_in_bytes());
+            assert_eq!(
+                bytes(weight),
+                experts * columns * inner * dtype.size_in_bytes()
+            );
+            assert!(matches!(
+                program.values[weight.index()].decl.storage,
+                ValueStorage::Fixed {
+                    class: StorageClass::ExternalInput,
+                    ..
+                }
+            ));
+            assert_eq!(
+                workspace.is_some(),
+                dtype == DType::BF16 && rows != 0 && columns != 0 && inner != 0
+            );
+            assert_eq!(
+                crate::executable::physical_counts(&program, &commands).1,
+                1 + usize::from(rows != 0)
+            );
+            assert!(program
+                .instructions
+                .iter()
+                .any(|i| i.kind == "grouped_expert_linear_rows_host_control_non_capturable"));
+        }
+    }
 }
 
 #[test]
@@ -971,6 +1048,7 @@ fn kv_state_and_transaction_bytes_follow_configured_storage() {
             layer: 0,
             window: None,
             mode: effect_torch_graph::KvAttentionMode::Causal,
+            rounding: effect_torch_graph::AttentionRounding::Fused,
         })
         .unwrap();
         let layout = CudaStateLayout {
@@ -978,6 +1056,14 @@ fn kv_state_and_transaction_bytes_follow_configured_storage() {
             dtype,
             slots: 2,
             packed_rows_per_sequence: None,
+            access: effect_torch_runtime::StateAccessMode::Append,
+            kv_layers: vec![effect_torch_runtime::KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 2,
+                head_dim: 8,
+                dtype,
+                retention: None,
+            }],
         };
         let (program, commands, memory, _, _) = lower(vec![root], false, Some(layout));
         let expected = 2 * 2 * 16 * 2 * 8 * dtype.size_in_bytes()
@@ -1015,16 +1101,20 @@ fn kv_state_and_transaction_bytes_follow_configured_storage() {
             .map(|v| v.decl.bytes)
             .sum::<usize>();
         assert_eq!(state_bytes, expected);
-        assert_eq!(staging_bytes, expected);
+        // A one-row private tail replaces the old whole-cache transaction.
+        assert_eq!(staging_bytes, expected / 16);
         assert!(memory
             .segments
             .iter()
             .any(|s| s.ownership == SegmentOwnership::StateTransaction));
-        let commits = commands
+        let state_copies = commands
             .iter()
-            .filter(|c| matches!(c.kind, CommandKind::StateCopy { commit: true, .. }))
+            .filter(|c| matches!(c.kind, CommandKind::Prepare))
             .count();
-        assert_eq!(commits, if dtype == DType::U8 { 4 } else { 2 });
+        assert_eq!(
+            state_copies, 1,
+            "only scratch/status preparation is submitted"
+        );
     }
 }
 

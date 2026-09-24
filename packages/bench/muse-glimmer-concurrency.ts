@@ -16,8 +16,8 @@
 // ./scripts/cuda-devbox.sh run pnpm bench:muse-glimmer-concurrency
 
 import * as BackendCuda from "@effect-torch/backend-cuda"
-import { Model, type Runtime, Tensor } from "@effect-torch/core"
-import { MuseGlimmer } from "@effect-torch/core/models"
+import { AutoRegressive, type Runtime, Tensor } from "@effect-torch/core"
+import { MuseGlimmer } from "@effect-torch/models"
 import * as Tokenizers from "@effect-torch/tokenizers"
 import { Duration, Effect, Option, Schema } from "effect"
 import * as fs from "node:fs"
@@ -27,9 +27,13 @@ import { fileURLToPath } from "node:url"
 import { buildPrompt } from "./muse-glimmer.ts"
 
 const directory = path.dirname(fileURLToPath(import.meta.url))
+
 const repoRoot = path.resolve(directory, "../..")
+
 const defaultModelPath = path.join(directory, "../examples/data/Muse-Glimmer-30B-UD-Q2_K_XL.gguf")
+
 const defaultTokenizerPath = path.join(directory, "../examples/data/muse-glimmer-tokenizer.json")
+
 const blockSize = 16
 
 interface Config {
@@ -74,18 +78,26 @@ const fail = (message: string): never => {
 
 const envInt = (name: string, fallback: number): number => {
   const raw = process.env[name]
+
   if (raw === undefined || raw === "") return fallback
+
   const value = Number(raw)
+
   if (!Number.isInteger(value)) return fail(`${name} must be an integer, got ${raw}`)
+
   return value
 }
 
 const envIntList = (name: string, fallback: ReadonlyArray<number>): ReadonlyArray<number> => {
   const raw = process.env[name]
+
   if (raw === undefined || raw === "") return fallback
+
   return raw.split(",").map((entry) => {
     const value = Number(entry.trim())
+
     if (!Number.isInteger(value) || value <= 0) return fail(`${name} entries must be positive integers, got ${entry}`)
+
     return value
   })
 }
@@ -100,19 +112,27 @@ const loadConfig = (): Config => {
   const warmupSteps = envInt("WARMUP_STEPS", 4)
   const cooldownMs = envInt("COOLDOWN_MS", 5_000)
   const prefillChunks = envIntList("PREFILL_CHUNK", [64, 128, 256])
+
   if (context < 9) return fail(`CONTEXT must be at least 9, got ${context}`)
+
   if (decodeTokens <= 0) return fail(`DECODE_TOKENS must be positive, got ${decodeTokens}`)
+
   if (runs <= 0) return fail(`RUNS must be positive, got ${runs}`)
+
   if (warmupSteps < 0) return fail(`WARMUP_STEPS must be non-negative, got ${warmupSteps}`)
+
   if (cooldownMs < 0) return fail(`COOLDOWN_MS must be non-negative, got ${cooldownMs}`)
+
   const tokensPerSession = Math.ceil((context + warmupSteps + decodeTokens + 1) / blockSize) * blockSize
   const requiredMaxTokens = Math.max(...concurrencies) * tokensPerSession
   const maxTokens = process.env.MAX_TOKENS === undefined ? undefined : envInt("MAX_TOKENS", requiredMaxTokens)
+
   if (maxTokens !== undefined && (maxTokens < requiredMaxTokens || maxTokens % blockSize !== 0)) {
     return fail(
       `MAX_TOKENS must be a multiple of ${blockSize} and at least ${requiredMaxTokens}, got ${maxTokens}`
     )
   }
+
   return {
     concurrencies,
     context,
@@ -132,6 +152,7 @@ const loadConfig = (): Config => {
 
 const metadataInt = (metadata: ReadonlyMap<string, unknown>, key: string): number => {
   const value = Option.getOrUndefined(Schema.decodeUnknownOption(Schema.Int)(metadata.get(key)))
+
   return value === undefined ? fail(`GGUF metadata ${key} must be an integer`) : value
 }
 
@@ -140,7 +161,7 @@ const percentile = (sorted: ReadonlyArray<number>, quantile: number): number =>
 
 interface CaseInput {
   readonly config: Config
-  readonly program: Model.InferenceProgram
+  readonly program: AutoRegressive.Artifact
   readonly tokenizer: Tokenizers.Tokenizer
   readonly bosTokenId: number
   readonly concurrency: number
@@ -152,11 +173,13 @@ interface CaseInput {
 }
 
 const runCase = (input: CaseInput): Effect.Effect<BenchRecord, unknown, Runtime.Runtime> => {
-  let generation: Model.Generation | undefined
+  let generation: AutoRegressive.Generation | undefined
+
   return Effect.gen(function*() {
     const { config } = input
     generation = yield* input.program.generation()
     const promptTensors: Array<Tensor.Any> = []
+
     for (let session = 0; session < input.concurrency; session++) {
       const caseId = ((input.concurrencyIndex * config.runs + input.run) * 1000) + session
       const prompt = yield* buildPrompt(input.tokenizer, config.seed, caseId, config.context)
@@ -165,12 +188,14 @@ const runCase = (input: CaseInput): Effect.Effect<BenchRecord, unknown, Runtime.
       ids.set(prompt.ids, 1)
       promptTensors.push(yield* Tensor.fromTypedArray(ids, [1, config.context]))
     }
+
     let pages = yield* generation.add(
       promptTensors.map((prompt) => ({
         prompt,
         maxTokens: config.warmupSteps + config.decodeTokens + 1
       }))
     )
+
     for (let step = 0; step < config.warmupSteps; step++) {
       pages = yield* generation.step(pages.map(({ seq }) => ({ seq })))
     }
@@ -178,22 +203,27 @@ const runCase = (input: CaseInput): Effect.Effect<BenchRecord, unknown, Runtime.
     let generatedTokens = 0
     const roundTimes: Array<number> = []
     const started = performance.now()
+
     for (let step = 0; step < config.decodeTokens; step++) {
       const roundStarted = performance.now()
       pages = yield* generation.step(pages.map(({ seq }) => ({ seq })))
       roundTimes.push(performance.now() - roundStarted)
       generatedTokens += pages.reduce((total, page) => total + page.tokens.length, 0)
     }
+
     const decodeMs = performance.now() - started
     const expectedTokens = input.concurrency * config.decodeTokens
+
     if (generatedTokens !== expectedTokens) {
       return yield* Effect.die(
         new Error(`decode returned ${generatedTokens} tokens, expected ${expectedTokens}`)
       )
     }
+
     roundTimes.sort((left, right) => left - right)
     const aggregateTokPerSec = generatedTokens / (decodeMs / 1000)
-    return {
+
+    const benchRecord: BenchRecord = {
       timestamp: new Date().toISOString(),
       engine: "effect-cuda",
       model: "Muse-Glimmer-30B",
@@ -212,7 +242,9 @@ const runCase = (input: CaseInput): Effect.Effect<BenchRecord, unknown, Runtime.
       compileMs: input.compileMs,
       maxTokens: input.maxTokens,
       rssBytes: process.memoryUsage().rss
-    } satisfies BenchRecord
+    }
+
+    return benchRecord
   }).pipe(
     Effect.ensuring(
       Effect.suspend(() => generation === undefined ? Effect.void : Effect.ignore(generation.close()))
@@ -223,6 +255,7 @@ const runCase = (input: CaseInput): Effect.Effect<BenchRecord, unknown, Runtime.
 const median = (values: ReadonlyArray<number>): number => {
   const sorted = [...values].sort((left, right) => left - right)
   const middle = Math.floor(sorted.length / 2)
+
   return sorted.length % 2 === 0 ? (sorted[middle - 1]! + sorted[middle]!) / 2 : sorted[middle]!
 }
 
@@ -238,6 +271,7 @@ const printRecord = (record: BenchRecord): void => {
 
 const printSummary = (config: Config, records: ReadonlyArray<BenchRecord>): void => {
   process.stdout.write("\nmedian decode throughput\n")
+
   for (const concurrency of config.concurrencies) {
     const group = records.filter((record) => record.concurrency === concurrency)
     process.stdout.write(
@@ -256,20 +290,25 @@ const suite = (config: Config, records: Array<BenchRecord>): Effect.Effect<void,
       ...Tokenizers.strictConfig,
       specialTokens: "Always"
     })
+
     const loadStarted = performance.now()
     const loaded = yield* MuseGlimmer.loadGGUF(config.modelPath)
     const loadMs = performance.now() - loadStarted
     const bosTokenId = metadataInt(loaded.metadata, "tokenizer.ggml.bos_token_id")
     process.stderr.write(`loaded in ${(loadMs / 1000).toFixed(2)}s\n`)
+
     return yield* Effect.gen(function*() {
       let first = true
+
       for (const [concurrencyIndex, concurrency] of config.concurrencies.entries()) {
         const tokensPerSession = Math.ceil(
           (config.context + config.warmupSteps + config.decodeTokens + 1) / blockSize
         ) * blockSize
+
         const maxTokens = config.maxTokens ?? concurrency * tokensPerSession
         const compileStarted = performance.now()
-        const program = yield* Model.inference(loaded.model, loaded.params, {
+
+        const program = yield* AutoRegressive.compile(loaded.definition, loaded.parameters, {
           maxTokens,
           blockSize,
           kvDtype: "f16",
@@ -277,13 +316,17 @@ const suite = (config: Config, records: Array<BenchRecord>): Effect.Effect<void,
           batchSize: concurrency,
           sampling: { temperature: 0, topK: 0, topP: 1, seed: config.seed }
         })
+
         const compileMs = performance.now() - compileStarted
         process.stderr.write(
           `compiled batchSize=${concurrency} in ${(compileMs / 1000).toFixed(2)}s\n`
         )
+
         for (let run = 0; run < config.runs; run++) {
           if (!first && config.cooldownMs > 0) yield* Effect.sleep(Duration.millis(config.cooldownMs))
+
           first = false
+
           const record = yield* runCase({
             config,
             program,
@@ -296,11 +339,12 @@ const suite = (config: Config, records: Array<BenchRecord>): Effect.Effect<void,
             compileMs,
             maxTokens
           })
+
           records.push(record)
           printRecord(record)
         }
       }
-    }).pipe(Effect.ensuring(Tensor.clearAll(loaded.params)))
+    }).pipe(Effect.ensuring(Tensor.clearAll(loaded.parameters)))
   })
 
 const writeOutput = (config: Config, records: ReadonlyArray<BenchRecord>): void => {

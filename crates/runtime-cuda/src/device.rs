@@ -22,6 +22,7 @@ pub(crate) const CUDA_TOP_K_LIMIT: usize = 40;
 // Applied after typed.cuh, so descriptor fields, casts, indexes, masks and
 // persistent state do not inherit the compute type substitution.
 const F32_PRELUDE: &str = r#"
+#define ET_COMPUTE_F32 1
 #define double float
 #define fabs fabsf
 #define sqrt sqrtf
@@ -56,6 +57,12 @@ const TYPED_KERNELS: &[&str] = &[
     "et_index",
     "et_top_k_indices",
     "et_expert_linear_rows",
+    "et_grouped_counts",
+    "et_grouped_offsets",
+    "et_grouped_rows",
+    "et_grouped_gather",
+    "et_grouped_scatter",
+    "et_grouped_matmul_f32",
     "et_sequence",
     "et_last_token",
     "et_optimizer",
@@ -191,10 +198,15 @@ impl CudaDevice {
             kernels.insert(name.to_string(), load(&quantized, name)?);
         }
         let cache = compile_module(&context, "cache.cu", &[TYPED_HEADER, CACHE_SOURCE])?;
-        kernels.insert(
-            "et_kv_attention".to_string(),
-            load(&cache, "et_kv_attention")?,
-        );
+        for name in [
+            "et_kv_store",
+            "et_kv_attention",
+            "et_kv_gemm_gather",
+            "et_kv_gemm_softmax",
+            "et_kv_gemm_round",
+        ] {
+            kernels.insert(name.to_string(), load(&cache, name)?);
+        }
         let mut sampling = None;
         for definition in COMPUTE_MODULES {
             for (suffix, prelude) in [("f32", F32_PRELUDE), ("f64", "")] {
@@ -212,6 +224,13 @@ impl CudaDevice {
                 )?;
                 for &name in definition.kernels {
                     kernels.insert(format!("{name}_{suffix}"), load(&module, name)?);
+                }
+                if definition.name == "tensor" && suffix == "f32" {
+                    kernels.insert("et_sum_wide_f32".into(), load(&module, "et_sum_wide")?);
+                    kernels.insert(
+                        "et_reduce_last_wide_f32".into(),
+                        load(&module, "et_reduce_last_wide")?,
+                    );
                 }
                 if definition.name == "pointwise" && suffix == "f32" {
                     sampling = Some(CudaF32Kernels {

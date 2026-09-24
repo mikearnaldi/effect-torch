@@ -32,12 +32,12 @@ export const LAYERS = 6
 /** Builds the FineWeb causal transformer for the supplied vocabulary size. */
 export const createGpt = (
   vocabSize: number
-): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError> =>
+): Effect.Effect<Model.Definition, Model.ModelError | Tensor.TensorError> =>
   Effect.gen(function*() {
     // Attention uses RoPE, so windowed inference has no learned position table
     // to outgrow.
     const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
-    const blocks: Array<Model.Model> = []
+    const blocks: Array<Model.Definition> = []
     for (let i = 0; i < LAYERS; i++) {
       const attn = yield* Model.chain(
         yield* Model.layerNorm(`b${i}.ln1`, EMBED),
@@ -71,18 +71,18 @@ export const loadTokenizer = Tokenizer.fromFile(TOKENIZER_JSON, {
  * Saves one named entry per parameter spec in model order. The bare artifact
  * has no trainer state. The caller must supply every parameter.
  */
-export const saveParams = (model: Model.Model, params: Model.Params, path: string) =>
+export const saveParams = (model: Model.Definition, params: Model.Parameters, path: string) =>
   Safetensors.save(path, Object.fromEntries(model.parameterSpecs.map(({ name }, i) => [name, params[i]])))
 
 /**
- * Loads bare named parameters in model order. {@link Safetensors.loadModel}
+ * Loads bare named parameters in model order. {@link Safetensors.loadParameters}
  * checks the archive header and loads only the required handles.
  */
 export const loadParams = (
-  model: Model.Model,
+  model: Model.Definition,
   path: string
 ): Effect.Effect<ReadonlyArray<Tensor.Concrete>, Model.ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  Safetensors.loadModel(model, path)
+  Safetensors.loadParameters(model, path)
 
 /** Reads a headerless u16 token bin that `prepare.ts` produces. */
 export const loadBin = (path: string) => {
@@ -109,8 +109,8 @@ export const windows = (data: Uint16Array, starts: ReadonlyArray<number>, batch:
 
 /** Computes mean cross-entropy over random held-out windows with no fixed seed. */
 export const heldOutLoss = (
-  model: Model.Model,
-  params: Model.Params,
+  model: Model.Definition,
+  params: Model.Parameters,
   data: Uint16Array,
   batch: number,
   block: number,

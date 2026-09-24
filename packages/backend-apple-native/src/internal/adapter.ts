@@ -27,6 +27,7 @@ import type {
   NativeInferenceSequence,
   NativeInferenceSession,
   NativeKvPool,
+  NativeKvPrefix,
   NativeKvSequence,
   NativeKvStateSchema,
   NativeProposerPlan,
@@ -35,12 +36,14 @@ import type {
 } from "./native-addon.js"
 
 type CancellationToken = InstanceType<NativeAddon["CancellationToken"]>
+
 type HandleKind =
   | "lazy-tensor"
   | "concrete-tensor"
   | "executable"
   | "kv-pool"
   | "kv-sequence"
+  | "kv-prefix"
   | "inference-artifact"
   | "inference-session"
   | "inference-sequence"
@@ -66,6 +69,7 @@ interface ScalarBindingDeclaration {
 }
 
 type InputDeclaration = TensorBindingDeclaration | ScalarBindingDeclaration
+
 type TensorBinding = Omit<TensorBindingDeclaration, "kind" | "slot">
 
 const numberBits = new DataView(new ArrayBuffer(8))
@@ -83,13 +87,18 @@ export const normalizedStructure = (value: unknown): unknown => {
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Recursive classification requires the intrinsic number category.
   if (typeof value === "number") {
     if (Number.isFinite(value) && !Object.is(value, -0)) return value
+
     numberBits.setFloat64(0, value, false)
     const high = numberBits.getUint32(0, false).toString(16).padStart(8, "0")
     const low = numberBits.getUint32(4, false).toString(16).padStart(8, "0")
+
     return { $number: `${high}${low}` }
   }
+
   if (value instanceof Uint8Array) return Array.from(value)
+
   if (Array.isArray(value)) return value.map(normalizedStructure)
+
   // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Recursive classification requires the intrinsic object category.
   if (typeof value === "object" && value !== null) {
     return Object.fromEntries(
@@ -98,8 +107,10 @@ export const normalizedStructure = (value: unknown): unknown => {
         .map(([key, entry]) => [key, normalizedStructure(entry)])
     )
   }
+
   return value
 }
+
 // oxlint-enable anti-slop/no-known-value-widening, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns
 
 /** Canonicalizes a value with {@link normalizedStructure}, then serializes it. @internal */
@@ -107,6 +118,7 @@ export const normalizedStructure = (value: unknown): unknown => {
 export const structuralCacheKey = (value: unknown): string => JSON.stringify(normalizedStructure(value))
 
 interface KvPoolInfo {
+  readonly kvLayers?: ReadonlyArray<Runtime.KvLayerDescriptor> | undefined
   readonly key: object
   readonly layers: number
   readonly kvHeads: number
@@ -178,14 +190,30 @@ interface HandleData {
     readonly structure?: StructuralNode | undefined
     readonly declarations?: ReadonlySet<InputDeclaration> | undefined
   }
-  readonly executable: { readonly value: Executable; readonly info: ExecutableInfo }
-  readonly "kv-pool": { readonly value: NativeKvPool; readonly info: KvPoolInfo }
-  readonly "kv-sequence": { readonly value: NativeKvSequence; readonly info: KvSequenceInfo }
+  readonly executable: {
+    readonly value: Executable
+    readonly info: ExecutableInfo
+  }
+  readonly "kv-pool": {
+    readonly value: NativeKvPool
+    readonly info: KvPoolInfo
+  }
+  readonly "kv-sequence": {
+    readonly value: NativeKvSequence
+    readonly info: KvSequenceInfo
+  }
+  readonly "kv-prefix": {
+    readonly value: NativeKvPrefix
+    readonly info: KvSequenceInfo
+  }
   readonly "inference-artifact": {
     readonly value: NativeInferenceArtifact
     readonly info: InferenceArtifactInfo
   }
-  readonly "inference-session": { readonly value: NativeInferenceSession; readonly info: InferenceSessionInfo }
+  readonly "inference-session": {
+    readonly value: NativeInferenceSession
+    readonly info: InferenceSessionInfo
+  }
   readonly "inference-sequence": {
     readonly value: NativeInferenceSequence
     readonly info: InferenceSequenceInfo
@@ -198,15 +226,20 @@ type HandleRecord<K extends HandleKind> = K extends HandleKind ? {
     disposed: boolean
   } & HandleData[K]
   : never
+
 type AnyHandleRecord = { [K in HandleKind]: HandleRecord<K> }[HandleKind]
+
 type TensorHandleRecord = HandleRecord<"lazy-tensor" | "concrete-tensor">
+
 type OpaqueHandleKind = Exclude<HandleKind, "lazy-tensor" | "concrete-tensor" | "executable">
+
 interface RuntimeHandle {
   readonly "lazy-tensor": Runtime.LazyTensorHandle
   readonly "concrete-tensor": Runtime.ConcreteTensorHandle
   readonly executable: Runtime.ExecutableHandle
   readonly "kv-pool": Runtime.KvPoolHandle
   readonly "kv-sequence": Runtime.KvSequenceHandle
+  readonly "kv-prefix": Runtime.KvPrefixHandle
   readonly "inference-artifact": Runtime.InferenceArtifactHandle
   readonly "inference-session": Runtime.InferenceSessionHandle
   readonly "inference-sequence": Runtime.InferenceSequenceHandle
@@ -217,18 +250,25 @@ interface BackendHandleRegistry {
 }
 
 const handleRecords = new WeakMap<object, AnyHandleRecord>()
+
 // Each adapter module keeps its records private. The shared weak set lets
 // separately loaded backend modules distinguish foreign opaque handles from
 // arbitrary objects without retaining either.
 const backendHandlesKey = Symbol.for("@effect-torch/backend-handles")
+
 // SAFETY: Backend adapters reserve this shared symbol for a WeakSet<object>.
 const backendHandleRegistry = globalThis as typeof globalThis & BackendHandleRegistry
+
 const existingBackendHandles = backendHandleRegistry[backendHandlesKey]
+
 const backendHandles = existingBackendHandles ?? new WeakSet<object>()
+
 if (existingBackendHandles === undefined) backendHandleRegistry[backendHandlesKey] = backendHandles
 
 const backendName = "@effect-torch/backend-apple-native"
+
 const device = "metal"
+
 const nativeDtype = (value: Runtime.DType): NativeDType => {
   switch (value) {
     case "f32":
@@ -244,6 +284,7 @@ const nativeDtype = (value: Runtime.DType): NativeDType => {
 }
 
 const description = "Apple Metal"
+
 const inferencePhases: ReadonlySet<string> = new Set([
   "compile",
   "open",
@@ -258,7 +299,9 @@ const inferencePhases: ReadonlySet<string> = new Set([
   "close",
   "inspect"
 ])
+
 const isInferenceFailurePhase = (value: string): value is Runtime.InferenceFailurePhase => inferencePhases.has(value)
+
 const isGgufFormat = (value: string): value is Runtime.GgufTensorDescriptor["format"] =>
   value === "F32" || Runtime.isTensorStorageEncoding(value)
 
@@ -267,11 +310,15 @@ const tensorStorage = (
   storage: LazyTensor["storage"]
 ): Runtime.EncodedTensorStorage | undefined => {
   if (storage.representation === "dense" && storage.format === undefined) return undefined
+
   if (storage.representation !== "packed" || !Runtime.isTensorStorageEncoding(storage.format)) {
     throw new Error("native runtime returned an unsupported storage representation")
   }
+
   const geometry = Runtime.encodedStorageGeometry(storage.format, shape)
+
   if (geometry === undefined) throw new Error("native runtime returned invalid packed tensor geometry")
+
   return { encoding: storage.format, physicalShape: geometry.physicalShape, physicalDtype: "u8" }
 }
 
@@ -286,6 +333,7 @@ const backendError = (
     : (() => {
       const message = cause instanceof Error ? cause.message : String(cause)
       const nativeInferencePhase = /inference\[([^\]]+)\]/.exec(message)?.[1]
+
       const fallbackInferencePhase: Runtime.InferenceFailurePhase | undefined = operation === "inferenceCompile"
         ? "compile"
         : operation === "inferenceOpen"
@@ -301,9 +349,11 @@ const backendError = (
         : operation === "inferenceClose"
         ? "close"
         : undefined
+
       const inferencePhase = nativeInferencePhase !== undefined && isInferenceFailurePhase(nativeInferencePhase)
         ? nativeInferencePhase
         : fallbackInferencePhase
+
       return new Runtime.BackendError({
         reason: message.includes("tensor was cleared")
           ? "invalid-handle"
@@ -338,46 +388,63 @@ const cancellable = <A>(
     const token = new native.CancellationToken()
     let lateValue: A | undefined
     let hasLateValue = false
+
     const clearLateValue = () => {
       if (!hasLateValue) return
+
       hasLateValue = false
+
       try {
         // SAFETY: hasLateValue is set only when lateValue receives a resolved A.
         onLateSuccess?.(lateValue as A)
       } catch {
         // The interrupted fiber cannot observe cleanup failures.
       }
+
       lateValue = undefined
     }
+
     const abort = () => {
       token.cancel()
-      if (token.cancelled) clearLateValue()
+      // Native completion can win cancellation before Effect receives the result.
+      // An interrupted fiber still cannot take ownership of that result.
+      clearLateValue()
     }
+
     if (signal.aborted) abort()
     else signal.addEventListener("abort", abort, { once: true })
+
     let pending: Promise<A>
+
     try {
       pending = register(token)
     } catch (error) {
       signal.removeEventListener("abort", abort)
       resume(Effect.fail(backendError(operation, phase, failureReason)(error)))
+
       return
     }
+
     pending.then(
       (value) => {
-        if (signal.aborted && token.cancelled) {
+        if (signal.aborted) {
           lateValue = value
           hasLateValue = true
           clearLateValue()
+
           return
         }
+
         lateValue = value
         hasLateValue = true
         resume(Effect.suspend(() => {
           signal.removeEventListener("abort", abort)
+
           if (!hasLateValue) return Effect.interrupt
+
           hasLateValue = false
           lateValue = undefined
+
           return Effect.succeed(value)
         }))
       },
@@ -414,11 +481,13 @@ export const createRuntimeAdapter = (
   if (!Number.isSafeInteger(deviceOrdinal) || deviceOrdinal < 0 || deviceOrdinal > 0xffff_ffff) {
     throw new Error(`Metal device ordinal must be an integer in [0, 4294967295]; received ${deviceOrdinal}`)
   }
+
   const backendErrorFor = (
     operation: string,
     phase: Runtime.BackendError["phase"],
     reason?: Runtime.BackendError["reason"]
   ) => backendError(operation, phase, reason)
+
   const cancellableFor = <A>(
     operation: string,
     phase: Runtime.BackendError["phase"],
@@ -426,14 +495,17 @@ export const createRuntimeAdapter = (
     onLateSuccess?: (value: A) => void,
     failureReason?: Runtime.BackendError["reason"]
   ) => cancellable(native, operation, phase, register, onLateSuccess, failureReason)
+
   const owner = Object.freeze({ native, deviceOrdinal })
   const placementId = `${device}:${deviceOrdinal}`
+
   const placement: Runtime.Placement = Object.freeze({
     id: placementId,
     deviceType: device,
     description: `${description} device ${deviceOrdinal}`,
     ordinal: deviceOrdinal
   })
+
   const invalidHandle = (
     operation: string,
     phase: Runtime.BackendError["phase"],
@@ -448,6 +520,7 @@ export const createRuntimeAdapter = (
       message: `${operation}: ${reason === "foreign-handle" ? "foreign" : "invalid"} ${kind} handle`,
       details: { device, kind }
     })
+
   const record = <K extends HandleKind>(
     handle: RuntimeHandle[K],
     kind: K,
@@ -455,9 +528,11 @@ export const createRuntimeAdapter = (
     phase: Runtime.BackendError["phase"]
   ): HandleRecord<K> => {
     const found = handleRecords.get(handle)
+
     if (found === undefined || found.kind !== kind) {
       throw invalidHandle(operation, phase, backendHandles.has(handle) ? "foreign-handle" : "invalid-handle", kind)
     }
+
     if (found.disposed) {
       throw new Runtime.BackendError({
         reason: "invalid-handle",
@@ -468,18 +543,21 @@ export const createRuntimeAdapter = (
         details: { device, kind }
       })
     }
+
     if (found.owner !== owner) {
       throw invalidHandle(operation, phase, "foreign-handle", kind)
     }
     // SAFETY: The runtime kind check above establishes the generic record variant.
     return found as HandleRecord<K>
   }
+
   const tensorRecord = (
     handle: Runtime.TensorHandle,
     operation: string,
     phase: Runtime.BackendError["phase"]
   ): TensorHandleRecord => {
     const found = handleRecords.get(handle)
+
     if (
       found === undefined || (found.kind !== "lazy-tensor" && found.kind !== "concrete-tensor")
     ) {
@@ -492,6 +570,7 @@ export const createRuntimeAdapter = (
         "tensor"
       )
     }
+
     if (found.disposed) {
       throw new Runtime.BackendError({
         reason: "invalid-handle",
@@ -502,22 +581,28 @@ export const createRuntimeAdapter = (
         details: { device, kind: found.kind }
       })
     }
+
     if (found.owner !== owner) throw invalidHandle(operation, phase, "foreign-handle", "tensor")
+
     return found
   }
+
   const wrapOpaque = <K extends OpaqueHandleKind>(
     kind: K,
     value: HandleData[K]["value"],
-    info: HandleData[K]["info"]
+    info: HandleData[K]["info"],
+    properties: Readonly<Record<string, number>> = {}
   ): RuntimeHandle[K] => {
     // SAFETY: Public handles are opaque identities; their typed data lives only in handleRecords.
-    const handle = Object.freeze({}) as RuntimeHandle[K]
+    const handle = Object.freeze<object>({ ...properties }) as RuntimeHandle[K]
     // SAFETY: K indexes the matching native value and metadata types in HandleData.
     const entry = { owner, kind, value, info, disposed: false } as HandleRecord<K>
     handleRecords.set(handle, entry)
     backendHandles.add(handle)
+
     return handle
   }
+
   const dtype = (value: string): Runtime.DType => {
     if (
       value === "f32" || value === "f64" || value === "f16" || value === "bf16" || value === "i64" || value === "u8" ||
@@ -525,8 +610,10 @@ export const createRuntimeAdapter = (
     ) {
       return value
     }
+
     throw new Error(`native runtime returned unsupported dtype ${value}`)
   }
+
   const tensorObject = <H extends Runtime.TensorHandle>(
     tag: H["_tag"],
     shape: ReadonlyArray<number>,
@@ -537,9 +624,11 @@ export const createRuntimeAdapter = (
     if (!shape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0)) {
       throw new Error(`native runtime returned invalid shape [${shape}]`)
     }
+
     if (tensorDevice !== device) {
       throw new Error(`native runtime returned placement ${tensorDevice}, expected ${device}`)
     }
+
     if (
       storage !== undefined &&
       (tensorDtype !== "f32" || !Runtime.validEncodedStorage(shape, storage))
@@ -565,11 +654,13 @@ export const createRuntimeAdapter = (
       }
     }) as H
   }
+
   // Because `node` calls are synchronous, these fields can carry one request's
   // JavaScript-only structure and declarations through the native constructor
   // into `lazyHandle`. The call consumes or resets them before returning.
   let pendingStructure: StructuralNode | undefined
   let pendingDeclarations: ReadonlySet<InputDeclaration> | undefined
+
   const lazyHandle = (
     value: LazyTensor,
     logical?: {
@@ -580,6 +671,7 @@ export const createRuntimeAdapter = (
   ): Runtime.LazyTensorHandle => {
     const [nativeShape, nativeDtype] = value.metadata()
     const storage = tensorStorage(nativeShape, value.storage)
+
     if (
       logical !== undefined &&
       (!sameShape(nativeShape, logical.shape) || nativeDtype !== logical.dtype ||
@@ -587,6 +679,7 @@ export const createRuntimeAdapter = (
     ) {
       throw new Error("native runtime returned tensor metadata inconsistent with its logical declaration")
     }
+
     const handle = tensorObject<Runtime.LazyTensorHandle>(
       "LazyTensor",
       nativeShape,
@@ -594,6 +687,7 @@ export const createRuntimeAdapter = (
       device,
       storage
     )
+
     handleRecords.set(handle, {
       owner,
       kind: "lazy-tensor",
@@ -605,9 +699,12 @@ export const createRuntimeAdapter = (
     pendingStructure = undefined
     pendingDeclarations = undefined
     backendHandles.add(handle)
+
     return handle
   }
+
   const graph = lazyHandle
+
   const concreteHandle = (
     value: NativeTensor,
     logical?: {
@@ -617,6 +714,7 @@ export const createRuntimeAdapter = (
     }
   ): Runtime.ConcreteTensorHandle => {
     const storage = tensorStorage(value.shape, value.storage)
+
     if (
       logical !== undefined &&
       (!sameShape(value.shape, logical.shape) || value.dtype !== logical.dtype ||
@@ -624,6 +722,7 @@ export const createRuntimeAdapter = (
     ) {
       throw new Error("native runtime returned tensor metadata inconsistent with its logical declaration")
     }
+
     const handle = tensorObject<Runtime.ConcreteTensorHandle>(
       "Tensor",
       value.shape,
@@ -631,6 +730,7 @@ export const createRuntimeAdapter = (
       value.device,
       storage
     )
+
     const graph = native.LazyTensor.fromMaterialized(value)
     handleRecords.set(handle, {
       owner,
@@ -645,26 +745,33 @@ export const createRuntimeAdapter = (
       disposed: false
     })
     backendHandles.add(handle)
+
     return handle
   }
+
   const nativeGraph = (
     handle: Runtime.TensorHandle,
     operation: string,
     phase: Runtime.BackendError["phase"] = "graph"
   ): LazyTensor => tensorRecord(handle, operation, phase).graph!
+
   const nativeTensor = (
     handle: Runtime.ConcreteTensorHandle,
     operation: string,
     phase: Runtime.BackendError["phase"] = "execute"
   ): NativeTensor => {
     const found = tensorRecord(handle, operation, phase)
+
     if (found.kind !== "concrete-tensor" || found.value === undefined) {
       throw invalidHandle(operation, phase, "invalid-handle", "concrete-tensor")
     }
+
     return found.value
   }
+
   const sameShape = (left: ReadonlyArray<number>, right: ReadonlyArray<number>): boolean =>
     left.length === right.length && left.every((dimension, index) => dimension === right[index])
+
   const sameStorage = (
     left: Runtime.EncodedTensorStorage | undefined,
     right: Runtime.EncodedTensorStorage | undefined
@@ -673,17 +780,21 @@ export const createRuntimeAdapter = (
       ? right === undefined
       : right !== undefined && left.encoding === right.encoding && left.physicalDtype === right.physicalDtype &&
         sameShape(left.physicalShape, right.physicalShape)
+
   const sameBinding = (left: TensorBinding, right: TensorBinding): boolean =>
     left.dtype === right.dtype && sameShape(left.shape, right.shape) && sameStorage(left.storage, right.storage)
+
   // Native LazyTensor nodes contain the semantic graph but do not expose the
   // shared public slot namespace. JavaScript carries the declarations so
   // compilation can reject gaps and tensor/scalar conflicts before splitting
   // invocation bindings into native tensor and scalar arrays.
   const declarationsFor = (request: Runtime.NodeRequest): ReadonlySet<InputDeclaration> => {
     const declarations = new Set<InputDeclaration>()
+
     const source = request.op === "constant" || request.op === "zeros" || request.op === "ones" ||
       request.op === "full" || request.op === "randn" || request.op === "uniform" || request.op === "arange" ||
       request.op === "eye" || request.op === "fromBytes" || request.op === "input" || request.op === "scalarInput"
+
     if (!source) {
       for (const input of request.inputs) {
         for (const declaration of tensorRecord(input, request.op, "graph").declarations ?? []) {
@@ -691,6 +802,7 @@ export const createRuntimeAdapter = (
         }
       }
     }
+
     if (request.op === "input") {
       declarations.add({
         kind: "tensor",
@@ -702,16 +814,21 @@ export const createRuntimeAdapter = (
     } else if (request.op === "scalarInput") {
       declarations.add({ kind: "scalar", slot: request.attributes.slot, dtype: request.attributes.dtype })
     }
+
     return declarations
   }
+
   const executableBindings = (roots: ReadonlyArray<Runtime.TensorHandle>): ReadonlyArray<TensorBinding> => {
     const slots = new Map<number, InputDeclaration>()
+
     for (const root of roots) {
       for (const declaration of tensorRecord(root, "compile", "compile").declarations ?? []) {
         if (!Number.isSafeInteger(declaration.slot) || declaration.slot < 0 || declaration.slot > 0xffff_ffff) {
           throw new Error(`compile: input slot ${declaration.slot} is not an unsigned 32-bit integer`)
         }
+
         const existing = slots.get(declaration.slot)
+
         if (existing === undefined) {
           slots.set(declaration.slot, declaration)
         } else if (
@@ -722,10 +839,13 @@ export const createRuntimeAdapter = (
         }
       }
     }
+
     const ordered = [...slots].sort(([left], [right]) => left - right)
+
     for (let index = 0; index < ordered.length; index++) {
       if (ordered[index]![0] !== index) throw new Error("compile: input slots must be contiguous from zero")
     }
+
     return Object.freeze(ordered.flatMap(([, declaration]) =>
       declaration.kind === "scalar"
         ? []
@@ -742,31 +862,40 @@ export const createRuntimeAdapter = (
         }]
     ))
   }
+
   const nativeBinding = (
     handle: Runtime.ConcreteTensorHandle,
     expected: TensorBinding,
     index: number,
-    boundedBatch?: { readonly compiled: number; readonly active: number }
+    boundedBatch?: {
+      readonly compiled: number
+      readonly active: number
+    }
   ): NativeTensor => {
     const found = tensorRecord(handle, "execute", "execute")
+
     const shapeMatches = (actual: ReadonlyArray<number>, compiled: ReadonlyArray<number>): boolean =>
       sameShape(actual, compiled) ||
       (boundedBatch !== undefined && compiled.length > 0 && compiled[0] === boundedBatch.compiled &&
         actual.length === compiled.length && actual[0] === boundedBatch.active &&
         actual.slice(1).every((dimension, shapeIndex) => dimension === compiled[shapeIndex + 1]))
+
     const storageMatches = expected.storage === undefined
       ? handle.storage === undefined
       : handle.storage !== undefined && expected.storage.encoding === handle.storage.encoding &&
         expected.storage.physicalDtype === handle.storage.physicalDtype &&
         shapeMatches(handle.storage.physicalShape, expected.storage.physicalShape)
+
     if (
       found.kind !== "concrete-tensor" || found.value === undefined || handle.dtype !== expected.dtype ||
       !shapeMatches(handle.shape, expected.shape) || !storageMatches
     ) {
       throw new Error(`execute: tensor binding ${index} does not match its compiled logical declaration`)
     }
+
     return found.value
   }
+
   // Copy native diagnostics into recursively frozen public data. These values
   // are static artifact and planner measurements. Compile timings come from the
   // artifact, so cache hits retain the timings of the original structural-cache
@@ -778,6 +907,7 @@ export const createRuntimeAdapter = (
     state: Runtime.DecodeStateSchema | undefined
   ): Runtime.ExecutableHandle => {
     const nativeDiagnostics = value.diagnostics
+
     const diagnostics: Runtime.ExecutableDiagnostics = Object.freeze({
       ...nativeDiagnostics,
       instructions: Object.freeze(nativeDiagnostics.instructions.map((instruction) => Object.freeze(instruction))),
@@ -789,6 +919,7 @@ export const createRuntimeAdapter = (
     const handle = Object.freeze(
       state === undefined ? { diagnostics } : { state, diagnostics }
     ) as Runtime.ExecutableHandle
+
     handleRecords.set(handle, {
       owner,
       kind: "executable",
@@ -797,24 +928,68 @@ export const createRuntimeAdapter = (
         bindings,
         outputs,
         state
-      } satisfies ExecutableInfo,
+      },
       disposed: false
     })
     backendHandles.add(handle)
+
     return handle
   }
+
   const nativeExecutable = (
     handle: Runtime.ExecutableHandle,
     operation: string
   ): HandleRecord<"executable"> => record(handle, "executable", operation, "execute")
+
   const pool = (value: NativeKvPool, info: Omit<KvPoolInfo, "key">): Runtime.KvPoolHandle =>
-    wrapOpaque("kv-pool", value, { ...info, key: value } satisfies KvPoolInfo)
+    wrapOpaque("kv-pool", value, { ...info, key: value })
+
   const nativePool = (handle: Runtime.KvPoolHandle, operation: string): HandleRecord<"kv-pool"> =>
     record(handle, "kv-pool", operation, "execute")
+
   const sequence = (value: NativeKvSequence, pool: KvPoolInfo): Runtime.KvSequenceHandle =>
-    wrapOpaque("kv-sequence", value, { pool } satisfies KvSequenceInfo)
+    wrapOpaque("kv-sequence", value, { pool })
+
   const nativeSequence = (handle: Runtime.KvSequenceHandle, operation: string): HandleRecord<"kv-sequence"> =>
     record(handle, "kv-sequence", operation, "execute")
+
+  const nativePrefix = (handle: Runtime.KvPrefixHandle, operation: string): HandleRecord<"kv-prefix"> =>
+    record(handle, "kv-prefix", operation, "execute")
+
+  const prefix = (value: NativeKvPrefix, pool: KvPoolInfo): Runtime.KvPrefixHandle =>
+    wrapOpaque("kv-prefix", value, { pool }, { tokenCount: value.cursor, retainedBytes: value.retainedBytes })
+
+  const sameKvLayers = (pool: KvPoolInfo, schema: Runtime.DecodeStateSchema): boolean =>
+    pool.kvLayers === undefined
+      ? pool.layers === schema.layers && pool.kvHeads === schema.kvHeads && pool.headDim === schema.headDim &&
+        pool.dtype === schema.kvDtype
+      : Runtime.sameKvSchema(pool.kvLayers, schema.kvLayers)
+
+  const resolveReadOnlyState = (
+    schema: Runtime.DecodeStateSchema,
+    invocation: Runtime.ReadOnlyStateInvocation
+  ): Array<NativeKvPrefix> => {
+    const prefixes = invocation.prefixes.map((handle) => nativePrefix(handle, "execute"))
+
+    if (
+      schema.access !== "ReadOnly" || prefixes.length === 0 || prefixes.length > schema.batch ||
+      invocation.slots.length !== prefixes.length || invocation.activeMask.length !== schema.batch ||
+      invocation.validLengths.length !== schema.batch || new Set(invocation.slots).size !== prefixes.length ||
+      invocation.slots.some((slot) => !Number.isSafeInteger(slot) || slot < 0 || slot >= schema.batch) ||
+      invocation.activeMask.some((active, slot) => active !== invocation.slots.includes(slot)) ||
+      invocation.validLengths.some((length, slot) =>
+        !Number.isSafeInteger(length) || length < 0 || (invocation.activeMask[slot] ? length === 0 : length !== 0)
+      ) ||
+      prefixes.some(({ info }) =>
+        info.pool.key !== prefixes[0]!.info.pool.key || !sameKvLayers(info.pool, schema) ||
+        info.pool.maxTokens !== schema.maxTokens || info.pool.blockSize !== schema.blockSize ||
+        info.pool.kdaLayers !== 0 || info.pool.convLayers !== 0
+      )
+    ) throw invalidHandle("execute", "execute", "invalid-handle", "kv-prefix")
+
+    return prefixes.map(({ value }) => value)
+  }
+
   // Each element in a native result array transfers one owning wrapper. Reject
   // duplicates so two public handles cannot own the same wrapper. Cleanup is
   // best-effort because this path is already discarding the result.
@@ -827,6 +1002,7 @@ export const createRuntimeAdapter = (
       }
     }
   }
+
   const mapTensors = (
     values: ReadonlyArray<NativeTensor>,
     logical?: ExecutableInfo["outputs"]
@@ -834,11 +1010,14 @@ export const createRuntimeAdapter = (
     if (new Set(values).size !== values.length) {
       throw new Error("native runtime returned duplicate tensor ownership")
     }
+
     if (logical !== undefined && logical.length !== values.length) {
       throw new Error(`native runtime returned ${values.length} outputs, expected ${logical.length}`)
     }
+
     return values.map((value, index) => concreteHandle(value, logical?.[index]))
   }
+
   // Build a value-independent graph description for the addon's bounded cache.
   // Materialized leaves contribute signatures, not payloads. The native cache
   // revalidates generated bindings. With constantWeights, values become
@@ -847,17 +1026,26 @@ export const createRuntimeAdapter = (
   const executableCacheKey = (request: Runtime.CompileRequest): string | undefined => {
     const ids = new Map<object, number>()
     const nodes: Array<unknown> = []
+
     const visit = (handle: Runtime.TensorHandle): number | undefined => {
       const existing = ids.get(handle)
+
       if (existing !== undefined) return existing
+
       const found = tensorRecord(handle, "compile", "compile")
+
       if (found.structure === undefined) return undefined
+
       const inputs: Array<number> = []
+
       for (const input of found.structure.inputs) {
         const id = visit(input)
+
         if (id === undefined) return undefined
+
         inputs.push(id)
       }
+
       const id = nodes.length
       ids.set(handle, id)
       nodes.push({
@@ -868,22 +1056,30 @@ export const createRuntimeAdapter = (
         dtype: handle.dtype,
         device: handle.device
       })
+
       return id
     }
+
     const roots: Array<number> = []
+
     for (const root of request.roots) {
       const id = visit(root)
+
       if (id === undefined) return undefined
+
       roots.push(id)
     }
+
     const options = request.options === undefined
       ? undefined
       : {
         optimize: request.options.optimize,
         constantWeights: request.options.constantWeights
       }
+
     return structuralCacheKey({ nodes, roots, options, state: request.state })
   }
+
   // Map each public request variant to its native LazyTensor constructor or
   // method. Copy public arrays before they cross N-API. Check every input's
   // owner and validate native metadata before creating the opaque result handle.
@@ -897,9 +1093,11 @@ export const createRuntimeAdapter = (
           attributes: "attributes" in request ? request.attributes : {}
         }
         const operation = request.op
+
         switch (request.op) {
           case "constant": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
+
             return graph(
               native.LazyTensor.constant(
                 request.attributes.value,
@@ -910,6 +1108,7 @@ export const createRuntimeAdapter = (
           }
           case "zeros": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
+
             return graph(
               native.LazyTensor.zeros(
                 [...request.attributes.shape],
@@ -920,6 +1119,7 @@ export const createRuntimeAdapter = (
           }
           case "ones": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
+
             return graph(
               native.LazyTensor.ones(
                 [...request.attributes.shape],
@@ -930,6 +1130,7 @@ export const createRuntimeAdapter = (
           }
           case "full": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
+
             return graph(
               native.LazyTensor.full(
                 [...request.attributes.shape],
@@ -986,13 +1187,16 @@ export const createRuntimeAdapter = (
             )
           case "input": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
+
             const storage = request.attributes.storage
+
             if (
               storage !== undefined &&
               (request.attributes.dtype !== "f32" || !Runtime.validEncodedStorage(request.attributes.shape, storage))
             ) {
               throw new Error("input: encoded storage does not match its logical GGML geometry")
             }
+
             return lazyHandle(
               native.LazyTensor.input(
                 request.attributes.slot,
@@ -1151,6 +1355,31 @@ export const createRuntimeAdapter = (
                   : request.attributes.window
               )
             )
+          case "scaledDotProductAttentionConfigured":
+            return graph(
+              nativeGraph(request.inputs[0], operation).scaledDotProductAttentionConfigured(
+                nativeGraph(request.inputs[1], operation),
+                nativeGraph(request.inputs[2], operation),
+                request.attributes.scale,
+                request.attributes.causal,
+                request.attributes.window === undefined
+                  ? -1
+                  : request.attributes.window === null
+                  ? 0
+                  : request.attributes.window,
+                request.attributes.rounding,
+                request.attributes.layerId,
+                request.attributes.retentionWindow === null ? -1 : request.attributes.retentionWindow
+              )
+            )
+          case "rotaryEmbeddingExplicit":
+            return graph(
+              nativeGraph(request.inputs[0], operation).rotaryEmbeddingExplicit(
+                nativeGraph(request.inputs[1], operation),
+                nativeGraph(request.inputs[2], operation),
+                request.attributes.layout
+              )
+            )
           case "kdaChunk":
             return graph(
               nativeGraph(request.inputs[0], operation).kdaChunk(
@@ -1200,6 +1429,13 @@ export const createRuntimeAdapter = (
           case "expertLinearRows":
             return graph(
               nativeGraph(request.inputs[0], operation).expertLinearRows(
+                nativeGraph(request.inputs[1], operation),
+                nativeGraph(request.inputs[2], operation)
+              )
+            )
+          case "groupedExpertLinearRows":
+            return graph(
+              nativeGraph(request.inputs[0], operation).groupedExpertLinearRows(
                 nativeGraph(request.inputs[1], operation),
                 nativeGraph(request.inputs[2], operation)
               )
@@ -1326,6 +1562,7 @@ export const createRuntimeAdapter = (
           case "sgdOut":
             return graph(nativeGraph(request.inputs[0], operation).sgdOut(request.attributes.index))
         }
+
         const unhandled: never = request
         void unhandled
         throw new Runtime.BackendError({
@@ -1340,24 +1577,30 @@ export const createRuntimeAdapter = (
       catch: (error) => {
         pendingStructure = undefined
         pendingDeclarations = undefined
+
         return backendErrorFor(request.op, "graph")(error)
       }
     })
+
   const mapCompileOptions = (
     options: Runtime.ExecutableCompileOptions | undefined
   ): NativeCompileOptions | undefined => {
     if (options === undefined) return undefined
+
     return {
       optimize: options.optimize,
       constantWeights: options.constantWeights
     }
   }
+
   const uint32 = (value: number, name: string, allowZero: boolean): number => {
     if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1) || value > 0xffff_ffff) {
       throw new Error(`compile: ${name} must be ${allowZero ? "a non-negative" : "a positive"} uint32`)
     }
+
     return value
   }
+
   const mapStateRequest = (
     state: Runtime.DecodeStateRequest | undefined
   ):
@@ -1368,7 +1611,9 @@ export const createRuntimeAdapter = (
     | undefined =>
   {
     if (state === undefined) return undefined
+
     const request: Runtime.DecodeStateRequest = {
+      access: state.access,
       maxTokens: uint32(state.maxTokens, "state.maxTokens", false),
       blockSize: uint32(state.blockSize, "state.blockSize", false),
       kvDtype: state.kvDtype,
@@ -1393,6 +1638,7 @@ export const createRuntimeAdapter = (
     return {
       request,
       native: {
+        access: request.access,
         maxTokens: request.maxTokens,
         blockSize: request.blockSize,
         kvDtype: nativeDtype(request.kvDtype),
@@ -1413,6 +1659,7 @@ export const createRuntimeAdapter = (
       }
     }
   }
+
   const completeStateSchema = (
     value: Executable,
     requested: Runtime.DecodeStateRequest | undefined
@@ -1420,8 +1667,11 @@ export const createRuntimeAdapter = (
     if (value.stateful !== (requested !== undefined)) {
       throw new Error("compile: native executable statefulness disagrees with the requested state")
     }
+
     if (!value.stateful) return undefined
+
     const state = requested!
+
     const geometry = {
       batch: value.batch,
       layers: value.layers,
@@ -1435,15 +1685,19 @@ export const createRuntimeAdapter = (
       convChannels: value.convChannels,
       convKernel: value.convKernel
     }
+
     for (const [name, inferred] of Object.entries(geometry)) {
       uint32(inferred, `native ${name}`, name !== "batch")
     }
+
     if (geometry.batch !== state.batch) {
       throw new Error(
         `compile: native batch ${geometry.batch} disagrees with requested batch ${state.batch}`
       )
     }
+
     const nativePackedRows = value.packedRowsPerSequence ?? undefined
+
     if (
       nativePackedRows !== state.packedCausalChains?.rowsPerSequence ||
       (nativePackedRows !== undefined &&
@@ -1452,10 +1706,20 @@ export const createRuntimeAdapter = (
     ) {
       throw new Error("compile: native packed causal-chain layout disagrees with the requested state")
     }
+
     if (!Predicate.isBoolean(value.allowsWindowEviction)) {
       throw new Error("compile: native executable returned an invalid window eviction policy")
     }
+
     return Object.freeze({
+      access: state.access,
+      kvLayers: Object.freeze(value.kvLayers.map((layer) =>
+        Object.freeze({
+          ...layer,
+          dtype: dtype(layer.dtype),
+          retentionWindow: layer.retentionWindow ?? null
+        })
+      )),
       maxTokens: state.maxTokens,
       blockSize: state.blockSize,
       kvDtype: state.kvDtype,
@@ -1473,6 +1737,7 @@ export const createRuntimeAdapter = (
       ...geometry
     })
   }
+
   const executionError = (
     message: string,
     reason: Runtime.BackendError["reason"] = "execution-failed"
@@ -1485,6 +1750,7 @@ export const createRuntimeAdapter = (
       message,
       details: { device }
     })
+
   // A stateful invocation mutably borrows distinct sequences from one compatible
   // pool. Before native execution stages its transactional updates, the adapter
   // checks the completed compile schema, token-row shape, and non-windowed
@@ -1514,11 +1780,18 @@ export const createRuntimeAdapter = (
       if (invocation !== undefined) {
         throw executionError("execute: stateless executable does not accept state")
       }
+
       return [undefined, undefined, undefined, undefined, undefined, undefined]
     }
+
     if (invocation === undefined) {
       throw executionError("execute: stateful executable requires state")
     }
+
+    if (invocation.access !== "Append" || schema.access !== "Append") {
+      throw executionError("execute: append execution requires an append state binding")
+    }
+
     if (
       invocation.sequences.length === 0 ||
       invocation.sequences.length > schema.batch ||
@@ -1532,9 +1805,11 @@ export const createRuntimeAdapter = (
         `execute: expected 1..=${schema.batch} sequences with one token row each`
       )
     }
+
     const sequenceRecords = invocation.sequences.map((handle) => nativeSequence(handle, "execute"))
     const sequenceInfos = sequenceRecords.map((entry) => entry.info)
     const firstPool = sequenceInfos[0]!.pool
+
     if (
       sequenceInfos.some((entry) => entry.pool.key !== firstPool.key) ||
       new Set(invocation.sequences).size !== sequenceRecords.length ||
@@ -1549,10 +1824,7 @@ export const createRuntimeAdapter = (
       invocation.tokens.some((row, index) => row.length !== invocation.advances[invocation.slots[index]!]!) ||
       firstPool.maxTokens !== schema.maxTokens ||
       firstPool.blockSize !== schema.blockSize ||
-      firstPool.dtype !== schema.kvDtype ||
-      firstPool.layers !== schema.layers ||
-      firstPool.kvHeads !== schema.kvHeads ||
-      firstPool.headDim !== schema.headDim ||
+      !sameKvLayers(firstPool, schema) ||
       firstPool.kdaLayers !== schema.kdaLayers ||
       firstPool.kdaHeads !== schema.kdaHeads ||
       firstPool.kdaHeadDim !== schema.kdaHeadDim ||
@@ -1563,6 +1835,7 @@ export const createRuntimeAdapter = (
     ) {
       throw invalidHandle("execute", "execute", "invalid-handle", "kv-sequence")
     }
+
     if (
       invocation.tokens.some((row) => row.length === 0) ||
       invocation.tokens.some((row) =>
@@ -1571,12 +1844,16 @@ export const createRuntimeAdapter = (
     ) {
       throw executionError("execute: invalid token rows for compiled state schema")
     }
+
     if (
-      schema.window === undefined &&
+      (schema.kvLayers.length === 0
+        ? schema.window === undefined
+        : schema.kvLayers.some((layer) => layer.retentionWindow === null)) &&
       sequenceRecords.some((entry, index) => entry.value.cursor + invocation.tokens[index]!.length > schema.maxTokens)
     ) {
       throw executionError(`execute: sequence context exceeds pool capacity ${schema.maxTokens}`)
     }
+
     return [
       sequenceRecords.map((entry) => entry.value),
       [...invocation.slots],
@@ -1586,36 +1863,63 @@ export const createRuntimeAdapter = (
       invocation.tokens.map((row) => [...row])
     ]
   }
+
   const resolveExecutableInvocation = (
     handle: Runtime.ExecutableHandle,
     invocation: Runtime.ExecutionInvocation
   ) => {
     const executableRecord = nativeExecutable(handle, "execute")
+
     if (Object.keys(invocation.runtimeValues).length !== 0) {
       throw executionError(
         "execute: runtime values are not supported by the Apple Metal backend",
         "unsupported-operation"
       )
     }
+
     const info = executableRecord.info
+
     if (invocation.bindings.length !== info.bindings.length) {
       throw executionError(
         `execute: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
       )
     }
+
     const inputs = invocation.bindings.map((input, index) => nativeBinding(input, info.bindings[index]!, index))
+
     if (info.state !== undefined && invocation.scalars.length !== 0) {
       throw executionError("execute: stateful executable does not accept scalar inputs")
     }
+
+    if (invocation.state?.access === "ReadOnly") {
+      if (info.state === undefined) throw executionError("execute: stateless executable does not accept state")
+
+      return {
+        executable: executableRecord.value,
+        info,
+        inputs,
+        scalars: [],
+        prefixes: resolveReadOnlyState(info.state, invocation.state),
+        slots: [...invocation.state.slots],
+        activeMask: [...invocation.state.activeMask],
+        validLengths: [...invocation.state.validLengths],
+        sequences: undefined,
+        advances: undefined,
+        tokens: undefined
+      }
+    }
+
     const [sequences, slots, activeMask, validLengths, advances, tokens] = resolveExecutionState(
       info.state,
       invocation.state
     )
+
     return {
       executable: executableRecord.value,
       info,
       inputs,
       scalars: [...invocation.scalars],
+      prefixes: undefined,
       sequences,
       slots,
       activeMask,
@@ -1624,6 +1928,7 @@ export const createRuntimeAdapter = (
       tokens
     }
   }
+
   // Pools own fixed KV slabs, prefix-cache state, and recurrent geometry.
   // Sequence wrappers retain KV block references and per-sequence recurrent
   // tensors. releaseSequence invalidates the public sequence and returns its
@@ -1650,9 +1955,15 @@ export const createRuntimeAdapter = (
                 convChannels: options.convChannels,
                 convKernel: options.convKernel
               },
-              deviceOrdinal
+              deviceOrdinal,
+              options.kvLayers?.map((layer) => ({
+                ...layer,
+                dtype: nativeDtype(layer.dtype),
+                retentionWindow: layer.retentionWindow ?? undefined
+              }))
             ),
             {
+              kvLayers: options.kvLayers?.map((layer) => Object.freeze({ ...layer })),
               layers: options.layers,
               kvHeads: options.kvHeads,
               headDim: options.headDim,
@@ -1674,9 +1985,49 @@ export const createRuntimeAdapter = (
       Effect.try({
         try: () => {
           const poolRecord = nativePool(handle, "makeKvSequence")
+
           return sequence(poolRecord.value.makeSequence(), poolRecord.info)
         },
         catch: backendErrorFor("makeKvSequence", "execute")
+      }),
+    snapshot: (handle) =>
+      Effect.try({
+        try: () => {
+          const entry = nativeSequence(handle, "snapshotKvSequence")
+
+          return prefix(entry.value.snapshot(), entry.info.pool)
+        },
+        catch: backendErrorFor("snapshotKvSequence", "execute")
+      }),
+    fork: (handle) =>
+      Effect.try({
+        try: () => {
+          const entry = nativePrefix(handle, "forkKvPrefix")
+
+          return sequence(entry.value.fork(), entry.info.pool)
+        },
+        catch: backendErrorFor("forkKvPrefix", "execute")
+      }),
+    releasePrefix: (handle) =>
+      Effect.try({
+        try: () => {
+          const entry = nativePrefix(handle, "releaseKvPrefix")
+          entry.value.release()
+          entry.disposed = true
+        },
+        catch: backendErrorFor("releaseKvPrefix", "execute")
+      }),
+    inspectPrefix: (handle) =>
+      Effect.try({
+        try: () => {
+          const inspection = nativePrefix(handle, "inspectKvPrefix").value.inspect()
+
+          return {
+            ...inspection,
+            layers: inspection.layers.map((layer) => ({ ...layer, dtype: dtype(layer.dtype) }))
+          }
+        },
+        catch: backendErrorFor("inspectKvPrefix", "execute")
       }),
     prefillMatch: (handle, tokens) =>
       Effect.try({
@@ -1699,6 +2050,7 @@ export const createRuntimeAdapter = (
         catch: backendErrorFor("releaseSequence", "execute")
       })
   }
+
   const sampling: Runtime.SamplingRuntime = {
     sample: (handle, options) =>
       cancellableFor(
@@ -1720,6 +2072,9 @@ export const createRuntimeAdapter = (
         "execute",
         (token) => {
           const resolved = resolveExecutableInvocation(handle, invocation)
+
+          if (resolved.prefixes !== undefined) throw executionError("executeDecode: requires append state")
+
           return resolved.executable.executeSampled(
             resolved.inputs,
             resolved.sequences ?? [],
@@ -1740,12 +2095,15 @@ export const createRuntimeAdapter = (
         (token) => {
           const target = nativeExecutable(request.targetVerify, "executeSpeculative").value
           const proposer = nativeExecutable(request.proposerDecode, "executeSpeculative").value
+
           const targetSequences = request.targetSequences.map((handle) =>
             nativeSequence(handle, "executeSpeculative").value
           )
+
           const proposerSequences = request.proposerSequences.map((handle) =>
             nativeSequence(handle, "executeSpeculative").value
           )
+
           return target.executeSpeculative(
             proposer,
             targetSequences,
@@ -1761,6 +2119,7 @@ export const createRuntimeAdapter = (
         }
       )
   }
+
   const normalizedInferenceSampling = (
     base: Runtime.InferenceSamplingOptions,
     override: Runtime.InferenceSamplingOverrides | undefined,
@@ -1772,6 +2131,7 @@ export const createRuntimeAdapter = (
       topP: override?.topP ?? base.topP,
       seed: override?.seed ?? base.seed
     }
+
     if (
       !Number.isFinite(value.temperature) || value.temperature < 0 ||
       !Number.isSafeInteger(value.topK) || value.topK < 0 ||
@@ -1780,14 +2140,18 @@ export const createRuntimeAdapter = (
     ) {
       throw new Error(`${operation}: invalid inference sampling controls`)
     }
+
     return Object.freeze(value)
   }
+
   const nativeInferenceSampling = (
     value: Runtime.InferenceSamplingOptions
   ): NativeInferenceSamplingOptions => ({ ...value })
+
   const nativeInferenceOverride = (
     value: Runtime.InferenceSamplingOverrides | undefined
   ): NativeInferenceSamplingOverride => value === undefined ? {} : { ...value }
+
   const inferenceArtifact = (
     value: NativeInferenceArtifact,
     sampling: Runtime.InferenceSamplingOptions
@@ -1797,8 +2161,9 @@ export const createRuntimeAdapter = (
       value,
       {
         sampling
-      } satisfies InferenceArtifactInfo
+      }
     )
+
   const inferenceSession = (
     value: NativeInferenceSession,
     artifact: Runtime.InferenceArtifactHandle,
@@ -1811,25 +2176,32 @@ export const createRuntimeAdapter = (
         artifact,
         sampling,
         sequences: new Map()
-      } satisfies InferenceSessionInfo
+      }
     )
+
   const mapInferenceResult = (
     sessionHandle: Runtime.InferenceSessionHandle,
     nativeSession: NativeInferenceSession,
     result: NativeInferenceRoundResult,
-    expected: { readonly count: number; readonly ids?: ReadonlyArray<bigint> },
+    expected: {
+      readonly count: number
+      readonly ids?: ReadonlyArray<bigint>
+    },
     newSampling?: ReadonlyArray<Runtime.InferenceSamplingOptions>
   ): Runtime.InferenceRoundResult => {
     const sessionRecord = record(sessionHandle, "inference-session", "inferenceResult", "execute")
     const sessionInfo = sessionRecord.info
+
     if (
       !Predicate.isBigInt(result.roundId) || result.roundId < 0n || result.roundId > 0xffff_ffff_ffff_ffffn ||
       !Predicate.isBoolean(result.recovered) || !Array.isArray(result.pages) || result.pages.length !== expected.count
     ) {
       throw new Error("inference[publish]: native runtime returned a malformed receipt")
     }
+
     const seen = new Set<bigint>()
     const additions: Array<readonly [bigint, Runtime.InferenceSequenceHandle]> = []
+
     const pages = result.pages.map((page, index): Runtime.InferenceTokenPage => {
       if (
         !Predicate.isBigInt(page.sequenceId) || page.sequenceId < 0n || page.sequenceId > 0xffff_ffff_ffff_ffffn ||
@@ -1840,12 +2212,15 @@ export const createRuntimeAdapter = (
       ) {
         throw new Error("inference[publish]: native runtime returned a malformed token page")
       }
+
       seen.add(page.sequenceId)
       let handle = sessionInfo.sequences.get(page.sequenceId)
       const sampling = newSampling?.[index]
+
       if (handle !== undefined && newSampling !== undefined) {
         const existing = record(handle, "inference-sequence", "inferenceResult", "execute")
           .info
+
         if (
           !result.recovered || sampling === undefined || existing.sampling.temperature !== sampling.temperature ||
           existing.sampling.topK !== sampling.topK || existing.sampling.topP !== sampling.topP ||
@@ -1857,10 +2232,13 @@ export const createRuntimeAdapter = (
         if (sampling === undefined) {
           throw new Error("inference[publish]: native runtime returned an unknown sequence")
         }
+
         const nativeSequence = nativeSession.sequence(page.sequenceId)
+
         if (nativeSequence.sequenceId !== page.sequenceId) {
           throw new Error("inference[publish]: native sequence identity is not canonical")
         }
+
         handle = wrapOpaque(
           "inference-sequence",
           nativeSequence,
@@ -1868,10 +2246,11 @@ export const createRuntimeAdapter = (
             session: sessionHandle,
             sequenceId: page.sequenceId,
             sampling
-          } satisfies InferenceSequenceInfo
+          }
         )
         additions.push([page.sequenceId, handle])
       }
+
       return Object.freeze({
         sequence: handle,
         sequenceId: page.sequenceId,
@@ -1879,44 +2258,59 @@ export const createRuntimeAdapter = (
         stopReason: page.stopReason
       })
     })
+
     const mapped = Object.freeze({
       roundId: result.roundId,
       recovered: result.recovered,
       pages: Object.freeze(pages)
     })
+
     for (const [sequenceId, handle] of additions) sessionInfo.sequences.set(sequenceId, handle)
+
     return mapped
   }
+
   const inference: Runtime.InferenceRuntime = {
     compile: (request) =>
       Effect.try({
         try: () => {
           const sampling = normalizedInferenceSampling(request.sampling, undefined, "inference[compile]")
+
           const targetPrefills = request.target.prefill.map((handle) =>
             record(handle, "executable", "inferenceCompile", "compile").value
           )
+
           const targetPrefill = targetPrefills[targetPrefills.length - 1]!
           const targetPrefillBuckets = targetPrefills.slice(0, -1)
           const targetDecode = record(request.target.decode, "executable", "inferenceCompile", "compile")
+
           const targetVerify = (request.target.verify ?? []).map((handle) =>
             record(handle, "executable", "inferenceCompile", "compile").value
           )
+
           const targetPool = record(request.target.pool, "kv-pool", "inferenceCompile", "compile")
+
           const proposerPrefill = request.proposer === undefined
             ? undefined
             : record(request.proposer.prefill, "executable", "inferenceCompile", "compile")
+
           const proposerDecode = request.proposer === undefined
             ? undefined
             : record(request.proposer.decode, "executable", "inferenceCompile", "compile")
+
           const proposerPool = request.proposer === undefined
             ? undefined
             : record(request.proposer.pool, "kv-pool", "inferenceCompile", "compile")
+
           const generalized = request.generalizedProposer
+
           const valueRef = (route: Runtime.InferenceValueRoute): NativeValueRef => {
             switch (route.kind) {
               case "TargetHidden": {
                 const tap = generalized?.plan.hiddenTaps.find((tap) => tap.outputRoot === route.targetOutput)
+
                 if (tap === undefined) throw new Error("inference[compile]: target hidden route has no tap contract")
+
                 return {
                   kind: route.kind,
                   name: tap.name,
@@ -1927,7 +2321,9 @@ export const createRuntimeAdapter = (
               case "SharedLmHead": {
                 const kind = route.kind === "SharedTokenEmbedding" ? "TokenEmbedding" : "LmHead"
                 const binding = generalized?.plan.sharedTensors.findIndex((candidate) => candidate.kind === kind) ?? -1
+
                 if (binding < 0) throw new Error(`inference[compile]: ${route.kind} route has no shared binding`)
+
                 return { kind: "SharedBinding", binding }
               }
               case "StageOutput":
@@ -1939,6 +2335,7 @@ export const createRuntimeAdapter = (
                 return { kind: route.kind }
             }
           }
+
           const nativePlan: NativeProposerPlan | undefined = generalized === undefined
             ? undefined
             : {
@@ -2023,16 +2420,21 @@ export const createRuntimeAdapter = (
                 },
               trainedMaxRows: generalized.plan.trainedMaxRows
             }
+
           const stageExecutables = generalized?.stageExecutables.map((executable) =>
             record(executable, "executable", "inferenceCompile", "compile").value
           )
+
           const sharedTargetTensors = generalized?.sharedTensors.map((tensor) =>
             nativeTensor(tensor, "inferenceCompile", "compile")
           )
+
           const replay = generalized?.replay
+
           const replayPrefills = replay?.prefill.map((handle) =>
             record(handle, "executable", "inferenceCompile", "compile").value
           )
+
           return inferenceArtifact(
             new native.NativeInferenceArtifact(
               targetPrefill,
@@ -2072,6 +2474,7 @@ export const createRuntimeAdapter = (
         try: () => {
           const artifactRecord = record(artifactHandle, "inference-artifact", "inferenceOpen", "execute")
           const info = artifactRecord.info
+
           return inferenceSession(
             artifactRecord.value.open(),
             artifactHandle,
@@ -2082,6 +2485,7 @@ export const createRuntimeAdapter = (
       }),
     add: (sessionHandle, request) => {
       let resolved: InferenceAddResolution
+
       try {
         const sessionRecord = record(sessionHandle, "inference-session", "inferenceAdd", "execute")
         const info = sessionRecord.info
@@ -2095,6 +2499,7 @@ export const createRuntimeAdapter = (
       } catch (error) {
         return Effect.fail(backendErrorFor("inferenceAdd", "execute")(error))
       }
+
       return cancellableFor(
         "inferenceAdd",
         "execute",
@@ -2126,6 +2531,7 @@ export const createRuntimeAdapter = (
     },
     runRound: (sessionHandle, request) => {
       let resolved: InferenceRoundResolution
+
       try {
         const sessionRecord = record(sessionHandle, "inference-session", "inferenceRound", "execute")
         resolved = {
@@ -2133,14 +2539,17 @@ export const createRuntimeAdapter = (
           sequences: request.entries.map((entry) => {
             const sequenceRecord = record(entry.sequence, "inference-sequence", "inferenceRound", "execute")
             const info = sequenceRecord.info
+
             if (info.session !== sessionHandle) {
               throw invalidHandle("inferenceRound", "execute", "invalid-handle", "inference-sequence")
             }
+
             return sequenceRecord.value
           }),
           sampling: request.entries.map((entry) => {
             const info = record(entry.sequence, "inference-sequence", "inferenceRound", "execute")
               .info
+
             return normalizedInferenceSampling(info.sampling, entry.sampling, "inference[admission]")
           }),
           ids: request.entries.map((entry) =>
@@ -2151,6 +2560,7 @@ export const createRuntimeAdapter = (
       } catch (error) {
         return Effect.fail(backendErrorFor("inferenceRound", "execute")(error))
       }
+
       return cancellableFor(
         "inferenceRound",
         "execute",
@@ -2189,17 +2599,22 @@ export const createRuntimeAdapter = (
       Effect.try({
         try: () => {
           const sessionRecord = record(sessionHandle, "inference-session", "inferenceFinish", "execute")
+
           const records = sequences.map((sequence) => {
             const found = record(sequence, "inference-sequence", "inferenceFinish", "execute")
+
             if (found.info.session !== sessionHandle) {
               throw invalidHandle("inferenceFinish", "execute", "invalid-handle", "inference-sequence")
             }
+
             return found
           })
+
           sessionRecord.value.finish(
             records.map((found) => found.value)
           )
           const info = sessionRecord.info
+
           for (const found of records) {
             found.disposed = true
             info.sequences.delete(found.info.sequenceId)
@@ -2212,17 +2627,21 @@ export const createRuntimeAdapter = (
         try: () => {
           const sessionRecord = record(sessionHandle, "inference-session", "inferenceInspect", "execute")
           const sequenceRecord = record(sequenceHandle, "inference-sequence", "inferenceInspect", "execute")
+
           if (sequenceRecord.info.session !== sessionHandle) {
             throw invalidHandle("inferenceInspect", "execute", "invalid-handle", "inference-sequence")
           }
+
           const inspected = sessionRecord.value.inspect(
             sequenceRecord.value
           )
+
           if (
             inspected.terminal !== undefined && inspected.terminal !== "eos" && inspected.terminal !== "maxTokens"
           ) {
             throw new Error("inference[inspect]: native runtime returned a malformed inspection")
           }
+
           return Object.freeze({
             sequenceId: inspected.sequenceId,
             cursor: inspected.cursor,
@@ -2235,6 +2654,7 @@ export const createRuntimeAdapter = (
       Effect.try({
         try: () => {
           const sessionRecord = handleRecords.get(sessionHandle)
+
           if (sessionRecord?.owner !== owner || sessionRecord.kind !== "inference-session") {
             throw invalidHandle(
               "inferenceClose",
@@ -2243,13 +2663,18 @@ export const createRuntimeAdapter = (
               "inference-session"
             )
           }
+
           if (sessionRecord.disposed) return
+
           sessionRecord.value.close()
           const info = sessionRecord.info
+
           for (const sequence of info.sequences.values()) {
             const found = handleRecords.get(sequence)
+
             if (found !== undefined) found.disposed = true
           }
+
           info.sequences.clear()
           sessionRecord.disposed = true
         },
@@ -2261,9 +2686,11 @@ export const createRuntimeAdapter = (
           const artifactRecord = record(artifactHandle, "inference-artifact", "inferenceDiagnostics", "execute")
           const value = artifactRecord.value.inferenceDiagnostics
           const phase = value.lastFailurePhase
+
           if (phase !== undefined && !isInferenceFailurePhase(phase)) {
             throw new Error("inference[inspect]: native runtime returned an invalid failure phase")
           }
+
           return Object.freeze({
             roundsStarted: value.roundsStarted,
             roundsCompleted: value.roundsCompleted,
@@ -2287,6 +2714,7 @@ export const createRuntimeAdapter = (
         catch: backendErrorFor("inferenceDiagnostics", "execute")
       })
   }
+
   // Saving to a path borrows tensors. Successful loads transfer new native
   // tensors to concrete handles owned by the caller. Safetensors cannot represent
   // the adapter's logical-f32 data backed by packed-u8 GGML storage, so the
@@ -2365,13 +2793,17 @@ export const createRuntimeAdapter = (
           Effect.try({
             try: () => {
               const values = archive.entries.map((entry) => entry.tensor)
+
               try {
                 const mapped = mapTensors(values)
                 const metadata: Record<string, string> = Object.create(null)
+
                 for (const [key, value] of Object.entries(archive.metadata)) {
                   if (!Predicate.isString(value)) throw new Error(`invalid safetensors metadata ${key}`)
+
                   metadata[key] = value
                 }
+
                 return {
                   entries: archive.entries.map((entry, index) => ({ name: entry.name, tensor: mapped[index]! })),
                   metadata: Object.freeze(metadata)
@@ -2386,6 +2818,7 @@ export const createRuntimeAdapter = (
         )
       )
   }
+
   // N-API passes each GGUF metadata entry through one populated scalar or array
   // field because generated object declarations cannot express the native tagged
   // union.
@@ -2393,52 +2826,69 @@ export const createRuntimeAdapter = (
     if (!Predicate.isString(entry.key) || entry.key.length === 0 || !Predicate.isString(entry.kind)) {
       throw new Error("native GGUF metadata entry is invalid")
     }
+
     const numericKinds = ["u8", "i8", "u16", "i16", "u32", "i32", "f32", "u64", "i64", "f64"]
     const candidates: Array<Runtime.GgufMetadataScalar | ReadonlyArray<Runtime.GgufMetadataScalar>> = []
+
     if (entry.numberValue !== undefined) {
       if (!numericKinds.includes(entry.kind) || !Predicate.isNumber(entry.numberValue)) {
         throw new Error("invalid GGUF number metadata")
       }
+
       candidates.push(entry.numberValue)
     }
+
     if (entry.stringValue !== undefined) {
       if (entry.kind !== "string" || !Predicate.isString(entry.stringValue)) {
         throw new Error("invalid GGUF string metadata")
       }
+
       candidates.push(entry.stringValue)
     }
+
     if (entry.booleanValue !== undefined) {
       if (entry.kind !== "bool" || !Predicate.isBoolean(entry.booleanValue)) {
         throw new Error("invalid GGUF boolean metadata")
       }
+
       candidates.push(entry.booleanValue)
     }
+
     if (entry.numberArray !== undefined) {
       if (!numericKinds.includes(entry.kind) || !entry.numberArray.every(Predicate.isNumber)) {
         throw new Error("invalid GGUF number array metadata")
       }
+
       candidates.push(Object.freeze([...entry.numberArray]))
     }
+
     if (entry.stringArray !== undefined) {
       if (entry.kind !== "string" || !entry.stringArray.every(Predicate.isString)) {
         throw new Error("invalid GGUF string array metadata")
       }
+
       candidates.push(Object.freeze([...entry.stringArray]))
     }
+
     if (entry.booleanArray !== undefined) {
       if (entry.kind !== "bool" || !entry.booleanArray.every(Predicate.isBoolean)) {
         throw new Error("invalid GGUF boolean array metadata")
       }
+
       candidates.push(Object.freeze([...entry.booleanArray]))
     }
+
     if (candidates.length !== 1) {
       throw new Error(`native GGUF metadata ${entry.key} has invalid value fields`)
     }
+
     return Object.freeze({ key: entry.key, value: candidates[0]! })
   }
+
   const ggufDescriptor = (value: NativeGgufTensorDescriptor): Runtime.GgufTensorDescriptor => {
     const format = value.format
     const encoded = format !== "F32"
+
     if (
       !Predicate.isString(value.name) || value.name.length === 0 || !isGgufFormat(format) ||
       value.logicalDtype !== "f32" || value.physicalDtype !== (encoded ? "u8" : "f32") ||
@@ -2454,6 +2904,7 @@ export const createRuntimeAdapter = (
     ) {
       throw new Error("native GGUF tensor descriptor is invalid")
     }
+
     return Object.freeze({
       name: value.name,
       format,
@@ -2463,6 +2914,7 @@ export const createRuntimeAdapter = (
       physicalDtype: value.physicalDtype
     })
   }
+
   // Inspection returns validated metadata and logical and physical descriptors,
   // but no payloads. Loading streams supported F32 and K-quant payloads to Metal
   // shared storage. Quantized handles retain logical f32 metadata over packed u8
@@ -2500,12 +2952,15 @@ export const createRuntimeAdapter = (
           Effect.try({
             try: () => {
               const values = archive.entries.map((entry) => entry.tensor)
+
               try {
                 if (new Set(values).size !== values.length) {
                   throw new Error("native runtime returned duplicate tensor ownership")
                 }
+
                 const entries = archive.entries.map((entry) => {
                   const descriptor = ggufDescriptor(entry.descriptor)
+
                   const storage: Runtime.EncodedTensorStorage | undefined = descriptor.format === "F32"
                     ? undefined
                     : {
@@ -2513,6 +2968,7 @@ export const createRuntimeAdapter = (
                       physicalShape: descriptor.physicalShape,
                       physicalDtype: "u8"
                     }
+
                   return Object.freeze({
                     descriptor,
                     tensor: concreteHandle(entry.tensor, {
@@ -2522,6 +2978,7 @@ export const createRuntimeAdapter = (
                     })
                   })
                 })
+
                 return Object.freeze({ entries: Object.freeze(entries) })
               } catch (error) {
                 clearBuffers(values)
@@ -2533,6 +2990,7 @@ export const createRuntimeAdapter = (
         )
       )
   }
+
   const runtime: Runtime.RuntimeService = {
     identity: owner,
     backend: { name: backendName },
@@ -2547,6 +3005,7 @@ export const createRuntimeAdapter = (
         try: () => {
           pendingStructure = undefined
           pendingDeclarations = undefined
+
           return nativeGraph(root, "exposures").exposures().map((entry) => ({
             name: entry.name,
             tensor: graph(entry.tensor)
@@ -2559,16 +3018,19 @@ export const createRuntimeAdapter = (
         try: () => {
           pendingStructure = undefined
           const declarations = tensorRecord(loss, "grad", "autodiff").declarations
+
           return native.grad(
             nativeGraph(loss, "grad", "autodiff"),
             wrt.map((target) => nativeGraph(target, "grad", "autodiff"))
           ).map((value) => {
             pendingDeclarations = declarations
+
             return graph(value)
           })
         },
         catch: (error) => {
           pendingDeclarations = undefined
+
           return backendErrorFor("grad", "autodiff")(error)
         }
       }),
@@ -2583,10 +3045,12 @@ export const createRuntimeAdapter = (
           if (!Array.isArray(request.roots) || request.roots.length === 0) {
             throw new Error("compile: expected at least one root")
           }
+
           const bindings = executableBindings(request.roots)
           const roots = request.roots.map((root) => nativeGraph(root, "compile", "compile"))
           const options = mapCompileOptions(request.options)
           const state = mapStateRequest(request.state)
+
           const value = native.compileForDevice(
             roots,
             options,
@@ -2594,19 +3058,25 @@ export const createRuntimeAdapter = (
             executableCacheKey(request),
             deviceOrdinal
           )
+
           const outputs = request.roots.flatMap((root, index) => {
             const base = {
               dtype: root.dtype,
               storage: root.storage
             }
+
             const selection = state?.request.outputSelections?.[index]
               ?? (state?.request.lastTokenRow === true ? "splitLastTokenRow" : "allRows")
+
             if (selection === "allRows") return [{ shape: root.shape, ...base }]
+
             if (selection === "batchedLastTokenRow") {
               return [{ shape: [state!.request.batch, root.shape[2]!], ...base }]
             }
+
             return Array.from({ length: state!.request.batch }, () => ({ shape: [root.shape[2]!], ...base }))
           })
+
           return executable(value, bindings, outputs, completeStateSchema(value, state?.request))
         },
         catch: backendErrorFor("compile", "compile", "compilation-failed")
@@ -2622,6 +3092,18 @@ export const createRuntimeAdapter = (
         "execute",
         (token) => {
           const resolved = resolveExecutableInvocation(handle, invocation)
+
+          if (resolved.prefixes !== undefined) {
+            return resolved.executable.executeReadOnly(
+              resolved.inputs,
+              resolved.prefixes,
+              resolved.slots,
+              resolved.activeMask,
+              resolved.validLengths,
+              token
+            )
+          }
+
           return resolved.executable.execute(
             resolved.inputs,
             resolved.scalars,
@@ -2664,6 +3146,7 @@ export const createRuntimeAdapter = (
       Effect.try({
         try: () => {
           const tensor = handleRecords.get(handle)
+
           if (tensor === undefined) {
             throw invalidHandle(
               "clear",
@@ -2674,13 +3157,17 @@ export const createRuntimeAdapter = (
               "concrete-tensor"
             )
           }
+
           if (tensor.owner !== owner) {
             throw invalidHandle("clear", "execute", "foreign-handle", "concrete-tensor")
           }
+
           if (tensor.kind !== "concrete-tensor" || tensor.value === undefined) {
             throw invalidHandle("clear", "execute", "invalid-handle", "concrete-tensor")
           }
+
           if (tensor.disposed) return
+
           const value = tensor.value
           value.clear()
           tensor.disposed = true
@@ -2700,5 +3187,6 @@ export const createRuntimeAdapter = (
       }
     }
   }
+
   return runtime
 }

@@ -12,6 +12,7 @@ import type {
   NativeGgufMetadataEntry,
   NativeGgufTensorDescriptor,
   NativeKvPool,
+  NativeKvPrefix,
   NativeKvSequence,
   NativeKvStateSchema,
   NativeTensor
@@ -43,19 +44,34 @@ interface ExecutableRecord {
 type HandleRecord = TensorRecord | ExecutableRecord
 
 const records = new WeakMap<object, HandleRecord>()
+
 interface PoolRecord {
   readonly value: NativeKvPool
   readonly options: Parameters<Runtime.DecodeRuntime["makePool"]>[0]
 }
+
 interface SequenceRecord {
   readonly value: NativeKvSequence
   readonly pool: PoolRecord
   disposed: boolean
 }
+
 const poolRecords = new WeakMap<object, PoolRecord>()
+
 const sequenceRecords = new WeakMap<object, SequenceRecord>()
+
+interface PrefixRecord {
+  readonly owner: object
+  readonly value: NativeKvPrefix
+  readonly pool: PoolRecord
+  disposed: boolean
+}
+
+const prefixRecords = new WeakMap<object, PrefixRecord>()
+
 interface InferenceArtifactRecord {
   readonly request: Runtime.InferenceCompileRequest
+  readonly retainedSharedTensors: ReadonlyArray<NativeTensor>
   readonly diagnostics: {
     roundsStarted: bigint
     roundsCompleted: bigint
@@ -70,6 +86,7 @@ interface InferenceArtifactRecord {
     lastRoundId?: bigint | undefined
   }
 }
+
 interface InferenceSessionRecord {
   readonly artifact: InferenceArtifactRecord
   readonly sequences: Map<bigint, InferenceSequenceRecord>
@@ -79,12 +96,14 @@ interface InferenceSessionRecord {
   nextRoundId: bigint
   closed: boolean
 }
+
 interface TokenBindingRecord {
   readonly value: NativeTensor
   readonly shape: ReadonlyArray<number>
   readonly dtype: "u32" | "i64"
   inUse: boolean
 }
+
 interface InferenceSequenceRecord {
   readonly session: InferenceSessionRecord
   readonly id: bigint
@@ -100,15 +119,22 @@ interface InferenceSequenceRecord {
   terminal?: "eos" | "maxTokens" | undefined
   finished: boolean
 }
+
 const inferenceArtifactRecords = new WeakMap<object, InferenceArtifactRecord>()
+
 const inferenceSessionRecords = new WeakMap<object, InferenceSessionRecord>()
+
 const inferenceSequenceRecords = new WeakMap<object, InferenceSequenceRecord>()
+
 const backendHandlesKey = Symbol.for("@effect-torch/backend-handles")
+
 interface BackendHandleRegistry {
   [backendHandlesKey]?: WeakSet<object>
 }
+
 // SAFETY: backend adapters reserve this global symbol for a WeakSet<object>.
 const registry = globalThis as typeof globalThis & BackendHandleRegistry
+
 const backendHandles = registry[backendHandlesKey] ??= new WeakSet<object>()
 
 const opaqueHandle = <H extends object>(): H => {
@@ -123,7 +149,9 @@ const errorFor = (
 ) =>
 (cause: unknown): Runtime.BackendError => {
   if (cause instanceof Runtime.BackendError) return cause
+
   const message = cause instanceof Error ? cause.message : String(cause)
+
   const reason: Runtime.BackendError["reason"] = message.includes("only f32") || message.includes("dtype")
     ? "unsupported-dtype"
     : message.includes("not supported")
@@ -131,6 +159,7 @@ const errorFor = (
     : message.includes("cleared")
     ? "invalid-handle"
     : fallback
+
   return new Runtime.BackendError({
     reason,
     backend: backendName,
@@ -166,46 +195,63 @@ const cancellable = <A>(
     const token = new native.CancellationToken()
     let lateValue: A | undefined
     let hasLateValue = false
+
     const clearLateValue = () => {
       if (!hasLateValue) return
+
       hasLateValue = false
+
       try {
         // SAFETY: hasLateValue is set only after lateValue receives a resolved A.
         clearLate?.(lateValue as A)
       } catch {
         // The interrupted caller cannot observe cleanup failure.
       }
+
       lateValue = undefined
     }
+
     const abort = () => {
       token.cancel()
-      if (token.cancelled) clearLateValue()
+      // Native completion can win cancellation before Effect receives the result.
+      // An interrupted fiber still cannot take ownership of that result.
+      clearLateValue()
     }
+
     if (signal.aborted) abort()
     else signal.addEventListener("abort", abort, { once: true })
+
     let pending: Promise<A>
+
     try {
       pending = run(token)
     } catch (cause) {
       signal.removeEventListener("abort", abort)
       resume(Effect.fail(errorFor(operation, phase, "execution-failed")(cause)))
+
       return
     }
+
     pending.then(
       (value) => {
-        if (signal.aborted && token.cancelled) {
+        if (signal.aborted) {
           lateValue = value
           hasLateValue = true
           clearLateValue()
+
           return
         }
+
         lateValue = value
         hasLateValue = true
         resume(Effect.suspend(() => {
           signal.removeEventListener("abort", abort)
+
           if (!hasLateValue) return Effect.interrupt
+
           hasLateValue = false
           lateValue = undefined
+
           return Effect.succeed(value)
         }))
       },
@@ -225,6 +271,7 @@ const dtype = (value: string): Runtime.DType => {
     value === "f64" || value === "f32" || value === "f16" || value === "bf16" || value === "i64" ||
     value === "u32" || value === "u8"
   ) return value
+
   throw new Error(`native CUDA runtime returned unsupported dtype ${value}`)
 }
 
@@ -251,24 +298,31 @@ const tensorStorage = (
   storage: LazyTensor["storage"]
 ): Runtime.EncodedTensorStorage | undefined => {
   if (storage.representation === "dense" && storage.format === undefined) return undefined
+
   if (storage.representation !== "packed" || !Runtime.isTensorStorageEncoding(storage.format)) {
     throw new Error("native runtime returned an unsupported storage representation")
   }
+
   const geometry = Runtime.encodedStorageGeometry(storage.format, shape)
+
   if (geometry === undefined) throw new Error("native runtime returned invalid packed tensor geometry")
+
   return { encoding: storage.format, physicalShape: geometry.physicalShape, physicalDtype: "u8" }
 }
 
 /** Builds the backend-neutral service around one native CUDA runtime. @internal */
 export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number): Runtime.RuntimeService => {
   const owner = {}
+
   const placement: Runtime.Placement = Object.freeze({
     id: `cuda:${deviceOrdinal}`,
     deviceType: "cuda",
     description: `NVIDIA CUDA device ${deviceOrdinal}`,
     ordinal: deviceOrdinal
   })
+
   const runtime: CudaRuntime = new native.CudaRuntime(deviceOrdinal)
+
   const capabilities: Runtime.Capabilities = Object.freeze({
     dtypes: ["f64", "f32", "f16", "bf16", "i64", "u32", "u8"] as const,
     features: [] as const
@@ -282,9 +336,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     storage?: Runtime.EncodedTensorStorage
   ): H => {
     if (!validShape(shape)) throw new Error(`native CUDA runtime returned invalid shape [${shape}]`)
+
     if (nativeDevice !== placement.id) {
       throw new Error(`native CUDA runtime returned placement ${nativeDevice}, expected ${placement.id}`)
     }
+
     if (storage !== undefined && (tensorDtype !== "f32" || !Runtime.validEncodedStorage(shape, storage))) {
       throw new Error("native CUDA runtime returned invalid encoded tensor metadata")
     }
@@ -317,6 +373,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     }
   ): Runtime.LazyTensorHandle => {
     const storage = tensorStorage(graph.shape, graph.storage)
+
     if (
       logical !== undefined &&
       (!sameShape(graph.shape, logical.shape) || graph.dtype !== logical.dtype ||
@@ -324,6 +381,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     ) {
       throw new Error("native CUDA runtime returned tensor metadata inconsistent with its logical declaration")
     }
+
     const handle = tensorObject<Runtime.LazyTensorHandle>(
       "LazyTensor",
       graph.shape,
@@ -331,8 +389,10 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       graph.device,
       storage
     )
+
     records.set(handle, { owner, kind: "lazy", graph, disposed: false })
     backendHandles.add(handle)
+
     return handle
   }
 
@@ -345,6 +405,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     }
   ): Runtime.ConcreteTensorHandle => {
     const storage = tensorStorage(value.shape, value.storage)
+
     if (
       logical !== undefined &&
       (!sameShape(value.shape, logical.shape) || value.dtype !== logical.dtype ||
@@ -352,6 +413,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     ) {
       throw new Error("native CUDA runtime returned tensor metadata inconsistent with its logical declaration")
     }
+
     const handle = tensorObject<Runtime.ConcreteTensorHandle>(
       "Tensor",
       value.shape,
@@ -359,9 +421,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       value.device,
       storage
     )
+
     const graph = runtime.fromMaterialized(value)
     records.set(handle, { owner, kind: "concrete", graph, value, disposed: false })
     backendHandles.add(handle)
+
     return handle
   }
 
@@ -379,7 +443,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       : operation === "release"
       ? "shutdown"
       : "graph"
+
     const found = records.get(handle)
+
     if (found?.owner !== owner) {
       throw new Runtime.BackendError({
         reason: backendHandles.has(handle) ? "foreign-handle" : "invalid-handle",
@@ -389,6 +455,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         message: `${operation}: tensor handle is not owned by this CUDA runtime`
       })
     }
+
     if (found.kind === "executable" || (concrete && found.kind !== "concrete")) {
       throw new Runtime.BackendError({
         reason: "invalid-handle",
@@ -398,6 +465,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         message: `${operation}: tensor handle has the wrong kind`
       })
     }
+
     if (found.disposed) {
       throw new Runtime.BackendError({
         reason: "invalid-handle",
@@ -407,11 +475,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         message: `${operation}: tensor handle was cleared`
       })
     }
+
     return found
   }
 
   const executableRecord = (handle: Runtime.ExecutableHandle, operation: string): ExecutableRecord => {
     const found = records.get(handle)
+
     if (found?.owner !== owner || found.kind !== "executable") {
       throw new Runtime.BackendError({
         reason: found === undefined && !backendHandles.has(handle) ? "invalid-handle" : "foreign-handle",
@@ -421,11 +491,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         message: `${operation}: executable handle is not owned by this CUDA runtime`
       })
     }
+
     return found
   }
 
   const nativePool = (handle: Runtime.KvPoolHandle, operation: string): PoolRecord => {
     const found = poolRecords.get(handle)
+
     if (found === undefined) {
       throw new Runtime.BackendError({
         reason: backendHandles.has(handle) ? "foreign-handle" : "invalid-handle",
@@ -435,11 +507,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         message: `${operation}: KV pool is not owned by this CUDA runtime`
       })
     }
+
     return found
   }
 
   const nativeSequence = (handle: Runtime.KvSequenceHandle, operation: string): SequenceRecord => {
     const found = sequenceRecords.get(handle)
+
     if (found === undefined || found.disposed) {
       throw new Runtime.BackendError({
         reason: found === undefined && backendHandles.has(handle) ? "foreign-handle" : "invalid-handle",
@@ -449,11 +523,29 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         message: `${operation}: KV sequence is not live in this CUDA runtime`
       })
     }
+
+    return found
+  }
+
+  const nativePrefix = (handle: Runtime.KvPrefixHandle, operation: string): PrefixRecord => {
+    const found = prefixRecords.get(handle)
+
+    if (found === undefined || found.owner !== owner || found.disposed) {
+      throw new Runtime.BackendError({
+        reason: found?.disposed ? "invalid-handle" : backendHandles.has(handle) ? "foreign-handle" : "invalid-handle",
+        backend: backendName,
+        operation,
+        phase: "execute",
+        message: `${operation}: KV prefix is not live in this CUDA runtime`
+      })
+    }
+
     return found
   }
 
   // SAFETY: core and N-API expose the same string values for these decode enums.
   const nativeState = (state: Runtime.DecodeStateRequest): NativeKvStateSchema => ({
+    access: state.access,
     maxTokens: state.maxTokens,
     blockSize: state.blockSize,
     kvDtype: state.kvDtype,
@@ -478,9 +570,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     operation: string
   ): InferenceArtifactRecord => {
     const found = inferenceArtifactRecords.get(handle)
+
     if (found === undefined) {
       throw new Error(`${operation}: inference artifact is not owned by this CUDA runtime`)
     }
+
     return found
   }
 
@@ -489,9 +583,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     operation: string
   ): InferenceSessionRecord => {
     const found = inferenceSessionRecords.get(handle)
+
     if (found === undefined || found.closed) {
       throw new Error(`${operation}: inference session is not live`)
     }
+
     return found
   }
 
@@ -501,9 +597,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     operation: string
   ): InferenceSequenceRecord => {
     const found = inferenceSequenceRecords.get(handle)
+
     if (found === undefined || found.session !== session || found.finished) {
       throw new Error(`${operation}: inference sequence is not live in this session`)
     }
+
     return found
   }
 
@@ -530,37 +628,46 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
   ): ReadonlyArray<number> => {
     for (let width = Math.min(maximum, history.length - 1); width >= minimum; width--) {
       const suffix = history.slice(-width)
+
       for (let start = history.length - width - 1; start >= 0; start--) {
         if (suffix.every((token, index) => history[start + index] === token)) {
           return history.slice(start + width, start + width + limit)
         }
       }
     }
+
     return []
   }
 
   const readTokens = async (handle: Runtime.ConcreteTensorHandle, token: CancellationToken): Promise<Array<number>> => {
     const record = handleRecord(handle, "inferenceAdd", true)
+
     const promptLength = handle.shape.length === 1
       ? handle.shape[0]
       : handle.shape.length === 2 && handle.shape[0] === 1
       ? handle.shape[1]
       : undefined
+
     if (promptLength === undefined || (handle.dtype !== "u32" && handle.dtype !== "i64")) {
       throw new Error("inferenceAdd: prompt must be a [T] or [1, T] u32 or i64 tensor")
     }
+
     const bytes = await record.value!.readback(token)
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     const values = new Array<number>(promptLength)
+
     for (let index = 0; index < values.length; index++) {
       const value = handle.dtype === "u32"
         ? view.getUint32(index * 4, true)
         : Number(view.getBigInt64(index * 8, true))
+
       if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
         throw new Error(`inferenceAdd: prompt token ${value} is outside u32 range`)
       }
+
       values[index] = value
     }
+
     return values
   }
 
@@ -572,26 +679,33 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
   ): Promise<TokenBindingRecord> => {
     const bytes = new Uint8Array(values.length * (tokenDtype === "u32" ? 4 : 8))
     const view = new DataView(bytes.buffer)
+
     for (let index = 0; index < values.length; index++) {
       if (tokenDtype === "u32") view.setUint32(index * 4, values[index]!, true)
       else view.setBigInt64(index * 8, BigInt(values[index]!), true)
     }
+
     const cached = session.tokenBindings.find((binding) =>
       !binding.inUse && binding.dtype === tokenDtype &&
       binding.shape.length === shape.length && binding.shape.every((dimension, index) => dimension === shape[index])
     )
+
     if (cached !== undefined) {
       cached.value.writeBytes(bytes)
       cached.inUse = true
+
       return cached
     }
+
     const binding: TokenBindingRecord = {
       value: runtime.uploadBytes(bytes, [...shape], tokenDtype),
       shape: [...shape],
       dtype: tokenDtype,
       inUse: true
     }
+
     session.tokenBindings.push(binding)
+
     return binding
   }
 
@@ -605,26 +719,36 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     readonly token: CancellationToken
   }): Promise<ReadonlyArray<number> | undefined> => {
     const state = options.executable.state
+
     if (state === undefined) throw new Error("inference: executable is not stateful")
+
     const width = options.executable.sourceShapes[0]?.at(-2)
+
     if (width === undefined) throw new Error("inference: executable has no token width")
+
     const values = new Array<number>(state.batch * width).fill(0)
     const activeMask = new Array<boolean>(state.batch).fill(false)
     const validLengths = new Array<number>(state.batch).fill(0)
+
     for (let request = 0; request < options.sequences.length; request++) {
       const slot = options.slots[request]!
       const row = options.tokenRows[request]!
+
       if (slot < 0 || slot >= state.batch || row.length === 0 || row.length > width) {
         throw new Error("inference: invalid active slot or token chunk")
       }
+
       activeMask[slot] = true
       validLengths[slot] = row.length
       values.splice(slot * width, row.length, ...row)
     }
+
     const session = options.sequences[0]!.session
     const binding = await uploadTokens(values, [state.batch, width], options.tokenDtype, session)
+
     try {
       const nativeSequences = options.sequences.map((sequence) => sequence.target)
+
       if (options.sampling !== undefined) {
         return await options.executable.value.executeSampled(
           [binding.value],
@@ -638,6 +762,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           options.token
         )
       }
+
       const outputs = await options.executable.value.executeStateful(
         [binding.value],
         nativeSequences,
@@ -648,7 +773,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         options.tokenRows.map((row) => [...row]),
         options.token
       )
+
       for (const output of outputs) output.clear()
+
       return undefined
     } finally {
       binding.inUse = false
@@ -663,26 +790,38 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     readonly tokenDtype: "u32" | "i64"
     readonly sampling?: ReadonlyArray<Runtime.SamplingOptions> | undefined
     readonly token: CancellationToken
-  }): Promise<{ readonly sampled?: ReadonlyArray<number>; readonly outputs: ReadonlyArray<NativeTensor> }> => {
+  }): Promise<{
+    readonly sampled?: ReadonlyArray<number>
+    readonly outputs: ReadonlyArray<NativeTensor>
+  }> => {
     const state = options.executable.state
+
     if (state === undefined) throw new Error("inference: executable is not stateful")
+
     const width = options.executable.sourceShapes[0]?.at(-2)
+
     if (width === undefined) throw new Error("inference: executable has no token width")
+
     const values = new Array<number>(state.batch * width).fill(0)
     const activeMask = new Array<boolean>(state.batch).fill(false)
     const validLengths = new Array<number>(state.batch).fill(0)
+
     for (let request = 0; request < options.sequences.length; request++) {
       const slot = options.slots[request]!
       const row = options.tokenRows[request]!
+
       if (slot < 0 || slot >= state.batch || row.length === 0 || row.length > width) {
         throw new Error("inference: invalid active slot or token chunk")
       }
+
       activeMask[slot] = true
       validLengths[slot] = row.length
       values.splice(slot * width, row.length, ...row)
     }
+
     const session = options.sequences[0]!.session
     const binding = await uploadTokens(values, [state.batch, width], options.tokenDtype, session)
+
     try {
       const outputs = await options.executable.value.executeStateful(
         [binding.value],
@@ -694,13 +833,17 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         options.tokenRows.map((row) => [...row]),
         options.token
       )
+
       try {
         const sampled = options.sampling === undefined
           ? undefined
           : await Promise.all(options.slots.map((slot, request) => {
             const output = outputs[slot]
+
             if (output === undefined) throw new Error("inference: target logits lane is missing")
+
             const sampling = options.sampling![request]!
+
             return output.sample(
               sampling.temperature,
               sampling.topK,
@@ -710,9 +853,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               options.token
             )
           }))
+
         return sampled === undefined ? { outputs } : { sampled, outputs }
       } catch (cause) {
         for (const output of outputs) output.clear()
+
         throw cause
       }
     } finally {
@@ -730,14 +875,18 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     readonly token: CancellationToken
   }): Promise<void> => {
     const state = options.executable.state
+
     if (state === undefined) throw new Error("inference: replay executable is not stateful")
+
     const activeMask = new Array<boolean>(state.batch).fill(false)
     const validLengths = new Array<number>(state.batch).fill(0)
+
     for (let request = 0; request < options.sequences.length; request++) {
       const slot = options.slots[request]!
       activeMask[slot] = true
       validLengths[slot] = options.lengths[request]!
     }
+
     const outputs = await options.executable.value.executeStateful(
       [...options.bindings],
       [...options.sequences],
@@ -748,6 +897,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       options.tokens.map((row) => [...row]),
       options.token
     )
+
     for (const output of outputs) output.clear()
   }
 
@@ -759,7 +909,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
   ): ReadonlyArray<NativeTensor> =>
     taps.map((tap) => {
       const output = outputs[tap.outputRoot + (splitLogits ? batch - 1 : 0)]
+
       if (output === undefined) throw new Error("inference: hidden tap " + tap.name + " is missing")
+
       return output
     })
 
@@ -773,23 +925,32 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     readonly token: CancellationToken
   }): Promise<ReadonlyArray<ReadonlyArray<number>>> => {
     const state = options.executable.state
+
     if (state === undefined) throw new Error("inference: executable is not stateful")
+
     const width = options.executable.sourceShapes[0]?.at(-2)
+
     if (width !== 1 || options.tokens.length !== options.sequences.length) {
       throw new Error("inference: multi-step decode requires one token per sequence")
     }
+
     const values = new Array<number>(state.batch).fill(0)
     const activeMask = new Array<boolean>(state.batch).fill(false)
     const validLengths = new Array<number>(state.batch).fill(0)
+
     for (let request = 0; request < options.sequences.length; request++) {
       const slot = options.slots[request]!
+
       if (slot < 0 || slot >= state.batch) throw new Error("inference: invalid active slot")
+
       activeMask[slot] = true
       validLengths[slot] = 1
       values[slot] = options.tokens[request]!
     }
+
     const session = options.sequences[0]!.session
     const binding = await uploadTokens(values, [state.batch, 1], options.tokenDtype, session)
+
     try {
       return await options.executable.value.executeSampledSteps(
         [binding.value],
@@ -814,14 +975,20 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     if (state === undefined) {
       return roots.map((root) => ({ shape: root.shape, dtype: root.dtype, storage: root.storage }))
     }
+
     const selections = state.outputSelections ?? roots.map(() => state.lastTokenRow ? "splitLastTokenRow" : "allRows")
+
     return roots.flatMap((root, index) => {
       const selection = selections[index]
+
       if (selection === "allRows") return [{ shape: root.shape, dtype: root.dtype }]
+
       const width = root.shape[root.shape.length - 1]!
+
       if (selection === "batchedLastTokenRow") {
         return [{ shape: [state.batch, width], dtype: root.dtype }]
       }
+
       return Array.from({ length: state.batch }, () => ({ shape: [width], dtype: root.dtype }))
     })
   }
@@ -830,6 +997,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     Effect.try({
       try: () => {
         const inputs = request.inputs.map((input) => handleRecord(input, request.op).graph)
+
         switch (request.op) {
           case "constant":
             if (inputs.length > 1) throw new Error("constant: expected zero or one tensor input")
@@ -852,12 +1020,14 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             )
           case "input": {
             const storage = request.attributes.storage
+
             if (
               storage !== undefined &&
               (request.attributes.dtype !== "f32" || !Runtime.validEncodedStorage(request.attributes.shape, storage))
             ) {
               throw new Error("input: encoded storage does not match its logical GGML geometry")
             }
+
             return lazyHandle(
               runtime.graphNode(
                 "input",
@@ -876,6 +1046,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           }
           default: {
             const attributes = "attributes" in request ? request.attributes : {}
+
             return lazyHandle(runtime.graphNode(request.op, inputs, JSON.stringify(attributes)))
           }
         }
@@ -903,11 +1074,17 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               convLayers: options.convLayers,
               convChannels: options.convChannels,
               convKernel: options.convKernel
-            }
+            },
+            options.kvLayers?.map((layer) => ({ ...layer, retentionWindow: layer.retentionWindow ?? undefined }))
           )
+
           const handle = opaqueHandle<Runtime.KvPoolHandle>()
-          poolRecords.set(handle, { value, options: { ...options } })
+          poolRecords.set(handle, {
+            value,
+            options: { ...options, kvLayers: options.kvLayers?.map((layer) => Object.freeze({ ...layer })) }
+          })
           backendHandles.add(handle)
+
           return handle
         },
         catch: errorFor("makeKvPool", "execute", "execution-failed")
@@ -920,9 +1097,62 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           const sequence = opaqueHandle<Runtime.KvSequenceHandle>()
           sequenceRecords.set(sequence, { value, pool, disposed: false })
           backendHandles.add(sequence)
+
           return sequence
         },
         catch: errorFor("makeKvSequence", "execute", "execution-failed")
+      }),
+    snapshot: (handle) =>
+      Effect.try({
+        try: () => {
+          const entry = nativeSequence(handle, "snapshotKvSequence")
+          const value = entry.value.snapshot()
+          // SAFETY: immutable prefix handles are validated through prefixRecords.
+          const prefix = Object.freeze({
+            tokenCount: value.cursor,
+            retainedBytes: value.retainedBytes
+          }) as Runtime.KvPrefixHandle
+
+          prefixRecords.set(prefix, { owner, value, pool: entry.pool, disposed: false })
+          backendHandles.add(prefix)
+
+          return prefix
+        },
+        catch: errorFor("snapshotKvSequence", "execute", "execution-failed")
+      }),
+    fork: (handle) =>
+      Effect.try({
+        try: () => {
+          const entry = nativePrefix(handle, "forkKvPrefix")
+          const value = entry.value.fork()
+          const sequence = opaqueHandle<Runtime.KvSequenceHandle>()
+          sequenceRecords.set(sequence, { value, pool: entry.pool, disposed: false })
+          backendHandles.add(sequence)
+
+          return sequence
+        },
+        catch: errorFor("forkKvPrefix", "execute", "execution-failed")
+      }),
+    releasePrefix: (handle) =>
+      Effect.try({
+        try: () => {
+          const entry = nativePrefix(handle, "releaseKvPrefix")
+          entry.value.release()
+          entry.disposed = true
+        },
+        catch: errorFor("releaseKvPrefix", "execute", "execution-failed")
+      }),
+    inspectPrefix: (handle) =>
+      Effect.try({
+        try: () => {
+          const inspection = nativePrefix(handle, "inspectKvPrefix").value.inspect()
+
+          return {
+            ...inspection,
+            layers: inspection.layers.map((layer) => ({ ...layer, dtype: dtype(layer.dtype) }))
+          }
+        },
+        catch: errorFor("inspectKvPrefix", "execute", "execution-failed")
       }),
     prefillMatch: (handle, tokens) =>
       Effect.try({
@@ -944,6 +1174,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         catch: errorFor("releaseSequence", "execute", "execution-failed")
       })
   }
+
   const inference: Runtime.InferenceRuntime = {
     compile: (request) =>
       Effect.try({
@@ -951,6 +1182,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           if (request.batchSize < 1 || request.target.prefill.length === 0) {
             throw new Error("inferenceCompile: batch size and prefill programs must be nonzero")
           }
+
           for (
             const executable of [...request.target.prefill, request.target.decode, ...(request.target.verify ?? [])]
           ) {
@@ -958,14 +1190,18 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               throw new Error("inferenceCompile: target programs must be stateful")
             }
           }
+
           nativePool(request.target.pool, "inferenceCompile")
+
           if (request.proposer !== undefined) {
             executableRecord(request.proposer.prefill, "inferenceCompile")
             executableRecord(request.proposer.decode, "inferenceCompile")
             nativePool(request.proposer.pool, "inferenceCompile")
           }
+
           if (request.generalizedProposer !== undefined) {
             const generalized = request.generalizedProposer
+
             if (generalized.plan.stages[0]?.operationId === "HistoryLookup") {
               if (
                 generalized.plan.stages.length !== 1 ||
@@ -989,9 +1225,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               ) {
                 throw new Error("inferenceCompile: CUDA requires one replayable ParallelBlock proposer")
               }
+
               for (const shared of generalized.sharedTensors) {
                 handleRecord(shared, "inferenceCompile", true)
               }
+
               for (
                 const executable of [
                   ...generalized.stageExecutables,
@@ -1004,11 +1242,16 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                   throw new Error("inferenceCompile: proposer and replay programs must be stateful")
                 }
               }
+
               nativePool(generalized.replay.pool, "inferenceCompile")
             }
           }
+
           const record: InferenceArtifactRecord = {
             request,
+            retainedSharedTensors: request.generalizedProposer?.sharedTensors.map((shared) =>
+              handleRecord(shared, "inferenceCompile", true).value!.retain()
+            ) ?? [],
             diagnostics: {
               roundsStarted: 0n,
               roundsCompleted: 0n,
@@ -1022,9 +1265,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               acceptedLengthHistogram: []
             }
           }
+
           const handle = opaqueHandle<Runtime.InferenceArtifactHandle>()
           inferenceArtifactRecords.set(handle, record)
           backendHandles.add(handle)
+
           return handle
         },
         catch: errorFor("inferenceCompile", "compile", "compilation-failed")
@@ -1033,6 +1278,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       Effect.try({
         try: () => {
           const artifact = inferenceArtifact(handle, "inferenceOpen")
+
           const record: InferenceSessionRecord = {
             artifact,
             sequences: new Map(),
@@ -1042,9 +1288,11 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             nextRoundId: 1n,
             closed: false
           }
+
           const session = opaqueHandle<Runtime.InferenceSessionHandle>()
           inferenceSessionRecords.set(session, record)
           backendHandles.add(session)
+
           return session
         },
         catch: errorFor("inferenceOpen", "execute", "execution-failed")
@@ -1057,31 +1305,40 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         async (token) => {
           const session = inferenceSession(handle, "inferenceAdd")
           const artifact = session.artifact.request
+
           if (request.entries.length === 0 || session.sequences.size + request.entries.length > artifact.batchSize) {
             throw new Error(`inferenceAdd: session accepts at most ${artifact.batchSize} live sequences`)
           }
+
           const prompts = await Promise.all(request.entries.map((entry) => readTokens(entry.prompt, token)))
+
           if (prompts.some((prompt) => prompt.length === 0)) {
             throw new Error("inferenceAdd: prompts must be nonempty")
           }
+
           const pool = nativePool(artifact.target.pool, "inferenceAdd")
           const generalized = artifact.generalizedProposer
+
           const proposerPool = generalized?.replay === undefined
             ? undefined
             : nativePool(generalized.replay.pool, "inferenceAdd")
+
           const staged: Array<InferenceSequenceRecord> = []
+
           try {
             for (let index = 0; index < request.entries.length; index++) {
               const entry = request.entries[index]!
               const id = session.nextSequenceId + BigInt(index)
               const sequenceHandle = opaqueHandle<Runtime.InferenceSequenceHandle>()
               const defaults = artifact.sampling
+
               const sampling: Runtime.InferenceSamplingOptions = {
                 temperature: entry.sampling?.temperature ?? defaults.temperature,
                 topK: entry.sampling?.topK ?? defaults.topK,
                 topP: entry.sampling?.topP ?? defaults.topP,
                 seed: entry.sampling?.seed ?? defaults.seed
               }
+
               const sequence: InferenceSequenceRecord = {
                 session,
                 id,
@@ -1096,10 +1353,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 generated: 0,
                 finished: false
               }
+
               staged.push(sequence)
               let offset = 0
+
               while (offset < prompts[index]!.length) {
                 const remaining = prompts[index]!.length - offset
+
                 const programs = artifact.target.prefill
                   .map((executable, program) => ({
                     executable: executableRecord(executable, "inferenceAdd"),
@@ -1110,16 +1370,20 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                   .sort((left, right) =>
                     left.executable.sourceShapes[0]!.at(-2)! - right.executable.sourceShapes[0]!.at(-2)!
                   )
+
                 const selected = programs.find((program) => program.executable.sourceShapes[0]!.at(-2)! >= remaining)
                   ?? programs[programs.length - 1]!
+
                 const executable = selected.executable
                 const width = executable.sourceShapes[0]!.at(-2)!
                 const length = Math.min(width, remaining)
                 const row = prompts[index]!.slice(offset, offset + length)
                 const final = offset + length === prompts[index]!.length
+
                 const sampling = final
                   ? [resolvedSampling(sequence.sampling, undefined, sequence.id, 0)]
                   : undefined
+
                 if (selected.replay === undefined) {
                   const sampled = await runStateBatch({
                     executable,
@@ -1130,6 +1394,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                     sampling,
                     token
                   })
+
                   if (sampled !== undefined) sequence.pending = sampled[0]!
                 } else {
                   const result = await runStateBatchWithOutputs({
@@ -1141,6 +1406,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                     sampling,
                     token
                   })
+
                   try {
                     const taps = generalized!.plan.prefillHiddenTaps ?? generalized!.plan.hiddenTaps
                     await runReplay({
@@ -1152,15 +1418,19 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                       tokens: [row],
                       token
                     })
+
                     if (result.sampled !== undefined) sequence.pending = result.sampled[0]!
                   } finally {
                     for (const output of result.outputs) output.clear()
                   }
                 }
+
                 offset += length
               }
+
               sequence.generated = 1
               sequence.history.push(sequence.pending)
+
               if (sequence.eos.has(sequence.pending)) sequence.terminal = "eos"
               else if (sequence.maxTokens !== undefined && sequence.generated >= sequence.maxTokens) {
                 sequence.terminal = "maxTokens"
@@ -1171,16 +1441,21 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               sequence.target.release()
               sequence.proposer?.release()
             }
+
             throw cause
           }
+
           session.nextSequenceId += BigInt(staged.length)
+
           for (const sequence of staged) {
             session.sequences.set(sequence.id, sequence)
             inferenceSequenceRecords.set(sequence.handle, sequence)
             backendHandles.add(sequence.handle)
           }
+
           const roundId = session.nextRoundId++
           session.receipts.add(roundId)
+
           const pages = staged.map((sequence) => ({
             sequence: sequence.handle,
             sequenceId: sequence.id,
@@ -1188,12 +1463,14 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             terminal: sequence.terminal,
             stopReason: sequence.terminal
           }))
+
           const diagnostics = session.artifact.diagnostics
           diagnostics.roundsStarted++
           diagnostics.roundsCompleted++
           diagnostics.ordinaryRounds++
           diagnostics.emittedTokens += BigInt(staged.length)
           diagnostics.lastRoundId = roundId
+
           return { roundId, recovered: false, pages }
         }
       ),
@@ -1204,29 +1481,39 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         "execute",
         async (token) => {
           const session = inferenceSession(handle, "inferenceRound")
+
           if (request.entries.length === 0 || request.entries.length > session.artifact.request.batchSize) {
             throw new Error("inferenceRound: invalid active sequence count")
           }
+
           const entries = request.entries.map((entry) => ({
             sequence: inferenceSequence(session, entry.sequence, "inferenceRound"),
             sampling: entry.sampling
           }))
+
           if (new Set(entries.map((entry) => entry.sequence)).size !== entries.length) {
             throw new Error("inferenceRound: sequences must be distinct")
           }
+
           const artifact = session.artifact.request
           const draftStarted = performance.now()
           const speculative = artifact.proposer !== undefined || artifact.generalizedProposer !== undefined
+
           const draftLimit = artifact.proposer?.maxDraftTokens
             ?? artifact.generalizedProposer?.maxDraftTokens
             ?? 0
+
           const decode = executableRecord(artifact.target.decode, "inferenceRound")
+
           const historyLookup = artifact.generalizedProposer?.plan.stages
             .find((stage) => stage.operationId === "HistoryLookup")
             ?.historyLookup
+
           const historyDrafts = new Map<InferenceSequenceRecord, ReadonlyArray<number>>()
+
           const limits = new Map(entries.map(({ sequence }) => {
             let limit = speculative ? draftLimit + 1 : 1
+
             if (historyLookup !== undefined) {
               const draft = historyDraft(
                 sequence.history,
@@ -1234,20 +1521,26 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 historyLookup.maxMatchTokens,
                 draftLimit
               )
+
               historyDrafts.set(sequence, draft)
               limit = draft.length + 1
             }
+
             if (sequence.maxTokens !== undefined) {
               limit = Math.min(limit, Math.max(0, sequence.maxTokens - sequence.generated))
             }
+
             if (decode.state?.window === undefined) {
               limit = Math.min(limit, Math.max(0, decode.state!.maxTokens - sequence.target.cursor))
             }
+
             return [sequence, limit] as const
           }))
+
           if (entries.some(({ sequence }) => sequence.terminal === undefined && limits.get(sequence) === 0)) {
             throw new Error("inferenceRound: sequence context exceeds pool capacity")
           }
+
           const pages = new Map<InferenceSequenceRecord, Array<number>>()
           const diagnostics = session.artifact.diagnostics
           diagnostics.roundsStarted++
@@ -1255,6 +1548,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           let verificationNanos = 0n
           let acceptedCandidates: number | undefined
           const roundSteps = Math.max(...limits.values())
+
           const append = (sequence: InferenceSequenceRecord, sampled: number) => {
             sequence.pending = sampled
             sequence.generated++
@@ -1262,60 +1556,76 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             const page = pages.get(sequence) ?? []
             page.push(sampled)
             pages.set(sequence, page)
+
             if (sequence.eos.has(sampled)) sequence.terminal = "eos"
             else if (sequence.maxTokens !== undefined && sequence.generated >= sequence.maxTokens) {
               sequence.terminal = "maxTokens"
             }
           }
+
           const verifierHandle = artifact.generalizedProposer === undefined
             ? undefined
             : artifact.target.verify?.at(-1)
+
           const verifier = verifierHandle === undefined
             ? undefined
             : executableRecord(verifierHandle, "inferenceRound")
+
           const verifyRows = verifier?.state === undefined
             ? 0
             : verifier.sourceShapes[0]![0]! / verifier.state.batch
+
           const targetMatching = roundSteps > 1 && verifier !== undefined && verifyRows >= roundSteps &&
             entries.every(({ sequence }) => sequence.terminal === undefined && limits.get(sequence)! > 0)
+
           const parallel = artifact.generalizedProposer?.plan.stages[0]?.operationId === "ParallelBlock"
             ? artifact.generalizedProposer
             : undefined
+
           const batchable = roundSteps > 1 && entries.every(({ sequence }) =>
             sequence.terminal === undefined && sequence.eos.size === 0 && limits.get(sequence) === roundSteps
           )
+
           if (speculative && parallel === undefined) {
             draftNanos = BigInt(Math.max(1, Math.round((performance.now() - draftStarted) * 1_000_000)))
           }
+
           if (targetMatching && parallel !== undefined) {
             const draftStarted = performance.now()
             const stage = executableRecord(parallel.stageExecutables[0]!, "inferenceRound")
             const replay = executableRecord(parallel.replay!.verify.at(-1)!, "inferenceRound")
             const slots = entries.map((_, index) => index)
+
             const draftSequences = entries.map(({ sequence }) => {
               if (sequence.proposer === undefined) {
                 throw new Error("inferenceRound: proposer replay sequence is missing")
               }
+
               return sequence.proposer.fork()
             })
+
             const anchor = await uploadTokens(
               Array.from({ length: artifact.batchSize }, (_, slot) => entries[slot]?.sequence.pending ?? 0),
               [artifact.batchSize],
               artifact.tokenDtype,
               session
             )
+
             let stageOutputs: ReadonlyArray<NativeTensor> = []
+
             try {
               const activeMask = new Array<boolean>(artifact.batchSize).fill(false)
               const validLengths = new Array<number>(artifact.batchSize).fill(0)
+
               for (const slot of slots) {
                 activeMask[slot] = true
                 validLengths[slot] = parallel.plan.trainedMaxRows + 1
               }
+
               stageOutputs = await stage.value.executeStateful(
                 [
                   anchor.value,
-                  ...parallel.sharedTensors.map((shared) => handleRecord(shared, "inferenceRound", true).value!)
+                  ...session.artifact.retainedSharedTensors
                 ],
                 draftSequences,
                 slots,
@@ -1329,19 +1639,26 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               )
             } finally {
               anchor.inUse = false
+
               for (const sequence of draftSequences) sequence.release()
             }
+
             draftNanos = BigInt(Math.max(1, Math.round((performance.now() - draftStarted) * 1_000_000)))
+
             try {
               const probabilities = stageOutputs[1]
+
               const proposalTokens = probabilities === undefined
                 ? await (async () => {
                   const candidates = stageOutputs[0]
+
                   if (candidates === undefined || candidates.dtype !== "u32") {
                     throw new Error("inferenceRound: ParallelBlock token output is missing")
                   }
+
                   const bytes = await candidates.readback(token)
                   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+
                   return entries.map(({ sequence }, request) => [
                     sequence.pending,
                     ...Array.from(
@@ -1355,7 +1672,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                   ])
                 })()
                 : entries.map(({ sequence }) => [sequence.pending])
+
               const verificationStarted = performance.now()
+
               const matched = await verifier.value.executeTargetMatching(
                 entries.map(({ sequence }) => sequence.target),
                 slots,
@@ -1371,6 +1690,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 probabilities,
                 token
               )
+
               try {
                 const taps = parallel.plan.verifyHiddenTaps ?? parallel.plan.hiddenTaps
                 await runReplay({
@@ -1386,10 +1706,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                   token
                 })
                 acceptedCandidates = matched.accepted.reduce((total, count) => total + count, 0)
+
                 for (let request = 0; request < entries.length; request++) {
                   const sequence = entries[request]!.sequence
+
                   for (const value of matched.pages[request]!) append(sequence, value)
                 }
+
                 verificationNanos = BigInt(
                   Math.max(1, Math.round((performance.now() - verificationStarted) * 1_000_000))
                 )
@@ -1401,6 +1724,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             }
           } else if (targetMatching) {
             const verificationStarted = performance.now()
+
             const matched = await verifier.value.executeTargetMatching(
               entries.map(({ sequence }) => sequence.target),
               entries.map((_, index) => index),
@@ -1422,10 +1746,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               undefined,
               token
             )
+
             try {
               acceptedCandidates = matched.accepted.reduce((total, count) => total + count, 0)
+
               for (let request = 0; request < entries.length; request++) {
                 const sequence = entries[request]!.sequence
+
                 for (const value of matched.pages[request]!) {
                   append(sequence, value)
                 }
@@ -1433,11 +1760,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             } finally {
               for (const output of matched.outputs) output.clear()
             }
+
             verificationNanos = BigInt(
               Math.max(1, Math.round((performance.now() - verificationStarted) * 1_000_000))
             )
           } else if (batchable) {
             const verificationStarted = performance.now()
+
             const sampled = await runSampledSteps({
               executable: decode,
               sequences: entries.map(({ sequence }) => sequence),
@@ -1450,12 +1779,15 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 )),
               token
             })
+
             for (let request = 0; request < entries.length; request++) {
               const sequence = entries[request]!.sequence
+
               for (const token of sampled[request]!) {
                 append(sequence, token)
               }
             }
+
             if (speculative) {
               verificationNanos = BigInt(
                 Math.max(1, Math.round((performance.now() - verificationStarted) * 1_000_000))
@@ -1463,13 +1795,16 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             }
           } else {
             const verificationStarted = performance.now()
+
             for (let step = 0; step < roundSteps; step++) {
               const active = entries.filter(({ sequence }) =>
                 sequence.terminal === undefined && (pages.get(sequence)?.length ?? 0) < limits.get(sequence)!
               )
+
               if (active.length === 0) {
                 break
               }
+
               const sampled = await runStateBatch({
                 executable: decode,
                 sequences: active.map(({ sequence }) =>
@@ -1485,21 +1820,27 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 ),
                 token
               })
+
               if (sampled === undefined) throw new Error("inferenceRound: decode did not sample outputs")
+
               for (let index = 0; index < active.length; index++) {
                 append(active[index]!.sequence, sampled[index]!)
               }
             }
+
             if (speculative) {
               verificationNanos = BigInt(
                 Math.max(1, Math.round((performance.now() - verificationStarted) * 1_000_000))
               )
             }
           }
+
           const roundId = session.nextRoundId++
           session.receipts.add(roundId)
+
           const resultPages = entries.flatMap(({ sequence }) => {
             const tokens = pages.get(sequence)
+
             return tokens === undefined
               ? []
               : [{
@@ -1509,26 +1850,34 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 stopReason: sequence.terminal
               }]
           })
+
           diagnostics.roundsCompleted++
           diagnostics.emittedTokens += BigInt(resultPages.reduce((total, page) => total + page.tokens.length, 0))
+
           if (speculative) {
             diagnostics.speculativeRounds++
+
             const proposed = entries.reduce(
               (total, { sequence }) => total + Math.max(0, limits.get(sequence)! - 1),
               0
             )
+
             const accepted = acceptedCandidates ??
               resultPages.reduce((total, page) => total + Math.max(0, page.tokens.length - 1), 0)
+
             diagnostics.proposedTokens += BigInt(proposed)
             diagnostics.acceptedTokens += BigInt(accepted)
             diagnostics.draftNanos += draftNanos
             diagnostics.verificationNanos += verificationNanos
+
             for (const page of resultPages) {
               const accepted = Math.max(0, page.tokens.length - 1)
               diagnostics.acceptedLengthHistogram[accepted] = (diagnostics.acceptedLengthHistogram[accepted] ?? 0n) + 1n
             }
           } else diagnostics.ordinaryRounds++
+
           diagnostics.lastRoundId = roundId
+
           return { roundId, recovered: false, pages: resultPages }
         }
       ),
@@ -1536,6 +1885,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       Effect.try({
         try: () => {
           const session = inferenceSession(handle, "inferenceAcknowledge")
+
           if (!session.receipts.delete(roundId)) throw new Error("inferenceAcknowledge: unknown round")
         },
         catch: errorFor("inferenceAcknowledge", "execute", "execution-failed")
@@ -1545,7 +1895,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         try: () => {
           const session = inferenceSession(handle, "inferenceFinish")
           const sequences = handles.map((sequence) => inferenceSequence(session, sequence, "inferenceFinish"))
+
           if (new Set(sequences).size !== sequences.length) throw new Error("inferenceFinish: duplicate sequence")
+
           for (const sequence of sequences) {
             sequence.target.release()
             sequence.proposer?.release()
@@ -1560,6 +1912,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         try: () => {
           const session = inferenceSession(handle, "inferenceInspect")
           const sequence = inferenceSequence(session, sequenceHandle, "inferenceInspect")
+
           return {
             sequenceId: sequence.id,
             cursor: BigInt(sequence.target.cursor),
@@ -1572,13 +1925,17 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       Effect.try({
         try: () => {
           const session = inferenceSession(handle, "inferenceClose")
+
           for (const sequence of session.sequences.values()) {
             sequence.target.release()
             sequence.proposer?.release()
             sequence.finished = true
           }
+
           session.sequences.clear()
+
           for (const binding of session.tokenBindings) binding.value.clear()
+
           session.tokenBindings.length = 0
           session.closed = true
         },
@@ -1588,6 +1945,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       Effect.try({
         try: () => {
           const diagnostics = inferenceArtifact(handle, "inferenceDiagnostics").diagnostics
+
           return Object.freeze({
             roundsStarted: diagnostics.roundsStarted,
             roundsCompleted: diagnostics.roundsCompleted,
@@ -1610,6 +1968,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         catch: errorFor("inferenceDiagnostics", "execute", "execution-failed")
       })
   }
+
   const sampling: Runtime.SamplingRuntime = {
     sample: (handle, options) =>
       cancellable(
@@ -1634,12 +1993,19 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         (token) => {
           const executable = executableRecord(handle, "executeDecode")
           const state = invocation.state
+
           if (executable.state === undefined || state === undefined) {
             throw new Error("executeDecode: requires a stateful executable and invocation")
           }
+
+          if (state.access !== "Append" || executable.state.access !== "Append") {
+            throw new Error("executeDecode: requires append state")
+          }
+
           if (invocation.scalars.length > 0 || Object.keys(invocation.runtimeValues).length > 0) {
             throw new Error("executeDecode: stateful CUDA programs do not accept scalar or runtime values")
           }
+
           return executable.value.executeSampled(
             invocation.bindings.map((binding) => handleRecord(binding, "executeDecode", true).value!),
             state.sequences.map((sequence) => nativeSequence(sequence, "executeDecode").value),
@@ -1655,56 +2021,74 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       ),
     executeSpeculative: () => unsupported("executeSpeculative")
   }
+
   const metadataValue = (entry: NativeGgufMetadataEntry): Runtime.GgufMetadataEntry => {
     if (!Predicate.isString(entry.key) || entry.key.length === 0 || !Predicate.isString(entry.kind)) {
       throw new Error("native GGUF metadata entry is invalid")
     }
+
     const numericKinds = ["u8", "i8", "u16", "i16", "u32", "i32", "f32", "u64", "i64", "f64"]
     const candidates: Array<Runtime.GgufMetadataScalar | ReadonlyArray<Runtime.GgufMetadataScalar>> = []
+
     if (entry.numberValue !== undefined) {
       if (!numericKinds.includes(entry.kind) || !Predicate.isNumber(entry.numberValue)) {
         throw new Error("invalid GGUF number metadata")
       }
+
       candidates.push(entry.numberValue)
     }
+
     if (entry.stringValue !== undefined) {
       if (entry.kind !== "string" || !Predicate.isString(entry.stringValue)) {
         throw new Error("invalid GGUF string metadata")
       }
+
       candidates.push(entry.stringValue)
     }
+
     if (entry.booleanValue !== undefined) {
       if (entry.kind !== "bool" || !Predicate.isBoolean(entry.booleanValue)) {
         throw new Error("invalid GGUF boolean metadata")
       }
+
       candidates.push(entry.booleanValue)
     }
+
     if (entry.numberArray !== undefined) {
       if (!numericKinds.includes(entry.kind) || !entry.numberArray.every(Predicate.isNumber)) {
         throw new Error("invalid GGUF number array metadata")
       }
+
       candidates.push(Object.freeze([...entry.numberArray]))
     }
+
     if (entry.stringArray !== undefined) {
       if (entry.kind !== "string" || !entry.stringArray.every(Predicate.isString)) {
         throw new Error("invalid GGUF string array metadata")
       }
+
       candidates.push(Object.freeze([...entry.stringArray]))
     }
+
     if (entry.booleanArray !== undefined) {
       if (entry.kind !== "bool" || !entry.booleanArray.every(Predicate.isBoolean)) {
         throw new Error("invalid GGUF boolean array metadata")
       }
+
       candidates.push(Object.freeze([...entry.booleanArray]))
     }
+
     if (candidates.length !== 1) {
       throw new Error(`native GGUF metadata ${entry.key} has invalid value fields`)
     }
+
     return Object.freeze({ key: entry.key, value: candidates[0]! })
   }
+
   const ggufDescriptor = (value: NativeGgufTensorDescriptor): Runtime.GgufTensorDescriptor => {
     const format = value.format
     const encoded = format !== "F32"
+
     if (
       !Predicate.isString(value.name) || value.name.length === 0 || !isGgufFormat(format) ||
       value.logicalDtype !== "f32" || value.physicalDtype !== (encoded ? "u8" : "f32") ||
@@ -1720,6 +2104,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     ) {
       throw new Error("native GGUF tensor descriptor is invalid")
     }
+
     return Object.freeze({
       name: value.name,
       format,
@@ -1729,6 +2114,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       physicalDtype: value.physicalDtype
     })
   }
+
   const clearArchiveTensors = (values: ReadonlyArray<NativeTensor>): void => {
     for (const value of new Set(values)) {
       try {
@@ -1738,6 +2124,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       }
     }
   }
+
   const gguf: Runtime.GgufRuntime = {
     inspect: (path) =>
       cancellable(native, "inspectGguf", "io", (token) => native.inspectGguf(path, token)).pipe(
@@ -1770,13 +2157,16 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           Effect.try({
             try: () => {
               const values = archive.entries.map((entry) => entry.tensor)
+
               try {
                 if (new Set(values).size !== values.length) {
                   throw new Error("native CUDA runtime returned duplicate tensor ownership")
                 }
+
                 return Object.freeze({
                   entries: Object.freeze(archive.entries.map((entry) => {
                     const descriptor = ggufDescriptor(entry.descriptor)
+
                     const storage: Runtime.EncodedTensorStorage | undefined = descriptor.format === "F32"
                       ? undefined
                       : {
@@ -1784,6 +2174,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                         physicalShape: descriptor.physicalShape,
                         physicalDtype: "u8"
                       }
+
                     return Object.freeze({
                       descriptor,
                       tensor: concreteHandle(entry.tensor, {
@@ -1804,6 +2195,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         )
       )
   }
+
   const pathSafetensors: Runtime.PathSafetensors = {
     inspect: (path) =>
       cancellable(native, "inspectArchive", "io", (token) => native.inspectSafetensors(path, token)).pipe(
@@ -1862,10 +2254,12 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           Effect.try({
             try: () => {
               const values = archive.entries.map((entry) => entry.tensor)
+
               try {
                 if (new Set(values).size !== values.length) {
                   throw new Error("native CUDA runtime returned duplicate tensor ownership")
                 }
+
                 return {
                   entries: archive.entries.map((entry) => ({
                     name: entry.name,
@@ -1883,13 +2277,14 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         )
       )
   }
+
   const extensions: Runtime.RuntimeService["extensions"] = {
     decode,
     inference,
     sampling,
     gguf,
     pathSafetensors,
-    diagnostics: { externalMemoryBytes: Effect.succeed(0) }
+    diagnostics: { externalMemoryBytes: Effect.sync(() => native.externalMemoryBytes()) }
   }
 
   return {
@@ -1920,7 +2315,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       Effect.try({
         try: () => {
           if (request.roots.length === 0) throw new Error("compile: expected at least one root")
+
           const roots = request.roots.map((root) => handleRecord(root, "compile").graph)
+
           const value = runtime.compile(
             roots,
             request.options === undefined
@@ -1931,10 +2328,18 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               },
             request.state === undefined ? undefined : nativeState(request.state)
           )
+
           const state: Runtime.DecodeStateSchema | undefined = request.state === undefined
             ? undefined
             : Object.freeze({
               ...request.state,
+              kvLayers: Object.freeze(value.kvLayers.map((layer) =>
+                Object.freeze({
+                  ...layer,
+                  dtype: dtype(layer.dtype),
+                  retentionWindow: layer.retentionWindow ?? null
+                })
+              )),
               window: value.allowsWindowEviction ? request.state.window : undefined,
               layers: value.layers,
               kvHeads: value.kvHeads,
@@ -1947,8 +2352,10 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
               convChannels: value.convChannels,
               convKernel: value.convKernel
             })
+
           const outputs = decodeOutputs(request.roots, state)
           const nativeDiagnostics = value.diagnostics
+
           const diagnostics: Runtime.ExecutableDiagnostics = Object.freeze({
             ...nativeDiagnostics,
             instructions: Object.freeze(
@@ -1964,6 +2371,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           const handle = Object.freeze(
             state === undefined ? { diagnostics } : { diagnostics, state }
           ) as Runtime.ExecutableHandle
+
           records.set(handle, {
             owner,
             kind: "executable",
@@ -1973,6 +2381,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             sourceShapes: request.roots.map((root) => root.shape)
           })
           backendHandles.add(handle)
+
           return handle
         },
         catch: errorFor("compile", "compile", "compilation-failed")
@@ -1981,26 +2390,49 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       const lateClear = (values: ReadonlyArray<NativeTensor>) => {
         for (const value of new Set(values)) value.clear()
       }
+
       return cancellable(
         native,
         "execute",
         "execute",
         (token) => {
           const executable = executableRecord(handle, "execute")
+
           if (Object.keys(invocation.runtimeValues).length !== 0) {
             throw new Error("execute: CUDA runtime values are not supported yet")
           }
+
           const bindings = invocation.bindings.map((binding) => {
             const found = handleRecord(binding, "execute", true)
+
             return found.value!
           })
+
           if (invocation.state === undefined) {
             if (executable.state !== undefined) throw new Error("execute: stateful executable requires state")
+
             return executable.value.execute(bindings, [...invocation.scalars], token)
           }
+
           if (executable.state === undefined) throw new Error("execute: stateless executable does not accept state")
+
           if (invocation.scalars.length > 0) throw new Error("execute: stateful executable does not accept scalars")
+
           const state = invocation.state
+
+          if (state.access !== executable.state.access) throw new Error("execute: state access mismatch")
+
+          if (state.access === "ReadOnly") {
+            return executable.value.executeReadOnly(
+              bindings,
+              state.prefixes.map((prefix) => nativePrefix(prefix, "execute").value),
+              [...state.slots],
+              [...state.activeMask],
+              [...state.validLengths],
+              token
+            )
+          }
+
           return executable.value.executeStateful(
             bindings,
             state.sequences.map((sequence) => nativeSequence(sequence, "execute").value),
@@ -2018,15 +2450,19 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           Effect.try({
             try: () => {
               const executable = executableRecord(handle, "execute")
+
               try {
                 if (values.length !== executable.outputs.length) {
                   throw new Error("execute: native CUDA output count disagrees with the executable")
                 }
+
                 if (new Set(values).size !== values.length) {
                   throw new Error("execute: native CUDA runtime returned duplicate tensor ownership")
                 }
+
                 return values.map((value, index) => {
                   const output = executable.outputs[index]!
+
                   return concreteHandle(value, output)
                 })
               } catch (cause) {
@@ -2049,6 +2485,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         Effect.map((buffer) => {
           const bytes = new Uint8Array(buffer.byteLength)
           bytes.set(buffer)
+
           return bytes.buffer
         }),
         Effect.mapError((error) =>
@@ -2061,7 +2498,9 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       Effect.try({
         try: () => {
           const found = records.get(handle)
+
           if (found?.owner === owner && found.kind === "concrete" && found.disposed) return
+
           const concrete = handleRecord(handle, "release", true)
           concrete.value!.clear()
           concrete.disposed = true

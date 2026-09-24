@@ -11,7 +11,7 @@ use effect_torch_runtime::{DType, StorageRepresentation};
 use objc2_metal::MTLDevice as _;
 
 /// Bump when classification or realization changes.
-pub(crate) const POLICY_REVISION: u64 = 6;
+pub(crate) const POLICY_REVISION: u64 = 7;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MetalDTypeCapabilities {
@@ -184,6 +184,12 @@ impl TargetDTypeCapabilities for MetalDTypeCapabilities {
             NodeKind::Arange { step, .. } if *step == 0.0 => {
                 unsupported(DTypeRequirement::Compute, "arange step must not be zero")
             }
+            NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+                unsupported(
+                    DTypeRequirement::Realization,
+                    "semantic operation requires native semantic preparation",
+                )
+            }
             NodeKind::Leaf(_)
             | NodeKind::Input { .. }
             | NodeKind::ScalarInput { .. }
@@ -215,6 +221,7 @@ impl TargetDTypeCapabilities for MetalDTypeCapabilities {
             | NodeKind::Argmax { .. }
             | NodeKind::TopKIndices { .. }
             | NodeKind::ExpertLinearRows { .. }
+            | NodeKind::GroupedExpertLinearRows { .. }
             | NodeKind::Argmin { .. }
             | NodeKind::Cumsum { .. } => native(),
             NodeKind::Relu { .. } if !input_dtype.is_float() => native(),

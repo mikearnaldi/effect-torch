@@ -164,7 +164,7 @@ guards' errors are already clean and typed.
 
 ## Addendum: the first storage dtype — int8 kv pools (implemented)
 
-`InferenceConfig.kvDtype` accepts `"f32" | "f16" | "bf16" | "int8"`.
+`CompileOptions.kvDtype` accepts `"f32" | "f16" | "bf16" | "int8"`.
 The halves store rows as-is (widen on gather); `"int8"` is the first
 *storage-tier* dtype: pool slabs are u8 bytes (no generic op may touch
 them) plus per-(token, head) f32 absmax scales, symmetric-quantized on
@@ -183,7 +183,7 @@ the paged attention kernel.
   No other additions: storage dtypes arrive with their kernels.
 - No promotion configuration, no autocast flag, no dtype context —
   strictness has no knobs.
-- `InferenceConfig.kvDtype?: "f32" | "f16" | "bf16"` (default `"f32"`)
+- `CompileOptions.kvDtype?: "f32" | "f16" | "bf16"` (default `"f32"`)
   — the first application, in the follow-up commit: pool slabs
   allocated in the cache dtype, scatter casts down, gather attends in
   the cache dtype where the composed path supports it (Metal f16/bf16

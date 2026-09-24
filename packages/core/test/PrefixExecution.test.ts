@@ -1,143 +1,128 @@
 import { expect } from "@effect/vitest"
-import { Effect } from "effect"
-import { Model, Runtime, Tensor } from "../src/index.ts"
-import { onDevices } from "./utils/devices.ts"
+import { Effect, Exit, Scope } from "effect"
+import { Diffusion, Tensor } from "../src/index.ts"
+import { deep, onDevices } from "./utils/devices.ts"
 
-const definition = (weight: Tensor.Any): Model.PrefixModel => ({
-  vocabSize: 4,
-  maxTokens: 8,
-  maxReadTokens: 2,
-  layerCount: 2,
-  embed: (ids, phase) =>
+// This replaces the old per-layer prefix executor's geometry regression with
+// actual decode-specialized attention. Failure and observer-cleanup coverage
+// now lives in Diffusion.test.ts and DiffusionGemmaRuntime.test.ts.
+const definition = (weight: Tensor.Any): Diffusion.Definition => {
+  const build = (
+    parameters: ReadonlyArray<Tensor.Any>,
+    tokens: Tensor.Any,
+    positions: Tensor.Any,
+    causal: boolean,
+    prediction: Diffusion.Prediction
+  ) =>
     Effect.gen(function*() {
-      const hidden = yield* Tensor.embedding(ids, { weight })
-      return phase === "read" ? yield* Tensor.neg(hidden) : hidden
-    }),
-  prefillLayer: (layer, hidden, positions) =>
-    Effect.gen(function*() {
-      const offsets = yield* Tensor.reshape(yield* Tensor.cast(positions, "f32"), hidden.shape)
-      const output = yield* Tensor.add(hidden, offsets)
-      let keys = yield* Tensor.reshape(output, [1, 1, hidden.shape[1], 1])
-      keys = layer === 0
-        ? yield* Tensor.slice(keys, { start: [0, 0, hidden.shape[1] - 1, 0] })
-        : yield* Tensor.concat([keys, keys], { dim: 1 })
+      const rows = tokens.shape[1]!
+      const embedding = yield* Tensor.embedding(tokens, { weight: parameters[0]! })
 
-      return { output, keys, values: yield* Tensor.neg(keys) }
-    }),
-  readLayer: (_layer, hidden, positions, prefix) =>
-    Effect.gen(function*() {
-      const offsets = yield* Tensor.reshape(yield* Tensor.cast(positions, "f32"), hidden.shape)
-      const context = yield* Tensor.sum(yield* Tensor.sub(prefix.keys, prefix.values))
-      return yield* Tensor.add(yield* Tensor.add(hidden, offsets), context)
-    }),
-  readout: (hidden, labels) =>
-    Effect.gen(function*() {
-      const selected = labels === undefined ? weight : yield* Tensor.embedding(labels, { weight })
-      return yield* Tensor.linearRows(hidden, selected)
-    })
-})
-
-const weights = Tensor.fromTypedArray(new Float32Array([0, 1, 2, 3]), [4, 1]).pipe(
-  Effect.flatMap((tensor) => Tensor.compute([tensor])),
-  Effect.flatMap(Tensor.clearAllScoped),
-  Effect.map(([weight]) => weight)
-)
-
-onDevices("prefix execution", () => (it) => {
-  it.effect("uses logical positions with heterogeneous prefixes and independent selected readouts", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const weight = yield* weights
-      const events: Array<string> = []
-      const hiddenStates: Array<Tensor.Concrete> = []
-      const execution = Model.executor(definition(weight), {
-        optimize: false,
-        observeLayer: ({ phase, layer, hidden }) =>
-          Effect.sync(() => {
-            events.push(phase + "." + layer)
-            hiddenStates.push(hidden)
-          })
-      })
-      const prefix = yield* Effect.acquireRelease(
-        execution.prefill(Uint32Array.of(1, 2, 3)),
-        Tensor.clearKvPrefix,
-        { interruptible: true }
+      let hidden = yield* Tensor.add(
+        causal ? embedding : yield* Tensor.neg(embedding),
+        yield* Tensor.reshape(yield* Tensor.cast(positions, "f32"), [1, rows, 1])
       )
-      expect(prefix.tokenCount).toBe(3)
-      expect(prefix.layers.map(({ keys }) => keys.shape)).toEqual([[1, 1, 1, 1], [1, 2, 3, 1]])
-      expect(yield* Tensor.toNumberArray(prefix.layers[0].keys)).toEqual([5])
-      expect(yield* Tensor.toNumberArray(prefix.layers[1].keys)).toEqual([1, 4, 7, 1, 4, 7])
 
-      const full = yield* Effect.acquireRelease(
-        execution.read(prefix, Uint32Array.of(0, 1), 1),
-        Tensor.clear,
-        { interruptible: true }
-      )
-      const selected = yield* Effect.acquireRelease(
-        execution.read(prefix, Uint32Array.of(0, 1), 1, Uint32Array.of(3, 1, 3)),
-        Tensor.clear,
-        { interruptible: true }
-      )
-      expect(events).toEqual(["prefill.0", "prefill.1", "read.0", "read.1", "read.0", "read.1"])
-
-      for (const hidden of hiddenStates) {
-        expect((yield* Effect.flip(Tensor.toNumberArray(hidden)))._tag).toBe("TensorError")
+      if (prediction._tag === "Refinement") {
+        hidden = yield* Tensor.add(hidden, yield* Tensor.mean(prediction.logits, { dims: [2], keepdims: true }))
       }
 
-      yield* Tensor.clearKvPrefix(prefix)
-      expect(yield* Tensor.toNumberArray(full)).toEqual([0, 65, 130, 195])
-      yield* Tensor.clear(full)
-      expect(yield* Tensor.toNumberArray(selected)).toEqual([195, 65, 195])
-      expect(yield* Tensor.toNumberArray(weight)).toEqual([0, 1, 2, 3])
-    })))
+      for (const layer of [0, 1]) {
+        const heads = layer + 1
+        const keys = yield* Tensor.broadcastTo(yield* Tensor.reshape(hidden, [1, 1, rows, 1]), [1, heads, rows, 1])
+        const attention = { causal, layerId: layer, retentionWindow: layer === 0 ? 1 : null }
 
-  for (const failure of ["observer", "readout"] as const) {
-    it.effect(
-      failure + " errors release read outputs and preserve the borrowed prefix",
-      () =>
-        Effect.scoped(Effect.gen(function*() {
-          const weight = yield* weights
-          const model = definition(weight)
-          const prefix = yield* Effect.acquireRelease(
-            Model.executor(model).prefill(Uint32Array.of(1, 2, 3)),
-            Tensor.clearKvPrefix,
-            { interruptible: true }
-          )
-          const runtime = yield* Runtime.Runtime
-          const produced: Array<Tensor.Concrete> = []
-          const service: Runtime.RuntimeService = {
-            ...runtime,
-            execute: (program, invocation) =>
-              runtime.execute(program, invocation).pipe(
-                Effect.tap((outputs) =>
-                  Effect.sync(() => {
-                    produced.push(...outputs)
-                  })
-                )
-              )
-          }
-          const execution = Model.executor({
-            ...model,
-            readout: failure === "readout" ? () => Effect.fail(failure) : model.readout
-          }, {
-            observeLayer: () => failure === "observer" ? Effect.fail(failure) : Effect.void
-          })
-          const error = yield* Effect.flip(
-            execution.read(prefix, Uint32Array.of(0, 1), 1).pipe(Effect.provideService(Runtime.Runtime, service))
-          )
-          expect(error).toBe(failure)
-          expect(produced.length).toBeGreaterThan(1)
+        const output = yield* Tensor.scaledDotProductAttention(
+          yield* Tensor.zerosLike(keys),
+          keys,
+          yield* Tensor.neg(keys),
+          causal ? { ...attention, window: layer === 0 ? 2 : null } : attention
+        )
 
-          for (const tensor of produced) {
-            expect((yield* Effect.flip(runtime.readback(tensor))).reason).toBe("invalid-handle")
-          }
+        const merged = yield* Tensor.reshape(yield* Tensor.mean(output, { dims: [1], keepdims: false }), [1, rows, 1])
+        hidden = yield* Tensor.add(hidden, merged)
+      }
 
-          const output = yield* Effect.acquireRelease(
-            Model.executor(model).read(prefix, Uint32Array.of(0, 1), 1),
-            Tensor.clear,
-            { interruptible: true }
-          )
-          expect(yield* Tensor.toNumberArray(output)).toEqual([0, 65, 130, 195])
-        }))
-    )
+      return hidden
+    })
+
+  return {
+    parameterSpecs: [{ name: "weight", shape: weight.shape, initializer: { _tag: "Constant", value: 0 } }],
+    vocabSize: 4,
+    canvasLength: 2,
+    maxPositions: 8,
+    dtype: "f32",
+    predictionDtype: "f32",
+    encode: (parameters, tokens, positions) => build(parameters, tokens, positions, true, { _tag: "Initial" }),
+    denoise: (parameters, tokens, positions, prediction) => build(parameters, tokens, positions, false, prediction),
+    readout: (parameters, hidden, selection) =>
+      Effect.gen(function*() {
+        const rows = selection._tag === "Full" ? hidden : yield* Tensor.take(hidden, selection.rows, { dim: 1 })
+
+        const weights = selection._tag === "Full"
+          ? parameters[0]!
+          : yield* Tensor.take(parameters[0]!, selection.labels)
+
+        return yield* Tensor.linearRows(rows, weights)
+      })
   }
+}
+
+onDevices("compiled prefix geometry", () => (it) => {
+  it.effect("retains heterogeneous local/global state while using absolute read positions", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const [weight] = yield* Effect.acquireRelease(
+        Tensor.compute([yield* Tensor.fromTypedArray(new Float32Array([0, 1, 2, 3]), [4, 1])]),
+        Tensor.clearAll,
+        { interruptible: true }
+      )
+
+      const program = yield* Diffusion.compile(definition(weight!), [weight!], {
+        maxTokens: 16,
+        blockSize: 1,
+        prefillChunks: [1],
+        selectedReadouts: [{ rows: 1, labels: 3 }],
+        compile: { optimize: false }
+      })
+
+      const prefixScope = yield* Scope.fork(yield* Effect.scope)
+
+      const prefix = yield* Effect.acquireRelease(
+        program.encode(Uint32Array.of(1, 2, 3)),
+        (prefix) => Effect.orDie(program.release(prefix)),
+        { interruptible: true }
+      ).pipe(Scope.provide(prefixScope))
+
+      const before = yield* program.inspect(prefix)
+      expect(prefix.tokenCount).toBe(3)
+      expect(before.layers.map(({ kvHeads, headDim, startPosition }) => ({ kvHeads, headDim, startPosition }))).toEqual(
+        [
+          { kvHeads: 1, headDim: 1, startPosition: 2 },
+          { kvHeads: 2, headDim: 1, startPosition: 0 }
+        ]
+      )
+      deep(before.layers[0]!.keys, [5])
+      deep(before.layers[0]!.values, [-5])
+      deep(before.layers[1]!.keys, [0, 0, 1, 1, 1, 1])
+
+      const full = yield* Effect.acquireRelease(
+        program.evaluate(prefix, Uint32Array.of(0, 1), { _tag: "Initial" }),
+        Tensor.clear,
+        { interruptible: true }
+      )
+
+      const selected = yield* Effect.acquireRelease(
+        program.score(prefix, Uint32Array.of(0, 1), [1], [3, 1, 3]),
+        Tensor.clear,
+        { interruptible: true }
+      )
+
+      deep(yield* Tensor.toNumberArray(full), [0, -0.8, -1.6, -2.4, 0, -0.8, -1.6, -2.4])
+      deep(yield* Tensor.toNumberArray(selected), [-2.4, -0.8, -2.4])
+      expect(yield* program.inspect(prefix)).toEqual(before)
+      yield* Scope.close(prefixScope, Exit.void)
+      yield* Tensor.clear(full)
+      deep(yield* Tensor.toNumberArray(selected), [-2.4, -0.8, -2.4])
+      deep(yield* Tensor.toNumberArray(weight!), [0, 1, 2, 3])
+    })))
 })

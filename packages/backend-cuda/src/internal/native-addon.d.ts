@@ -27,6 +27,7 @@ export declare class Executable {
   get stateful(): boolean
   get batch(): number
   get allowsWindowEviction(): boolean
+  get kvLayers(): Array<NativeKvLayerDescriptor>
   get layers(): number
   get kvHeads(): number
   get headDim(): number
@@ -39,6 +40,7 @@ export declare class Executable {
   get convKernel(): number
   get device(): string
   get instructionCount(): number
+  executeReadOnly(bindings: Array<NativeTensor>, prefixes: Array<NativeKvPrefix>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   execute(bindings: Array<NativeTensor>, scalars: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   executeStateful(bindings: Array<NativeTensor>, sequences: Array<NativeKvSequence>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, advances: Array<number>, tokens: Array<Array<number>>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   executeSampled(bindings: Array<NativeTensor>, sequences: Array<NativeKvSequence>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, advances: Array<number>, tokens: Array<Array<number>>, sampling: Array<NativeSamplingOptions>, token?: CancellationToken | undefined | null): Promise<Array<number>>
@@ -60,15 +62,26 @@ export declare class NativeExposure {
 }
 
 export declare class NativeKvPool {
-  constructor(device: number, layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, dtype?: string | undefined | null, recurrent?: NativeRecurrentStateSchema | undefined | null)
+  constructor(device: number, layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, dtype?: string | undefined | null, recurrent?: NativeRecurrentStateSchema | undefined | null, kvLayers?: Array<NativeKvLayerDescriptor> | undefined | null)
   get capacity(): number
   get freeBlocks(): number
   get cachedBlocks(): number
   makeSequence(): NativeKvSequence
 }
 
+export declare class NativeKvPrefix {
+  release(): void
+  get cursor(): number
+  get retainedBytes(): number
+  get sharedBytes(): number
+  get copiedBytes(): number
+  fork(): NativeKvSequence
+  inspect(): NativeKvSnapshotInspection
+}
+
 export declare class NativeKvSequence {
   get cursor(): number
+  snapshot(): NativeKvPrefix
   fork(): NativeKvSequence
   release(): void
   prefillMatch(tokens: Array<number>): number
@@ -82,6 +95,8 @@ export declare class NativeTargetMatchingOutput {
 
 export declare class NativeTensor {
   clear(): void
+  /** Returns an independently clearable slot retaining the same device allocation. */
+  retain(): NativeTensor
   writeBytes(data: Uint8Array): void
   get shape(): Array<number>
   get dtype(): string
@@ -93,6 +108,9 @@ export declare class NativeTensor {
 
 /** Number of CUDA devices visible to this process. */
 export declare function deviceCount(): number
+
+/** Backing bytes retained by live exported tensor slots, deduplicated across aliases. */
+export declare function externalMemoryBytes(): number
 
 /** Reverse-mode gradients of `loss` with respect to each tensor in `wrt`. */
 export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<LazyTensor>
@@ -203,7 +221,34 @@ export interface NativeInstructionDiagnostics {
   count: number
 }
 
+export interface NativeKvLayerDescriptor {
+  layerId: number
+  kvHeads: number
+  headDim: number
+  dtype: string
+  retentionWindow?: number | undefined
+}
+
+export interface NativeKvLayerSnapshot {
+  layerId: number
+  startPosition: number
+  kvHeads: number
+  headDim: number
+  dtype: string
+  keys: Array<number>
+  values: Array<number>
+}
+
+export interface NativeKvSnapshotInspection {
+  cursor: number
+  retainedBytes: number
+  sharedBytes: number
+  copiedBytes: number
+  layers: Array<NativeKvLayerSnapshot>
+}
+
 export interface NativeKvStateSchema {
+  access?: string | undefined
   maxTokens: number
   blockSize: number
   kvDtype: string

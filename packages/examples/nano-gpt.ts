@@ -1,5 +1,5 @@
 import * as BackendApple from "@effect-torch/backend-apple-native"
-import { LearningRate, Loss, Model, Optimizer, Runtime, Tensor, Trainer } from "@effect-torch/core"
+import { AutoRegressive, LearningRate, Loss, Model, Optimizer, Runtime, Tensor, Trainer } from "@effect-torch/core"
 import * as Tokenizer from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
 import { Duration, Effect, Option } from "effect"
@@ -67,16 +67,27 @@ He chortled in his joy.
 `
 
 const BLOCK = 32
+
 const EMBED = 64
+
 const HEADS = 4
+
 const LAYERS = 2
+
 const BATCH = 16
+
 const STEPS = 400
+
 const LR = 3e-3
+
 const TEMPERATURE = 0.8
+
 const VOCAB = 300
+
 const TOKENIZER_MODEL: Tokenizer.TrainModel = "Unigram"
+
 const BOS = "<|bos|>"
+
 const EOS = "<|eos|>"
 
 // BOS/EOS mark the three documents before their ids are concatenated. Random
@@ -89,26 +100,31 @@ const createGpt = (vocabSize: number) =>
     // Token embeddings; RoPE inside attention means the architecture has no
     // learned position table to outgrow during windowed inference.
     const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
-    const blocks: Array<Model.Model> = []
+    const blocks: Array<Model.Definition> = []
+
     for (let i = 0; i < LAYERS; i++) {
       const attn = yield* Model.chain(
         yield* Model.layerNorm(`b${i}.ln1`, EMBED),
         yield* Model.multiHeadAttention(`b${i}.attn`, EMBED, HEADS, { causal: true, rope: 10000 })
       )
+
       const mlp = yield* Model.chain(
         yield* Model.layerNorm(`b${i}.ln2`, EMBED),
         yield* Model.linear(`b${i}.fc`, EMBED, 4 * EMBED),
         yield* Model.gelu(),
         yield* Model.linear(`b${i}.proj`, 4 * EMBED, EMBED)
       )
+
       blocks.push(yield* Model.chain(yield* Model.residual(attn), yield* Model.residual(mlp)))
     }
+
     const model = yield* Model.chain(
       embeddings,
       ...blocks,
       yield* Model.layerNorm("lnf", EMBED),
       yield* Model.linear("head", EMBED, vocabSize)
     )
+
     return model
   })
 
@@ -119,13 +135,16 @@ const sampleBatch = (data: ReadonlyArray<number>) =>
   Effect.gen(function*() {
     const inputs: Array<number> = []
     const targets: Array<number> = []
+
     for (let b = 0; b < BATCH; b++) {
       const start = Math.floor(Math.random() * (data.length - BLOCK - 1))
+
       for (let t = 0; t < BLOCK; t++) {
         inputs.push(data[start + t])
         targets.push(data[start + t + 1])
       }
     }
+
     return {
       input: yield* ids(inputs, [BATCH, BLOCK]),
       target: yield* ids(targets, [BATCH, BLOCK])
@@ -135,7 +154,7 @@ const sampleBatch = (data: ReadonlyArray<number>) =>
 // Create the trainer for the model, compiled. The batch shape is fixed,
 // so the whole run is served by one frozen step program; the first step
 // pays the trace.
-const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
+const createTrainer = (model: Model.Definition, data: ReadonlyArray<number>) =>
   Effect.gen(function*() {
     const trainer = yield* Trainer.make(model, {
       optimizer: yield* Optimizer.adamW(),
@@ -152,17 +171,21 @@ const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
           )
           : Effect.void
     })
+
     return trainer
   })
 
-const init = (model: Model.Model) =>
+const init = (model: Model.Definition) =>
   Effect.gen(function*() {
     const params = yield* Model.initialize(model)
+
     for (const [i, { name }] of model.parameterSpecs.entries()) {
       yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
     }
+
     const total = params.reduce((sum, param) => sum + param.shape.reduce((a, b) => a * b, 1), 0)
     yield* Effect.log(`  total: ${total.toLocaleString()} parameters`)
+
     return params
   })
 
@@ -171,7 +194,7 @@ const init = (model: Model.Model) =>
 // step. The sliding window caps attention at the model's maximum training span,
 // and EOS is the only application-level termination condition.
 const generate = (
-  program: Model.InferenceProgram,
+  program: AutoRegressive.Artifact,
   tokenizer: Tokenizer.Tokenizer,
   prompt: string
 ) =>
@@ -180,31 +203,43 @@ const generate = (
     const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
     const promptIds = Array.from((yield* tokenizer.encode(prompt)).data)
     const gen = yield* program.execution()
+
     const sample = (logits: Tensor.Any) =>
       Effect.gen(function*() {
         const row = yield* Tensor.toNumberArray(logits)
+
         if (Tensor.isTensor(logits)) yield* Tensor.clear(logits)
+
         const max = Math.max(...row)
         const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
         const total = exps.reduce((a, b) => a + b, 0)
         let draw = Math.random() * total
+
         for (let i = 0; i < exps.length; i++) {
           draw -= exps[i]
+
           if (draw <= 0) return i
         }
+
         return exps.length - 1
       })
+
     const entry = (yield* gen.add([yield* ids([bosId, ...promptIds], [1, 1 + promptIds.length])]))[0]!
     let logits = entry.logits
     const generated: Array<number> = []
+
     for (;;) {
       const next = yield* sample(logits)
+
       if (next === eosId) break
+
       generated.push(next)
       const [nextLogits] = yield* gen.step([{ seq: entry.seq, token: next }])
       logits = nextLogits
     }
+
     yield* gen.close()
+
     return yield* tokenizer.decode(generated)
   })
 
@@ -212,6 +247,7 @@ const program = Effect.gen(function*() {
   const runtime = yield* Runtime.Runtime
 
   yield* Effect.log(`0) training ${TOKENIZER_MODEL} tokenizer (target vocab ${VOCAB})`)
+
   const tokenizer = yield* Tokenizer.train(
     {
       source: Tokenizer.trainTexts(DOCUMENTS.flatMap((poem) => poem.split(/(?<=\n)/))),
@@ -226,13 +262,16 @@ const program = Effect.gen(function*() {
     },
     Tokenizer.strictConfig
   )
+
   const vocabSize = tokenizer.vocabSize
   const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
   const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
   const data: Array<number> = []
+
   for (const poem of DOCUMENTS) {
     data.push(bosId, ...(yield* tokenizer.encode(poem)).data, eosId)
   }
+
   yield* Effect.log(
     `nano-gpt: vocab ${vocabSize} (${data.length} tokens in ${DOCUMENTS.length} documents), block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${runtime.placement.description}`
   )
@@ -248,17 +287,20 @@ const program = Effect.gen(function*() {
   const params = trained.params
 
   yield* Effect.log(`3) generating from prompts (temperature ${TEMPERATURE}), stopping at EOS:`)
-  const inference = yield* Model.inference(model, params, {
+
+  const inference = yield* AutoRegressive.compile(model, params, {
     maxTokens: 4096,
     blockSize: 16,
     prefillChunks: [16],
     attentionWindow: BLOCK
   })
+
   const prompts = [
     "Shall I compare thee",
     "To be, or not to be",
     "Beware the Jabberwock"
   ]
+
   for (const prompt of prompts) {
     const text = yield* generate(inference, tokenizer, prompt)
     yield* Effect.log(`prompt: ${prompt}`)

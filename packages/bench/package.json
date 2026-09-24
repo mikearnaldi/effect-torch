@@ -11,6 +11,12 @@
     "bench:muse-glimmer": "tsx muse-glimmer.ts",
     "bench:muse-glimmer-concurrency": "tsx muse-glimmer-concurrency.ts",
     "bench:muse-glimmer-sglang": "${SGLANG_PYTHON:-python3} muse-glimmer-sglang.py",
+    "bench:diffusion-gemma": "tsx diffusion-gemma/effect-direct.ts",
+    "bench:diffusion-gemma-vllm-setup": "bash diffusion-gemma/setup-vllm.sh",
+    "bench:diffusion-gemma-vllm": "${VLLM_PYTHON:-python3} diffusion-gemma/vllm-direct.py",
+    "bench:diffusion-gemma-http": "${BENCH_PYTHON:-python3} diffusion-gemma/http_benchmark.py",
+    "bench:diffusion-gemma-summary": "${BENCH_PYTHON:-python3} diffusion-gemma/summarize.py",
+    "bench:diffusion-gemma-telemetry": "${BENCH_PYTHON:-python3} diffusion-gemma/telemetry.py",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
@@ -21,7 +27,8 @@
     "@effect-torch/tokenizers": "workspace:*",
     "@types/node": "^22.0.0",
     "effect": "^4.0.0-beta.101",
-    "tsx": "^4.20.0"
+    "tsx": "^4.20.0",
+    "@effect-torch/models": "workspace:*"
   },
   "optionalDependencies": {
     "@frost-beta/mlx": "^0.0.10"

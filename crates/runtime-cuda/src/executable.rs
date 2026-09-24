@@ -2,8 +2,7 @@
 use crate::buffer::CudaBuffer;
 use crate::capabilities::CudaCapabilities;
 use crate::lowering::{
-    Command, CommandKind, CudaLoweredProgram, CudaProgramBuilder, StateComponent,
-    BF16_LINEAR_BIAS_KERNEL,
+    Command, CommandKind, CudaLoweredProgram, CudaProgramBuilder, BF16_LINEAR_BIAS_KERNEL,
 };
 use crate::value::element_count;
 use crate::workspace::{self, CudaMemorySpace, InvocationResources, CUDA_STORAGE_ALIGNMENT};
@@ -14,14 +13,19 @@ use effect_torch_compiler::{
     DiagnosticsInput, GraphIndex, LoweringUnit, MemoryPlannerConfig, ProgramRequest,
     StateCursorSlot, ARTIFACT_ASSEMBLY_PHASE, PHYSICAL_PLANNING_PHASE, PUBLICATION_PHASE,
 };
-use effect_torch_graph::{KvAttentionMode, Node, NodeKind, PositionOffset};
+use effect_torch_graph::{AttentionRounding, KvAttentionMode, Node, NodeKind, PositionOffset};
 use effect_torch_runtime::{
-    CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, MemoryPlan, ValueId,
+    CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, KvLayerDescriptor, MemoryPlan,
+    StateAccessMode, ValueId,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+
+#[cfg(test)]
+#[path = "kv_matmul_tests.rs"]
+mod kv_matmul_tests;
 
 /// By-value launch ABI shared by every typed CUDA kernel.
 #[repr(C)]
@@ -124,6 +128,11 @@ fn product(values: &[usize]) -> Result<usize, String> {
 impl Instruction {
     pub(super) fn kernel(&self) -> Result<KernelSpec, String> {
         let spec = match self {
+            Self::GroupedExpertLinearRows { .. } => {
+                return Err(
+                    "compile: grouped experts require non-capturable command lowering".into(),
+                );
+            }
             Self::Binary { op, a, b, .. } => {
                 let mut s = KernelSpec::new("et_binary", &[Some(*a), Some(*b)]);
                 s.args.operation = *op;
@@ -156,10 +165,18 @@ impl Instruction {
                 s.args.integers[0] = u64::from(*dim);
                 s
             }
-            Self::Reduce { op, a, dims, .. } => {
+            Self::Reduce {
+                op,
+                a,
+                dims,
+                count,
+                trailing,
+            } => {
                 let mut s = KernelSpec::new("et_reduce", &[Some(*a)]);
                 s.args.operation = *op;
                 s.args.integers[0] = dims.len() as u64;
+                s.args.integers[1] = *count as u64;
+                s.args.integers[2] = u64::from(*trailing);
                 s.tail = dims.iter().map(|d| *d as u64).collect();
                 s
             }
@@ -561,12 +578,17 @@ impl Instruction {
                 layer,
                 window,
                 bidirectional,
+                rounding,
                 ..
             } => {
                 let mut s = KernelSpec::new("et_kv_attention", &[Some(*q), Some(*k), Some(*v)]);
                 s.args.scalars[0] = *scale;
                 s.args.integers[3] = window.unwrap_or(0) as u64;
                 s.args.integers[4] = u64::from(*bidirectional);
+                s.args.integers[6] = u64::from(*rounding == AttentionRounding::Stepwise);
+                s.args.integers[7] = q_shape[2] as u64;
+                s.args.integers[10] = q_shape[3] as u64;
+                s.args.integers[11] = q_shape[1] as u64;
                 s.state = StateAccess::Kv {
                     layer: *layer,
                     heads: k_shape[1],
@@ -647,6 +669,8 @@ pub(super) enum Instruction {
         op: u32,
         a: usize,
         dims: Vec<usize>,
+        count: usize,
+        trailing: bool,
     },
     Matmul {
         a: usize,
@@ -716,6 +740,11 @@ pub(super) enum Instruction {
         columns: usize,
         inner: usize,
         experts: usize,
+    },
+    GroupedExpertLinearRows {
+        x: usize,
+        weight: usize,
+        indexes: usize,
     },
     QuantizedLinear {
         x: usize,
@@ -818,6 +847,7 @@ pub(super) enum Instruction {
         layer: usize,
         window: Option<usize>,
         bidirectional: bool,
+        rounding: AttentionRounding,
     },
     Random {
         normal: bool,
@@ -869,6 +899,9 @@ fn semantic_instruction(
     state_cursor: Option<(u32, bool)>,
 ) -> Result<Instruction, String> {
     Ok(match &node.kind {
+        NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+            return Err("compile: semantic operation escaped native preparation".into());
+        }
         NodeKind::Leaf(slot) => {
             let value = slot
                 .get::<CudaValue>()
@@ -1089,6 +1122,12 @@ fn semantic_instruction(
                 op,
                 a: child_index(&index, a)?,
                 dims: dims.clone(),
+                count: dims.iter().try_fold(1_usize, |count, &dim| {
+                    count
+                        .checked_mul(a.shape[dim])
+                        .ok_or("CUDA reduction size overflow")
+                })?,
+                trailing: dims.len() == 1 && dims[0] + 1 == a.shape.len(),
             }
         }
         NodeKind::Matmul { a, b } => Instruction::Matmul {
@@ -1243,6 +1282,13 @@ fn semantic_instruction(
             inner: x.shape[1],
             experts: weight.shape[0],
         },
+        NodeKind::GroupedExpertLinearRows { x, weight, indexes } => {
+            Instruction::GroupedExpertLinearRows {
+                x: child_index(&index, x)?,
+                weight: child_index(&index, weight)?,
+                indexes: child_index(&index, indexes)?,
+            }
+        }
         NodeKind::Linear { x, weight, bias } => Instruction::Linear {
             x: child_index(&index, x)?,
             weight: child_index(&index, weight)?,
@@ -1818,6 +1864,7 @@ fn semantic_instruction(
             layer,
             window,
             mode,
+            rounding,
         } => Instruction::KvAttention {
             q: child_index(&index, q)?,
             k: child_index(&index, k)?,
@@ -1828,6 +1875,7 @@ fn semantic_instruction(
             layer: *layer as usize,
             window: *window,
             bidirectional: *mode == KvAttentionMode::BidirectionalBlock,
+            rounding: *rounding,
         },
         NodeKind::Inverse { a } => Instruction::Linalg {
             op: 0,
@@ -1890,15 +1938,17 @@ pub struct CudaExecutable {
 }
 
 /// Physical KV layout frozen before lowering and memory planning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaStateLayout {
     pub capacity: u32,
     pub dtype: DType,
     pub slots: u32,
     pub packed_rows_per_sequence: Option<u32>,
+    pub kv_layers: Vec<KvLayerDescriptor>,
+    pub access: StateAccessMode,
 }
 impl CudaStateLayout {
-    pub(crate) fn validate(self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.capacity == 0
             || self.slots == 0
             || self.packed_rows_per_sequence == Some(0)
@@ -1909,20 +1959,42 @@ impl CudaStateLayout {
         {
             return Err("compile: invalid CUDA state layout".into());
         }
+        let mut ids = std::collections::HashSet::new();
+        for layer in &self.kv_layers {
+            if !ids.insert(layer.layer_id)
+                || layer.kv_heads == 0
+                || layer.head_dim == 0
+                || !matches!(
+                    layer.dtype,
+                    DType::F32 | DType::F16 | DType::BF16 | DType::U8
+                )
+                || layer.row_bytes().is_none()
+            {
+                return Err("compile: invalid CUDA KV layer descriptor".into());
+            }
+        }
         Ok(())
     }
 }
 
-// Capture remains disabled until the new typed ABI has hardware lifetime coverage.
-pub(crate) struct CudaDecodeGraph;
-
-#[derive(Clone)]
+/// Immutable device pages. Forks and snapshots retain pages without copying KV.
+#[derive(Clone, Default)]
 pub struct CudaKvSnapshot {
-    pub dtype: DType,
-    pub keys: Vec<Vec<u8>>,
-    pub values: Vec<Vec<u8>>,
-    pub key_scales: Vec<Vec<f32>>,
-    pub value_scales: Vec<Vec<f32>>,
+    pub(crate) layers: Vec<CudaKvLayer>,
+}
+#[derive(Clone)]
+pub(crate) struct CudaKvLayer {
+    pub(crate) descriptor: effect_torch_runtime::KvLayerDescriptor,
+    pub(crate) start_position: u32,
+    pub(crate) pages: Vec<Arc<CudaKvPage>>,
+}
+pub(crate) struct CudaKvPage {
+    pub(crate) start: u32,
+    pub(crate) count: u32,
+    pub(crate) keys: CudaBuffer<u8>,
+    pub(crate) values: CudaBuffer<u8>,
+    pub(crate) key_scales: Option<CudaBuffer<f32>>,
+    pub(crate) value_scales: Option<CudaBuffer<f32>>,
 }
 #[derive(Clone)]
 pub struct CudaSequenceState {
@@ -1935,44 +2007,7 @@ pub struct CudaSequenceState {
 }
 #[derive(Clone)]
 pub(crate) struct CudaKvCache {
-    pub(crate) keys: Arc<CudaBuffer<u8>>,
-    pub(crate) values: Arc<CudaBuffer<u8>>,
-    pub(crate) key_scales: Option<Arc<CudaBuffer<f32>>>,
-    pub(crate) value_scales: Option<Arc<CudaBuffer<f32>>>,
-    pub(crate) layer_elements: usize,
-    pub(crate) dtype: DType,
-}
-impl CudaKvCache {
-    pub(crate) fn try_clone(&self, device: &Arc<CudaDevice>) -> Result<Self, String> {
-        fn copy<T: DeviceRepr + Send + Sync + 'static>(
-            device: &Arc<CudaDevice>,
-            source: &CudaBuffer<T>,
-        ) -> Result<Arc<CudaBuffer<T>>, String> {
-            let mut buffer =
-                unsafe { device.stream.alloc::<T>(source.len()) }.map_err(|e| e.to_string())?;
-            device
-                .stream
-                .memcpy_dtod(source, &mut buffer)
-                .map_err(|e| e.to_string())?;
-            Ok(Arc::new(CudaBuffer::from_slice(buffer)))
-        }
-        Ok(Self {
-            keys: copy(device, &self.keys)?,
-            values: copy(device, &self.values)?,
-            key_scales: self
-                .key_scales
-                .as_ref()
-                .map(|s| copy(device, s))
-                .transpose()?,
-            value_scales: self
-                .value_scales
-                .as_ref()
-                .map(|s| copy(device, s))
-                .transpose()?,
-            layer_elements: self.layer_elements,
-            dtype: self.dtype,
-        })
-    }
+    pub(crate) sequences: Vec<CudaKvSnapshot>,
 }
 pub struct CudaStateInvocation {
     pub sequences: Vec<CudaSequenceState>,
@@ -1981,10 +2016,9 @@ pub struct CudaStateInvocation {
     pub capacity: u32,
     pub cache_dtype: DType,
     pub packed_rows_per_sequence: Option<u32>,
+    pub kv_layers: Vec<KvLayerDescriptor>,
+    pub access: StateAccessMode,
     pub(crate) cache: Option<CudaKvCache>,
-    pub(crate) cursor_device: Option<Arc<cudarc::driver::CudaSlice<u32>>>,
-    pub(crate) valid_device: Option<Arc<cudarc::driver::CudaSlice<u32>>>,
-    pub(crate) decode_graph: Option<CudaDecodeGraph>,
 }
 
 struct InvocationFence {
@@ -2037,6 +2071,8 @@ impl CudaExecutable {
             cancelled,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
     }
     /// Test-only injection immediately after a successful cuBLAS submission.
@@ -2047,7 +2083,7 @@ impl CudaExecutable {
         cancelled: &CancellationFlag,
         after_gemm: &dyn Fn(),
     ) -> Result<Vec<CudaValue>, String> {
-        self.execute_inner(bindings, &[], None, cancelled, Some(after_gemm))
+        self.execute_inner(bindings, &[], None, cancelled, Some(after_gemm), None)
     }
     pub fn execute_stateful(
         &self,
@@ -2056,8 +2092,39 @@ impl CudaExecutable {
         state: &mut CudaStateInvocation,
         cancelled: &CancellationFlag,
     ) -> Result<Vec<CudaValue>, String> {
+        self.execute_state_transaction(
+            bindings,
+            scalars,
+            state,
+            cancelled,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn execute_stateful_with_kv_hook(
+        &self,
+        bindings: &[CudaValue],
+        state: &mut CudaStateInvocation,
+        cancelled: &CancellationFlag,
+        after_kv: &dyn Fn(),
+    ) -> Result<Vec<CudaValue>, String> {
+        self.execute_state_transaction(bindings, &[], state, cancelled, Some(after_kv))
+    }
+    fn execute_state_transaction(
+        &self,
+        bindings: &[CudaValue],
+        scalars: &[f64],
+        state: &mut CudaStateInvocation,
+        cancelled: &CancellationFlag,
+        #[cfg(test)] after_kv: Option<&dyn Fn()>,
+    ) -> Result<Vec<CudaValue>, String> {
+        if !scalars.is_empty() {
+            return Err("execute: stateful scalar bindings are unsupported".into());
+        }
         self.prepare_state(state)?;
         let before = state.sequences.clone();
+        let cache_before = state.cache.clone();
         let result = self.execute_inner(
             bindings,
             scalars,
@@ -2065,9 +2132,12 @@ impl CudaExecutable {
             cancelled,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            after_kv,
         );
         if result.is_err() {
             state.sequences = before;
+            state.cache = cache_before;
         }
         result
     }
@@ -2078,6 +2148,10 @@ impl CudaExecutable {
         _state: &mut CudaStateInvocation,
         _cancelled: &CancellationFlag,
     ) -> Result<Option<CudaValue>, String> {
+        // In particular, GroupedExpert commands are non-capturable: their
+        // exact cuBLAS dimensions depend on a host group-control completion.
+        // Stepwise BF16 KV GEMMs also remain non-capturable: P and Q depend on
+        // the invocation cursor, retained start and valid query length.
         Ok(None)
     }
     pub fn execute_stateful_greedy(
@@ -2118,6 +2192,7 @@ impl CudaExecutable {
         mut state: Option<&mut CudaStateInvocation>,
         cancelled: &CancellationFlag,
         #[cfg(test)] after_gemm: Option<&dyn Fn()>,
+        #[cfg(test)] after_kv: Option<&dyn Fn()>,
     ) -> Result<Vec<CudaValue>, String> {
         let resources = workspace::acquire(self.device.ordinal, &self.memory.segments)?;
         // Drop the fence before returning leases on errors or interruption.
@@ -2126,45 +2201,114 @@ impl CudaExecutable {
             complete: false,
         };
         let run = self.runs.fetch_add(1, Ordering::Relaxed);
+        // Opt-in diagnosis of a bounded run. Synchronization below attributes
+        // asynchronous GEMMs to their own command rather than the next kernel.
+        let trace = std::env::var("EFFECT_TORCH_CUDA_TRACE").is_ok_and(|value| value == "1");
+        // Node may make stderr nonblocking. Use an explicit append-only file
+        // rather than allowing diagnostic output to panic on EAGAIN.
+        let mut trace_file = if trace {
+            let path = std::env::var_os("EFFECT_TORCH_CUDA_TRACE_PATH")
+                .ok_or("execute: CUDA trace requires EFFECT_TORCH_CUDA_TRACE_PATH")?;
+            Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| format!("execute: CUDA trace file: {error}"))?,
+            )
+        } else {
+            None
+        };
+        let mut emit_trace = |record: serde_json::Value| -> Result<(), String> {
+            if let Some(file) = trace_file.as_mut() {
+                std::io::Write::write_all(file, format!("{record}\n").as_bytes())
+                    .map_err(|error| format!("execute: CUDA trace write: {error}"))?;
+            }
+            Ok(())
+        };
         let mut values: Vec<Option<CudaValue>> = vec![None; self.program.values.len()];
         for (position, command) in self.commands.iter().enumerate() {
             if cancelled.is_cancelled() {
                 return Err("operation aborted".into());
             }
-            if let CommandKind::StateCopy {
-                persistent,
-                transaction,
-                component,
-                commit,
-            } = &command.kind
-            {
-                let state = state
-                    .as_deref()
-                    .ok_or("execute: state copy requires state")?;
-                let mut persistent = self.state_buffer(
-                    state,
-                    *component,
-                    self.program.values[persistent.index()].decl.bytes,
-                )?;
-                let mut transaction = self.buffer(&resources, *transaction)?;
-                if *commit {
-                    self.device
-                        .stream
-                        .memcpy_dtod(&transaction, &mut persistent)
-                } else {
-                    self.device
-                        .stream
-                        .memcpy_dtod(&persistent, &mut transaction)
-                }
-                .map_err(|e| e.to_string())?;
-                continue;
-            }
             let Some(output_id) = command.output else {
                 continue;
             };
             let meta = &self.program.values[output_id.index()];
+            let traced = trace
+                && !matches!(
+                    command.kind,
+                    CommandKind::Prepare
+                        | CommandKind::Value(_)
+                        | CommandKind::Input { .. }
+                        | CommandKind::Alias { .. }
+                );
+            let started = if traced {
+                self.device
+                    .stream
+                    .synchronize()
+                    .map_err(|error| error.to_string())?;
+                let value = |id: ValueId| {
+                    let value = &self.program.values[id.index()];
+                    serde_json::json!({ "shape": value.shape, "dtype": value.dtype.name() })
+                };
+                let operation = match &command.kind {
+                    CommandKind::Kernel {
+                        name,
+                        inputs,
+                        args,
+                        state,
+                        kv_matmul,
+                        ..
+                    } => serde_json::json!({
+                        "kernel": if kv_matmul.is_some() { "kv_stepwise_bf16_gemm_active_rows" } else { name },
+                        "capturable": false,
+                        "dynamicGemmDimensions": kv_matmul.is_some(),
+                        "workspaceBytes": kv_matmul.map(|plan| plan.bytes),
+                        "inputs": inputs.iter().flatten().map(|id| value(*id)).collect::<Vec<_>>(),
+                        "state": format!("{state:?}"),
+                        "integers": args.integers,
+                        "computeDtype": args.compute_dtype
+                    }),
+                    CommandKind::Gemm {
+                        x, weight, plan, ..
+                    } => serde_json::json!({
+                        "kernel": "cublas_bf16_gemm", "inputs": [value(*x), value(*weight)],
+                        "m": plan.m, "n": plan.n, "k": plan.k, "batch": plan.batch
+                    }),
+                    CommandKind::LinearBias { .. } => {
+                        serde_json::json!({ "kernel": "et_linear_bias_f32" })
+                    }
+                    CommandKind::GroupedExpert {
+                        rows,
+                        columns,
+                        inner,
+                        experts,
+                        ..
+                    } => serde_json::json!({
+                        "kernel": "grouped_expert_linear_rows", "rows": rows, "columns": columns,
+                        "inner": inner, "experts": experts, "capturable": false,
+                        "controlReadbackBytes": (experts + 2) * 4
+                    }),
+                    CommandKind::Scalar { .. } => serde_json::json!({ "kernel": "et_fill" }),
+                    CommandKind::Cursor { .. } => serde_json::json!({ "kernel": "cursor_upload" }),
+                    _ => unreachable!(),
+                };
+                emit_trace(serde_json::json!({
+                    "event": "begin", "program": format!("{self:p}"), "run": run, "instruction": position,
+                    "operation": operation, "output": value(output_id),
+                    "state": state.as_ref().map(|state| serde_json::json!({
+                        "cursors": state.sequences.iter().map(|sequence| sequence.cursor).collect::<Vec<_>>(),
+                        "validLengths": state.valid_lengths, "capacity": state.capacity,
+                        "access": format!("{:?}", state.access)
+                    }))
+                }))?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let output = match &command.kind {
-                CommandKind::Prepare | CommandKind::StateCopy { .. } => continue,
+                CommandKind::Prepare => continue,
                 CommandKind::Value(value) => value.clone(),
                 CommandKind::Input { binding } => {
                     let value = bindings
@@ -2269,6 +2413,164 @@ impl CudaExecutable {
                     }
                     output
                 }
+                CommandKind::GroupedExpert {
+                    x,
+                    weight,
+                    indexes,
+                    rows,
+                    columns,
+                    inner,
+                    experts,
+                    control,
+                    row_map,
+                    gathered,
+                    projected,
+                    workspace,
+                } => {
+                    let output = self.planned_value(&resources, output_id)?;
+                    if *rows != 0 {
+                        let address = |id: &ValueId| -> Result<u64, String> {
+                            Ok(values[id.index()]
+                                .as_ref()
+                                .ok_or("execute: grouped expert operand unavailable")?
+                                .storage_address())
+                        };
+                        let control = self
+                            .buffer(&resources, *control)?
+                            .cast::<u32>(experts + 2)?;
+                        let row_map = self.buffer(&resources, *row_map)?;
+                        let gathered = self.buffer(&resources, *gathered)?;
+                        let projected = self.buffer(&resources, *projected)?;
+                        let mut args = CudaKernelArgs {
+                            output: control.address(),
+                            elements: (experts + 2) as u64,
+                            output_dtype: dtype_code(DType::U32),
+                            ..Default::default()
+                        };
+                        let control_started = trace.then(std::time::Instant::now);
+                        self.launch("et_fill", &args)?;
+                        args.inputs[0] = address(indexes)?;
+                        args.elements = *rows as u64;
+                        args.integers[0] = *experts as u64;
+                        self.launch("et_grouped_counts", &args)?;
+                        args.elements = 1;
+                        self.launch("et_grouped_offsets", &args)?;
+                        // This is an explicit non-capturable host completion point.
+                        // Only status and E+1 offsets cross the host. No padded
+                        // groups, activations, weights, or row maps are read back.
+                        let readback_started = trace.then(std::time::Instant::now);
+                        let offsets = self
+                            .device
+                            .stream
+                            .clone_dtoh(&control)
+                            .map_err(|e| e.to_string())?;
+                        if let Some(started) = control_started {
+                            emit_trace(serde_json::json!({
+                                "event": "grouped_control", "program": format!("{self:p}"), "run": run,
+                                "instruction": position, "capturable": false, "bytes": (experts + 2) * 4,
+                                "milliseconds": started.elapsed().as_secs_f64() * 1000.0,
+                                "readbackAndWaitMilliseconds": readback_started.unwrap().elapsed().as_secs_f64() * 1000.0,
+                                "activeGroupRows": offsets[1..].windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>()
+                            }))?;
+                        }
+                        if offsets[0] != 0 {
+                            return Err(
+                                "groupedExpertLinearRows: expert index is out of range".into()
+                            );
+                        }
+                        if cancelled.is_cancelled() {
+                            return Err("operation aborted".into());
+                        }
+                        if *columns != 0 && *inner == 0 {
+                            args.output = output.storage_address();
+                            args.output_dtype = dtype_code(meta.dtype);
+                            args.elements = (*rows * *columns) as u64;
+                            self.launch("et_fill", &args)?;
+                        } else if *columns != 0 {
+                            args.elements = *rows as u64;
+                            args.inputs[1] = control.address();
+                            args.output = row_map.address();
+                            self.launch("et_grouped_rows", &args)?;
+                            args.inputs[0] = address(x)?;
+                            args.inputs[1] = row_map.address();
+                            args.output = gathered.address();
+                            args.output_dtype = dtype_code(meta.dtype);
+                            args.elements = (*rows * *inner) as u64;
+                            args.integers[0] = *inner as u64;
+                            self.launch("et_grouped_gather", &args)?;
+                            let width = meta.dtype.size_in_bytes();
+                            let weights = address(weight)?;
+                            let workspace = workspace
+                                .map(|id| self.buffer(&resources, id))
+                                .transpose()?;
+                            for (expert, range) in offsets[1..].windows(2).enumerate() {
+                                if cancelled.is_cancelled() {
+                                    return Err("operation aborted".into());
+                                }
+                                let start = range[0] as usize;
+                                let count = (range[1] - range[0]) as usize;
+                                if count == 0 {
+                                    continue;
+                                }
+                                let x = gathered.address() + (start * *inner * width) as u64;
+                                let weight = weights + (expert * *columns * *inner * width) as u64;
+                                let out = projected.address() + (start * *columns * width) as u64;
+                                if meta.dtype == DType::BF16 {
+                                    let plan = crate::cublas::Bf16GemmPlan {
+                                        m: count,
+                                        n: *columns,
+                                        k: *inner,
+                                        batch: 1,
+                                        stride_x: count * *inner,
+                                        stride_weight: 0,
+                                        stride_out: count * *columns,
+                                    };
+                                    // SAFETY: checked geometry and invocation-planned
+                                    // allocations, retained through the completion fence.
+                                    // The handle lock covers mode/workspace/submission.
+                                    unsafe {
+                                        self.device.cublas.gemm_bf16(
+                                            plan,
+                                            true,
+                                            x,
+                                            weight,
+                                            out,
+                                            false,
+                                            workspace
+                                                .as_ref()
+                                                .ok_or("grouped GEMM workspace missing")?
+                                                .address(),
+                                        )?;
+                                    }
+                                } else {
+                                    let mut gemm = CudaKernelArgs {
+                                        output: out,
+                                        elements: (count * *columns) as u64,
+                                        ..Default::default()
+                                    };
+                                    gemm.inputs[..2].copy_from_slice(&[x, weight]);
+                                    gemm.integers[..2]
+                                        .copy_from_slice(&[*columns as u64, *inner as u64]);
+                                    self.launch("et_grouped_matmul_f32", &gemm)?;
+                                }
+                                #[cfg(test)]
+                                if let Some(after_gemm) = after_gemm {
+                                    after_gemm();
+                                }
+                            }
+                            if cancelled.is_cancelled() {
+                                return Err("operation aborted".into());
+                            }
+                            args.inputs[0] = projected.address();
+                            args.inputs[1] = row_map.address();
+                            args.output = output.storage_address();
+                            args.elements = (*rows * *columns) as u64;
+                            args.integers[0] = *columns as u64;
+                            self.launch("et_grouped_scatter", &args)?;
+                        }
+                    }
+                    output
+                }
                 CommandKind::LinearBias {
                     accumulator,
                     bias,
@@ -2299,6 +2601,7 @@ impl CudaExecutable {
                     status,
                     state: access,
                     state_buffers,
+                    kv_matmul,
                     ..
                 } => {
                     let output = self.planned_value(&resources, output_id)?;
@@ -2335,18 +2638,37 @@ impl CudaExecutable {
                         args.integers[0] =
                             args.integers[0].wrapping_add(run.wrapping_mul(0x9e3779b97f4a7c15));
                     }
+                    let transaction_buffers = state_buffers
+                        .iter()
+                        .map(|id| id.map(|id| self.buffer(&resources, id)).transpose())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut kv_ranges = Vec::new();
                     self.prepare_kernel_state(
                         access,
                         &mut args,
                         &scratch_buffers,
+                        &transaction_buffers,
                         state.as_deref_mut(),
+                        &mut kv_ranges,
                     )?;
-                    for (slot, id) in state_buffers.iter().enumerate() {
-                        if let Some(id) = id {
-                            args.inputs[slot + 3] = self.buffer(&resources, *id)?.address();
+                    if let Some(plan) = kv_matmul {
+                        if traced {
+                            emit_trace(serde_json::json!({
+                                "event":"kv_gemm_geometry", "instruction":position, "capturable":false,
+                                "lanes":kv_ranges.iter().map(|&(lane,p,q)|serde_json::json!({"lane":lane,"p":p,"q":q})).collect::<Vec<_>>(),
+                                "workspaceBytes":plan.bytes, "kernelAndGemmSubmissions":2+5*kv_ranges.len(),
+                            }))?;
                         }
+                        crate::kv_matmul::execute(
+                            &self.device,
+                            &args,
+                            *plan,
+                            &kv_ranges,
+                            |name, args| self.launch(name, args),
+                        )?;
+                    } else {
+                        self.launch(name, &args)?;
                     }
-                    self.launch(name, &args)?;
                     let code = self
                         .device
                         .stream
@@ -2361,10 +2683,27 @@ impl CudaExecutable {
                         6 => return Err("expertLinearRows: expert index is out of range".into()),
                         _ => return Err(format!("{name}: invalid arithmetic")),
                     }
+                    #[cfg(test)]
+                    if matches!(access, StateAccess::Kv { .. }) {
+                        if let Some(hook) = after_kv {
+                            hook();
+                        }
+                    }
                     self.commit_kernel_state(access, &scratch_buffers, state.as_deref_mut())?;
                     output
                 }
             };
+            if let Some(started) = started {
+                self.device
+                    .stream
+                    .synchronize()
+                    .map_err(|error| error.to_string())?;
+                emit_trace(serde_json::json!({
+                    "event": "end", "program": format!("{self:p}"), "run": run, "instruction": position,
+                    "diagnostic": true, "streamSynchronized": true,
+                    "milliseconds": started.elapsed().as_secs_f64() * 1000.0
+                }))?;
+            }
             values[output_id.index()] = Some(output);
         }
         self.device
@@ -2411,20 +2750,62 @@ impl CudaExecutable {
         if args.elements == 0 {
             return Ok(());
         }
-        // KV keeps causal row order within each warp while its lanes compute
-        // output dimensions in parallel. Small head dimensions still need a
-        // complete warp for every logical sequence.
-        let work_items = if name == "et_kv_attention" {
-            args.integers[5]
+        // Current rows must be stored before query/head warps read them,
+        // including future rows in a bidirectional canvas. Both launches use
+        // the same stream and invocation-owned transaction/scratch storage.
+        let warp_sum = name == "et_reduce_f32" && args.operation == 0;
+        let wide_trailing =
+            name == "et_reduce_f32" && args.integers[2] != 0 && args.integers[1] >= 4096;
+        if wide_trailing && matches!(args.operation, 0 | 2 | 3) {
+            let kernel = if args.operation == 0 {
+                "et_sum_wide_f32"
+            } else {
+                "et_reduce_last_wide_f32"
+            };
+            let function = self.device.kernel(kernel)?;
+            let mut launch = self.device.stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (args.elements.min(65535) as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        let work_items = if warp_sum {
+            args.elements
+                .checked_mul(32)
+                .ok_or("CUDA Sum grid overflow")?
+        } else if name == "et_rms_norm_f32" {
+            (args.elements / args.integers[0])
+                .checked_mul(32)
+                .ok_or("CUDA RMS grid overflow")?
+        } else if name == "et_grouped_rows" {
+            args.integers[0] * 32
+        } else if name == "et_kv_attention" {
+            self.launch("et_kv_store", args)?;
+            (args.elements / args.integers[10])
                 .checked_mul(32)
                 .ok_or("CUDA KV grid overflow")?
+        } else if name == "et_kv_store" {
+            args.integers[5]
+                .checked_mul(args.integers[2])
+                .and_then(|n| n.checked_mul(args.integers[7]))
+                .ok_or("CUDA KV store grid overflow")?
         } else if name == "et_top_k_indices" {
             // One block per row. Thread zero owns the stable insertion output.
             (args.elements / args.integers[0]) * 256
         } else {
             args.elements
         };
-        let blocks = u32::try_from(work_items.div_ceil(256)).map_err(|_| "CUDA grid overflow")?;
+        let blocks = if name.starts_with("et_grouped_") || name == "et_rms_norm_f32" || warp_sum {
+            work_items.div_ceil(256).clamp(1, 65535) as u32
+        } else {
+            u32::try_from(work_items.div_ceil(256)).map_err(|_| "CUDA grid overflow")?
+        };
         let function = self.device.kernel(name)?;
         let mut launch = self.device.stream.launch_builder(function);
         launch.arg(args);
@@ -2452,9 +2833,28 @@ pub(super) fn physical_counts(
     let mut completions = 1; // Final stream completion before output publication.
     for command in commands {
         match &command.kind {
-            CommandKind::Gemm { .. }
-            | CommandKind::StateCopy { .. }
-            | CommandKind::Cursor { .. } => submissions += 1,
+            CommandKind::Gemm { .. } | CommandKind::Cursor { .. } => submissions += 1,
+            CommandKind::GroupedExpert {
+                rows,
+                columns,
+                inner,
+                experts,
+                ..
+            } => {
+                if *rows != 0 {
+                    // Reset/count/prefix/readback plus at most min(N,E) GEMMs.
+                    // Exact dynamic counts and wait time are emitted by trace.
+                    submissions += 4;
+                    completions += 1;
+                    if *columns != 0 {
+                        submissions += if *inner == 0 {
+                            1
+                        } else {
+                            3 + rows.min(experts)
+                        };
+                    }
+                }
+            }
             CommandKind::Scalar { .. } | CommandKind::LinearBias { .. } => {
                 submissions += usize::from(
                     command
@@ -2463,7 +2863,11 @@ pub(super) fn physical_counts(
                 );
             }
             CommandKind::Kernel {
-                name, args, state, ..
+                name,
+                args,
+                state,
+                kv_matmul,
+                ..
             } => {
                 // Status reset, optional launch, and status readback.
                 let launches = if *name == "et_expert_linear_rows" {
@@ -2471,13 +2875,24 @@ pub(super) fn physical_counts(
                 } else {
                     args.elements != 0
                 };
-                submissions += 2 + usize::from(launches);
+                let kernel_submissions = if kv_matmul.is_some() {
+                    // Zero output, store current rows, then gather/QK/softmax/PV/round
+                    // per active lane. Static diagnostics bound all declared lanes.
+                    let StateAccess::Kv { batch, .. } = state else {
+                        unreachable!()
+                    };
+                    2 + 5 * batch
+                } else if *name == "et_kv_attention" {
+                    2
+                } else {
+                    1
+                };
+                submissions += 2 + usize::from(launches) * kernel_submissions;
                 completions += 1;
                 submissions += match state {
                     StateAccess::Rotary => 1,
-                    StateAccess::Kv { .. } | StateAccess::Kda { .. } | StateAccess::Conv { .. } => {
-                        2
-                    }
+                    StateAccess::Kv { .. } => 3,
+                    StateAccess::Kda { .. } | StateAccess::Conv { .. } => 2,
                     StateAccess::None | StateAccess::LastToken { .. } => 0,
                 };
                 if matches!(
@@ -2570,7 +2985,7 @@ fn compile_inner(
     let prepared = request.prepare()?;
     let mut driver = CompilerDriver::new(&prepared, &capabilities)?;
     let mut builder =
-        CudaProgramBuilder::new(&prepared.index, state_layout, driver.legalization())?;
+        CudaProgramBuilder::new(&prepared.index, state_layout.clone(), driver.legalization())?;
     driver.lower(|unit, index, _, plan| {
         let LoweringUnit::Node(dense) = unit else {
             return Err("compile: CUDA regions unsupported".into());
@@ -2607,6 +3022,20 @@ fn compile_inner(
                 }
                 CommandKind::LinearBias { .. } => {
                     device.kernel(BF16_LINEAR_BIAS_KERNEL)?;
+                    Ok(None)
+                }
+                CommandKind::GroupedExpert { .. } => {
+                    for name in [
+                        "et_fill",
+                        "et_grouped_counts",
+                        "et_grouped_offsets",
+                        "et_grouped_rows",
+                        "et_grouped_gather",
+                        "et_grouped_scatter",
+                        "et_grouped_matmul_f32",
+                    ] {
+                        device.kernel(name)?;
+                    }
                     Ok(None)
                 }
                 _ => Ok(None),
@@ -2661,302 +3090,122 @@ fn full_value(
 }
 
 impl CudaExecutable {
-    /// Acquires explicit state-owned storage before encoding any operations.
+    /// Borrow immutable page tables; no prefix payload is uploaded or copied.
     pub fn prepare_state(&self, state: &mut CudaStateInvocation) -> Result<(), String> {
-        if let Some(layout) = self.state_layout {
-            if layout.capacity != state.capacity
-                || layout.dtype != state.cache_dtype
-                || layout.slots as usize != state.valid_lengths.len()
-                || layout.packed_rows_per_sequence != state.packed_rows_per_sequence
-            {
-                return Err("execute: state layout differs from compiled layout".into());
-            }
-        }
-        if state.slots.len() != state.sequences.len()
-            || state
-                .slots
-                .iter()
-                .any(|slot| *slot as usize >= state.valid_lengths.len())
+        let layout = self
+            .state_layout
+            .as_ref()
+            .ok_or("execute: state layout is missing")?;
+        if layout.capacity != state.capacity
+            || layout.dtype != state.cache_dtype
+            || layout.slots as usize != state.valid_lengths.len()
+            || layout.packed_rows_per_sequence != state.packed_rows_per_sequence
+            || layout.kv_layers != state.kv_layers
+            || layout.access != state.access
         {
+            return Err("execute: state layout differs from compiled layout".into());
+        }
+        if state.slots.len() != state.sequences.len() {
             return Err("execute: CUDA sequence slots are invalid".into());
         }
-        let mut geometry = None;
-        let mut layers = 0usize;
-        for command in &self.commands {
-            if let CommandKind::Kernel {
-                state: StateAccess::Kv {
-                    layer, heads, dim, ..
-                },
-                ..
-            } = &command.kind
-            {
-                if geometry.is_some_and(|old| old != (*heads, *dim)) {
-                    return Err("execute: CUDA KV layer geometry differs".into());
-                }
-                geometry = Some((*heads, *dim));
-                layers = layers.max(layer.checked_add(1).ok_or("KV layer count overflow")?);
-            }
-        }
-        let Some((heads, dim)) = geometry else {
-            return Ok(());
-        };
-        if state.capacity == 0
-            || !matches!(
-                state.cache_dtype,
-                DType::F32 | DType::F16 | DType::BF16 | DType::U8
-            )
-        {
-            return Err("execute: invalid CUDA KV storage contract".into());
-        }
-        let rows = product(&[state.valid_lengths.len(), state.capacity as usize, heads])?;
-        let layer_elements = product(&[rows, dim])?;
-        let width = state.cache_dtype.size_in_bytes();
-        let bytes = product(&[layers, layer_elements, width])?;
-        if let Some(cache) = &state.cache {
-            if cache.layer_elements != layer_elements
-                || cache.dtype != state.cache_dtype
-                || cache.keys.len() != bytes
-                || cache.values.len() != bytes
-            {
-                return Err("execute: CUDA state cache layout differs".into());
-            }
-            return Ok(());
-        }
-        let mut keys = vec![
-            if state.cache_dtype == DType::U8 {
-                128u8
-            } else {
-                0
-            };
-            bytes
-        ];
-        let mut values = keys.clone();
-        let scale_elements = if state.cache_dtype == DType::U8 {
-            product(&[layers, rows])?
-        } else {
-            0
-        };
-        let mut key_scales = vec![0.0f32; scale_elements];
-        let mut value_scales = key_scales.clone();
-        let row_elements = product(&[state.capacity as usize, heads, dim])?;
-        let row_bytes = product(&[row_elements, width])?;
-        let row_scales = product(&[state.capacity as usize, heads])?;
-        for (request, &slot) in state.slots.iter().enumerate() {
-            let sequence = &state.sequences[request];
-            if let Some(snapshot) = &sequence.kv_storage {
-                if snapshot.dtype != state.cache_dtype
-                    || snapshot.keys.len() != layers
-                    || snapshot.values.len() != layers
-                {
-                    return Err("execute: CUDA KV snapshot layout differs".into());
-                }
-                for layer in 0..layers {
-                    if snapshot.keys[layer].len() != row_bytes
-                        || snapshot.values[layer].len() != row_bytes
-                    {
-                        return Err("execute: CUDA KV snapshot byte length differs".into());
-                    }
-                    let start = layer * layer_elements * width + slot as usize * row_bytes;
-                    keys[start..start + row_bytes].copy_from_slice(&snapshot.keys[layer]);
-                    values[start..start + row_bytes].copy_from_slice(&snapshot.values[layer]);
-                    if state.cache_dtype == DType::U8 {
-                        let ks = snapshot
-                            .key_scales
-                            .get(layer)
-                            .filter(|s| s.len() == row_scales)
-                            .ok_or("execute: missing key scales")?;
-                        let vs = snapshot
-                            .value_scales
-                            .get(layer)
-                            .filter(|s| s.len() == row_scales)
-                            .ok_or("execute: missing value scales")?;
-                        let start = layer * rows + slot as usize * row_scales;
-                        key_scales[start..start + row_scales].copy_from_slice(ks);
-                        value_scales[start..start + row_scales].copy_from_slice(vs);
-                    }
-                }
-            } else if sequence.cursor != 0 {
-                if state.cache_dtype == DType::U8 {
-                    return Err(
-                        "execute: quantized KV restore requires exact codes and scales".into(),
-                    );
-                }
-                if sequence.keys.len() != layers || sequence.values.len() != layers {
-                    return Err("execute: nonempty sequence has no KV snapshot".into());
-                }
-                for layer in 0..layers {
-                    if sequence.keys[layer].len() != row_elements
-                        || sequence.values[layer].len() != row_elements
-                    {
-                        return Err("execute: dense KV snapshot geometry differs".into());
-                    }
-                    let start = layer * layer_elements * width + slot as usize * row_bytes;
-                    keys[start..start + row_bytes].copy_from_slice(
-                        &crate::value::dense_bytes_from_host(
-                            &sequence.keys[layer],
-                            state.cache_dtype,
-                        ),
-                    );
-                    values[start..start + row_bytes].copy_from_slice(
-                        &crate::value::dense_bytes_from_host(
-                            &sequence.values[layer],
-                            state.cache_dtype,
-                        ),
-                    );
-                }
-            }
-        }
-        let upload = |data: &[u8]| {
-            self.device
-                .stream
-                .clone_htod(data)
-                .map(CudaBuffer::from_slice)
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
-        };
-        let upload_scales = |data: &[f32]| {
-            self.device
-                .stream
-                .clone_htod(data)
-                .map(CudaBuffer::from_slice)
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
-        };
-        state.cache = Some(CudaKvCache {
-            keys: upload(&keys)?,
-            values: upload(&values)?,
-            key_scales: if scale_elements > 0 {
-                Some(upload_scales(&key_scales)?)
-            } else {
-                None
-            },
-            value_scales: if scale_elements > 0 {
-                Some(upload_scales(&value_scales)?)
-            } else {
-                None
-            },
-            layer_elements,
-            dtype: state.cache_dtype,
+        let mut seen = vec![false; state.valid_lengths.len()];
+        let bounded = state.kv_layers.iter().any(|layer| {
+            layer
+                .retention
+                .is_none_or(|retention| retention > state.capacity as usize)
         });
+        for (request, &slot) in state.slots.iter().enumerate() {
+            let active = seen
+                .get_mut(slot as usize)
+                .ok_or("execute: invalid state slot")?;
+            if *active {
+                return Err("execute: duplicate state slot".into());
+            }
+            *active = true;
+            let cursor = state.sequences[request].cursor;
+            let end = cursor
+                .checked_add(state.valid_lengths[slot as usize])
+                .ok_or("execute: cursor overflow")?;
+            if bounded
+                && (cursor > state.capacity
+                    || (state.access == StateAccessMode::Append && end > state.capacity))
+            {
+                return Err("execute: prefix exceeds KV capacity".into());
+            }
+        }
+        if state.cache.is_none() {
+            let mut sequences = Vec::with_capacity(state.sequences.len());
+            for sequence in &state.sequences {
+                let snapshot = sequence
+                    .kv_storage
+                    .clone()
+                    .unwrap_or_else(|| CudaKvSnapshot {
+                        layers: state
+                            .kv_layers
+                            .iter()
+                            .map(|&descriptor| CudaKvLayer {
+                                descriptor,
+                                start_position: 0,
+                                pages: Vec::new(),
+                            })
+                            .collect(),
+                    });
+                if snapshot
+                    .layers
+                    .iter()
+                    .map(|layer| layer.descriptor)
+                    .collect::<Vec<_>>()
+                    != state.kv_layers
+                {
+                    return Err("execute: prefix layer schema differs".into());
+                }
+                for layer in &snapshot.layers {
+                    let expected = sequence.cursor.saturating_sub(
+                        layer
+                            .descriptor
+                            .retention
+                            .unwrap_or(state.capacity as usize) as u32,
+                    );
+                    if layer.start_position != expected
+                        || (sequence.cursor > layer.start_position && layer.pages.is_empty())
+                    {
+                        return Err("execute: prefix is missing retained KV rows".into());
+                    }
+                }
+                sequences.push(snapshot);
+            }
+            state.cache = Some(CudaKvCache { sequences });
+        }
         Ok(())
     }
+    /// Publication retains device pages. Only inspect() exports host arrays.
     pub fn readback_state(&self, state: &mut CudaStateInvocation) -> Result<(), String> {
-        let Some(cache) = &state.cache else {
+        if state.access == StateAccessMode::ReadOnly {
+            return Ok(());
+        }
+        let Some(cache) = &mut state.cache else {
             return Ok(());
         };
-        let keys = self
-            .device
-            .stream
-            .clone_dtoh(cache.keys.as_ref())
-            .map_err(|e| e.to_string())?;
-        let values = self
-            .device
-            .stream
-            .clone_dtoh(cache.values.as_ref())
-            .map_err(|e| e.to_string())?;
-        let ks = cache
-            .key_scales
-            .as_ref()
-            .map(|s| {
-                self.device
-                    .stream
-                    .clone_dtoh(s.as_ref())
-                    .map_err(|e| e.to_string())
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let vs = cache
-            .value_scales
-            .as_ref()
-            .map(|s| {
-                self.device
-                    .stream
-                    .clone_dtoh(s.as_ref())
-                    .map_err(|e| e.to_string())
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let layer_bytes = product(&[cache.layer_elements, cache.dtype.size_in_bytes()])?;
-        if layer_bytes == 0 || state.valid_lengths.is_empty() {
-            return Err("execute: empty KV cache geometry".into());
-        }
-        let layers = keys.len() / layer_bytes;
-        let sequence_bytes = layer_bytes / state.valid_lengths.len();
-        let sequence_scales = if ks.is_empty() {
-            0
-        } else {
-            ks.len() / layers / state.valid_lengths.len()
-        };
-        for (request, &slot) in state.slots.iter().enumerate() {
-            let mut snapshot = CudaKvSnapshot {
-                dtype: cache.dtype,
-                keys: Vec::with_capacity(layers),
-                values: Vec::with_capacity(layers),
-                key_scales: Vec::with_capacity(layers),
-                value_scales: Vec::with_capacity(layers),
-            };
-            for layer in 0..layers {
-                let start = layer * layer_bytes + slot as usize * sequence_bytes;
-                snapshot
-                    .keys
-                    .push(keys[start..start + sequence_bytes].to_vec());
-                snapshot
-                    .values
-                    .push(values[start..start + sequence_bytes].to_vec());
-                if sequence_scales != 0 {
-                    let start =
-                        (layer * state.valid_lengths.len() + slot as usize) * sequence_scales;
-                    snapshot
-                        .key_scales
-                        .push(ks[start..start + sequence_scales].to_vec());
-                    snapshot
-                        .value_scales
-                        .push(vs[start..start + sequence_scales].to_vec());
-                }
+        for (request, snapshot) in cache.sequences.iter_mut().enumerate() {
+            let end = state.sequences[request]
+                .cursor
+                .checked_add(state.valid_lengths[state.slots[request] as usize])
+                .ok_or("execute: cursor overflow")?;
+            for layer in &mut snapshot.layers {
+                let retained = layer
+                    .descriptor
+                    .retention
+                    .unwrap_or(state.capacity as usize);
+                layer.start_position = end.saturating_sub(
+                    u32::try_from(retained).map_err(|_| "execute: retention exceeds u32")?,
+                );
+                layer
+                    .pages
+                    .retain(|page| page.start + page.count > layer.start_position);
             }
-            state.sequences[request].kv_storage = Some(snapshot);
+            state.sequences[request].kv_storage = Some(snapshot.clone());
         }
         Ok(())
-    }
-    fn state_buffer(
-        &self,
-        state: &CudaStateInvocation,
-        component: StateComponent,
-        bytes: usize,
-    ) -> Result<CudaBuffer<u8>, String> {
-        let cache = state
-            .cache
-            .as_ref()
-            .ok_or("execute: persistent KV storage missing")?;
-        let (layer, buffer) = match component {
-            StateComponent::Keys(layer) => (layer, cache.keys.as_ref().clone()),
-            StateComponent::Values(layer) => (layer, cache.values.as_ref().clone()),
-            StateComponent::KeyScales(layer) => {
-                let source = cache
-                    .key_scales
-                    .as_ref()
-                    .ok_or("execute: key scales missing")?;
-                (
-                    layer,
-                    source
-                        .cast::<u8>(source.len().checked_mul(4).ok_or("scale bytes overflow")?)?,
-                )
-            }
-            StateComponent::ValueScales(layer) => {
-                let source = cache
-                    .value_scales
-                    .as_ref()
-                    .ok_or("execute: value scales missing")?;
-                (
-                    layer,
-                    source
-                        .cast::<u8>(source.len().checked_mul(4).ok_or("scale bytes overflow")?)?,
-                )
-            }
-            _ => return Err("execute: recurrent state uses host transaction staging".into()),
-        };
-        let start = layer.checked_mul(bytes).ok_or("state offset overflow")?;
-        buffer.slice(start..start.checked_add(bytes).ok_or("state range overflow")?)
     }
     fn upload_scratch<T: DeviceRepr + Send + Sync + 'static>(
         &self,
@@ -2977,7 +3226,9 @@ impl CudaExecutable {
         access: &StateAccess,
         args: &mut CudaKernelArgs,
         scratch: &[Option<CudaBuffer<u8>>],
+        transactions: &[Option<CudaBuffer<u8>>],
         state: Option<&mut CudaStateInvocation>,
+        kv_ranges: &mut Vec<(usize, usize, usize)>,
     ) -> Result<(), String> {
         match access {
             StateAccess::None => {}
@@ -3022,64 +3273,143 @@ impl CudaExecutable {
                 if product(&[state.valid_lengths.len(), rows])? != *batch {
                     return Err("execute: KV batch geometry differs".into());
                 }
+                let tokens = args.integers[7] as usize;
+                let per_sequence = product(&[rows, tokens])?;
+                let descriptor = *state
+                    .kv_layers
+                    .iter()
+                    .find(|d| d.layer_id as usize == *layer)
+                    .ok_or("execute: KV layer descriptor missing")?;
+                if descriptor.kv_heads != *heads || descriptor.head_dim != *dim {
+                    return Err("execute: KV layer geometry differs".into());
+                }
                 let cache = state
                     .cache
-                    .as_ref()
+                    .as_mut()
                     .ok_or("execute: KV state was not prepared")?;
-                let layer_bytes = product(&[cache.layer_elements, cache.dtype.size_in_bytes()])?;
-                let start = product(&[*layer, layer_bytes])?;
-                args.inputs[3] = cache.keys.slice(start..start + layer_bytes)?.address();
-                args.inputs[4] = cache.values.slice(start..start + layer_bytes)?.address();
-                let layer_scales =
-                    product(&[state.valid_lengths.len(), state.capacity as usize, *heads])?;
-                if cache.dtype == DType::U8 {
-                    let start = product(&[*layer, layer_scales])?;
-                    args.inputs[5] = cache
-                        .key_scales
-                        .as_ref()
-                        .ok_or("key scales missing")?
-                        .slice(start..start + layer_scales)?
-                        .address();
-                    args.inputs[6] = cache
-                        .value_scales
-                        .as_ref()
-                        .ok_or("value scales missing")?
-                        .slice(start..start + layer_scales)?
-                        .address();
-                }
+                let row_bytes = product(&[*heads, *dim, descriptor.dtype.size_in_bytes()])?;
+                let mut table = vec![0u64; state.valid_lengths.len() * 4];
                 let mut cursors = vec![0u32; *batch];
                 let mut valid = vec![0u32; *batch];
                 for (request, &slot) in state.slots.iter().enumerate() {
-                    for row in 0..rows {
-                        let lane = slot as usize * rows + row;
-                        cursors[lane] = state.sequences[request]
-                            .cursor
-                            .checked_add(row as u32)
-                            .ok_or("KV cursor overflow")?;
-                        valid[lane] = if rows == 1 {
-                            state.valid_lengths[slot as usize]
-                        } else {
-                            u32::from(row < state.valid_lengths[slot as usize] as usize)
+                    let slot = slot as usize;
+                    let cursor = state.sequences[request].cursor;
+                    let count = state.valid_lengths[slot] as usize;
+                    if count > per_sequence || (rows > 1 && tokens != 1) {
+                        return Err("execute: invalid KV token count".into());
+                    }
+                    let end = cursor
+                        .checked_add(count as u32)
+                        .ok_or("execute: cursor overflow")?;
+                    let cached = cache.sequences[request]
+                        .layers
+                        .iter_mut()
+                        .find(|l| l.descriptor.layer_id == descriptor.layer_id)
+                        .ok_or("execute: KV layer missing")?;
+                    cached.pages.retain(|p| p.start < cursor);
+                    if count != 0 {
+                        let byte_start = product(&[slot, per_sequence, row_bytes])?;
+                        let byte_end = byte_start
+                            .checked_add(count * row_bytes)
+                            .ok_or("KV byte range overflow")?;
+                        let slice = |role: usize| {
+                            transactions[role]
+                                .as_ref()
+                                .ok_or("execute: KV transaction missing")?
+                                .slice(byte_start..byte_end)
                         };
+                        let scales = |role: usize| -> Result<Option<CudaBuffer<f32>>, String> {
+                            if descriptor.dtype != DType::U8 {
+                                return Ok(None);
+                            }
+                            let start = product(&[slot, per_sequence, *heads, 4])?;
+                            let len = product(&[count, *heads])?;
+                            Ok(Some(
+                                transactions[role]
+                                    .as_ref()
+                                    .ok_or("execute: KV scale transaction missing")?
+                                    .slice(start..start + len * 4)?
+                                    .cast::<f32>(len)?,
+                            ))
+                        };
+                        cached.pages.push(Arc::new(CudaKvPage {
+                            start: cursor,
+                            count: count as u32,
+                            keys: slice(0)?,
+                            values: slice(1)?,
+                            key_scales: scales(2)?,
+                            value_scales: scales(3)?,
+                        }));
+                    }
+                    let start = cached.start_position;
+                    let offset = table.len() as u64;
+                    table[slot * 4..slot * 4 + 4].copy_from_slice(&[
+                        u64::from(start),
+                        u64::from(cursor),
+                        u64::from(end),
+                        offset,
+                    ]);
+                    let mut position = start;
+                    for page in &cached.pages {
+                        let from = page.start.max(start);
+                        let to = (page.start + page.count).min(end);
+                        if to <= from {
+                            continue;
+                        }
+                        if from != position {
+                            return Err("execute: prefix page table has a gap".into());
+                        }
+                        for pos in from..to {
+                            let offset = (pos - page.start) as usize;
+                            table.extend_from_slice(&[
+                                page.keys.address() + (offset * row_bytes) as u64,
+                                page.values.address() + (offset * row_bytes) as u64,
+                                page.key_scales
+                                    .as_ref()
+                                    .map_or(0, |s| s.address() + (offset * heads * 4) as u64),
+                                page.value_scales
+                                    .as_ref()
+                                    .map_or(0, |s| s.address() + (offset * heads * 4) as u64),
+                            ]);
+                        }
+                        position = to;
+                    }
+                    if position != end {
+                        return Err("execute: incomplete prefix page table".into());
+                    }
+                    for row in 0..rows {
+                        cursors[slot * rows + row] =
+                            cursor.checked_add(row as u32).ok_or("KV cursor overflow")?;
+                        valid[slot * rows + row] = if rows == 1 {
+                            count as u32
+                        } else {
+                            u32::from(row < count)
+                        };
+                        if valid[slot * rows + row] != 0 {
+                            kv_ranges.push((
+                                slot * rows + row,
+                                (end - start) as usize,
+                                valid[slot * rows + row] as usize,
+                            ));
+                        }
                     }
                 }
                 self.upload_scratch(&scratch[0], &valid)?;
                 self.upload_scratch(&scratch[1], &cursors)?;
+                let target = scratch[2]
+                    .as_ref()
+                    .ok_or("execute: KV pointer staging missing")?;
+                let mut target = target.slice(0..table.len() * 8)?.cast::<u64>(table.len())?;
+                self.device
+                    .stream
+                    .memcpy_htod(&table, &mut target)
+                    .map_err(|e| e.to_string())?;
+                args.inputs[3] = target.address();
+                args.inputs[4] = args.scratch[2] + args.integers[12];
                 args.inputs[7] = args.scratch[1];
-                args.integers[0] = u64::from(state.capacity);
-                args.integers[1] = u64::from(dtype_code(cache.dtype));
+                args.integers[1] = u64::from(dtype_code(descriptor.dtype));
                 args.integers[2] = rows as u64;
                 args.integers[5] = state.valid_lengths.len() as u64;
-                if cache.layer_elements
-                    != product(&[
-                        state.valid_lengths.len(),
-                        state.capacity as usize,
-                        *heads,
-                        *dim,
-                    ])?
-                {
-                    return Err("execute: KV physical layout differs".into());
-                }
             }
             StateAccess::Kda {
                 layer,

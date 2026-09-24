@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "model": {
+    "id": "google/diffusiongemma-26B-A4B-it",
+    "revision": "f7f5b7f5fa82ffc52addd066915886d497f5517b",
+    "precision": "bfloat16",
+    "tokenizerSha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "chatTemplateSha256": "9aeb7eac68ad87bba7567e9d4597ff203e5609f1b427d9e823437d0142cc61bf",
+    "initializedStateSha256": "69c413815d1e62b529c88cc1d393b1242a2910a8237cce73f60290206fee9c60"
+  },
+  "generation": {
+    "canvasLength": 256,
+    "maxNewTokens": 256,
+    "maxSteps": 48,
+    "entropyBound": 0.1,
+    "minTemperature": 0.4,
+    "maxTemperature": 0.8,
+    "stabilityThreshold": 1,
+    "confidenceThreshold": 0.005,
+    "eosTokenIds": [1, 106, 50],
+    "padTokenId": 0,
+    "enableThinking": false,
+    "seed": 20260924
+  },
+  "target": {
+    "engine": "vllm",
+    "minimumVersion": "0.24.0",
+    "dockerImage": "vllm/vllm-openai@sha256:251eba5cc7c12fed0b75da22a9240e582b1c9e39f6fbc064f86781b963bd814f",
+    "imageCommit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "wheelUrl": "https://files.pythonhosted.org/packages/00/33/3f0abda52acff437a471cf3a2bf204213eb4102975b2677512cd76f2b45e/vllm-0.24.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+    "wheelSha256": "2d2831aeba311292250df0132dbc4d8e9f42c654536eaec48e6fe58acb1822cf",
+    "supportMergeCommit": "eb28452b10a1376d143b2847a78b31726db346dd"
+  },
+  "hardware": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell",
+    "minimumMemoryBytes": 96000000000,
+    "gpuCount": 1
+  },
+  "deployment": {
+    "maxTokens": 8192,
+    "gpuMemoryUtilization": 0.85
+  },
+  "matrix": {
+    "promptTargets": [32, 128, 512, 2048],
+    "outputTokens": [64, 128, 256],
+    "concurrencies": [1, 2, 4],
+    "warmupRuns": 1,
+    "measuredRuns": 3,
+    "cooldownMilliseconds": 2000
+  },
+  "promptPaddingOverheadTokens": 3,
+  "promptWords": [
+    "system",
+    "harbor",
+    "signal",
+    "meadow",
+    "copper",
+    "lantern",
+    "orbit",
+    "timber",
+    "cascade",
+    "archive",
+    "willow",
+    "granite",
+    "compass",
+    "ember",
+    "tunnel",
+    "fabric"
+  ],
+  "prompts": [
+    {
+      "id": "explain-0",
+      "question": "Explain why the sky appears blue to a curious student.",
+      "offset": 0,
+      "baseTokens": 20
+    },
+    {
+      "id": "plan-1",
+      "question": "Write a practical plan for restoring a neglected community garden.",
+      "offset": 3,
+      "baseTokens": 20
+    },
+    {
+      "id": "debug-2",
+      "question": "Diagnose a service that becomes slow only after several hours of traffic.",
+      "offset": 7,
+      "baseTokens": 23
+    },
+    {
+      "id": "compare-3",
+      "question": "Compare solar and wind power for a small isolated research station.",
+      "offset": 11,
+      "baseTokens": 21
+    }
+  ]
+}

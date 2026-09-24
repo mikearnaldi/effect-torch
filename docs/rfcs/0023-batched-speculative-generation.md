@@ -16,7 +16,7 @@ single-sequence case. Normal decoding returns one token per page; speculative
 decoding may return several accepted tokens followed by a target correction or
 bonus token. Pages in one result may have different lengths.
 
-Speculation is configured when calling `Model.inference`; it is not a separate
+Speculation is configured when calling `AutoRegressive.compile`; it is not a separate
 public session type. A proposer-neutral native round can execute conventional
 draft models, EAGLE/MTP-style auxiliary drafters, DFlash, DSpark,
 self-speculation, retrieval proposers, and linear or tree candidate layouts.
@@ -69,7 +69,7 @@ not preserve the current single/batched and logits/sampled matrix.
 6. Sampling defaults are fixed at inference creation and may be overridden per
    lane. All tokens in one lane use the same effective controls for that round.
 7. Sequence identity, not a transient array index, keys sampling counters.
-8. Speculation is configured on `Model.inference` and lowered with the target
+8. Speculation is configured on `AutoRegressive.compile` and lowered with the target
    model into one backend-owned inference artifact.
 9. Core speculative execution methods are required runtime methods. There is
    no capability probing or optional-method fallback.
@@ -155,7 +155,7 @@ weight retention, hidden taps, vocabulary mapping, and state geometry must be
 validated before a sequence can mutate.
 
 ```ts
-export interface InferenceConfig {
+export interface CompileOptions {
   readonly batchSize?: number
   readonly prefillChunk?: number
   readonly sampling: SamplingOptions
@@ -170,7 +170,7 @@ export interface InferenceConfig {
 
 `ProposerArtifact` is one opaque effect-torch artifact regardless of research
 method. A conventional small LLM and target-coupled DFlash checkpoint differ in
-their internal plan, not in `Model.inference`. First-party or model packages
+their internal plan, not in `AutoRegressive.compile`. First-party or model packages
 construct artifacts through `Speculation.artifact`; convenience loaders such as
 `DFlash.load` may validate named checkpoint formats but return the same type.
 
@@ -199,7 +199,7 @@ execution stages, target dependencies, candidate topology, probability
 contract, state schema, trained limits, and token mapping. It does not contain
 an `"eagle" | "dflash" | ...` switch. Retrieval and self-speculation artifacts
 may have no separately retained parameters. Unsupported plans fail during
-`Model.inference`, before opening a generation session or mutating a sequence.
+`AutoRegressive.compile`, before opening a generation session or mutating a sequence.
 
 ### Raw logits escape hatch
 
@@ -456,7 +456,7 @@ artifact construction. `ProposerOutput` explicitly identifies the values that
 become candidates, probability rows, parents, and confidence. There are no
 implicit adjacent-stage inputs or conventional output slot numbers.
 
-`TargetContract` is checked during `Model.inference`. Token mapping, vocabulary,
+`TargetContract` is checked during `AutoRegressive.compile`. Token mapping, vocabulary,
 declared tap shapes/dtypes, and shared-weight names and shapes must match before
 proposer programs are retained. A standalone draft normally leaves graph and
 checkpoint fingerprints empty. A target-coupled checkpoint supplies either or
@@ -481,7 +481,7 @@ recipe.
 The first speculative milestone supports exactly one `Autoregressive` stage
 with KV state, `AutoregressiveChain` commit, chain output, and
 `CausalNormalized` probabilities. Other variants are present in the plan schema
-so adding a trained proposer does not change `Model.inference` or `runRound`,
+so adding a trained proposer does not change `AutoRegressive.compile` or `runRound`,
 but a backend rejects unimplemented variants at compile time.
 
 ```rust
@@ -743,7 +743,7 @@ masks remain inside the proposer executable.
 ## Backend Contract
 
 The inference runtime extension is a required cohesive contract. Its concrete
-TypeScript grouping may differ, but every runtime used by `Model.inference`
+TypeScript grouping may differ, but every runtime used by `AutoRegressive.compile`
 implements these operations rather than advertising them optionally:
 
 ```ts
@@ -811,7 +811,7 @@ development Apple Silicon host was 718 us/token (CPU B=1), 493 us/token (CPU
 B=8), 599 us/token (Metal B=1), and 104 us/token (Metal B=8), measured over 100
 rounds with `pnpm bench:inference`.
 
-1. In `Model.ts`, replace `decodeBatch` with `batchSize`, remove the separate
+1. In `AutoRegressive.ts`, replace `decodeBatch` with `batchSize`, remove the separate
    single decode trace, and compile only `[B, 1]` decode.
 2. Extend required decode runtime requests with active masks, per-lane advances,
    and batched prefill valid lengths. Implement the same contract on CPU and
@@ -845,7 +845,7 @@ length, and concurrent sessions.
 1. Add `ProposerArtifact` and implement only the structural
    `Autoregressive`/KV/chain/`CausalNormalized` plan. Validate target/proposer
    runtime, vocabulary mapping, sampling transforms, and state geometry during
-   `Model.inference`.
+   `AutoRegressive.compile`.
 2. Extend batched `add` to prefill target and proposer transactionally and
    install the first target-sampled token as pending in both states.
 3. Compile target verification with all-row outputs and add packed row offsets,

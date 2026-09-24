@@ -4,7 +4,108 @@
 #define ET_OUTPUT ((double *)a.output)
 
 #ifdef ET_TENSOR
+#ifdef ET_COMPUTE_F32
+__device__ et_u64 et_sum_source(const et_u64 *shape, unsigned int rank, et_u64 mask,
+                               et_u64 out, et_u64 reduced) {
+    et_u64 source = 0, stride = 1;
+    for (int d = (int)rank - 1; d >= 0; --d) {
+        bool selected = mask & (1ULL << d);
+        et_u64 coordinate = selected ? reduced % shape[d] : out % shape[d];
+        if (selected) reduced /= shape[d]; else out /= shape[d];
+        source += coordinate * stride; stride *= shape[d];
+    }
+    return source;
+}
+extern "C" __global__ __launch_bounds__(1024) void et_sum_wide(CudaKernelArgs a) {
+    unsigned int rank = et_meta(a)[1], lane = threadIdx.x & 31U;
+    if (rank > 64) { et_error(a, 4); return; }
+    const et_u64 *shape = et_shape(a, 0), *dims = et_tail(a);
+    et_u64 mask = 0, count = a.integers[1];
+    for (et_u64 i = 0; i < a.integers[0]; ++i) mask |= 1ULL << dims[i];
+    __shared__ float partials[32];
+    unsigned int warp = threadIdx.x / 32;
+    et_u64 complete = count - count % 4096;
+    for (et_u64 row = blockIdx.x; row < a.elements; row += gridDim.x) {
+        const double *input = ET_INPUT(0) + row * count;
+        float sum = 0.0f;
+        for (et_u64 r = threadIdx.x * 4; r < complete; r += 4096) {
+            #pragma unroll
+            for (unsigned int j = 0; j < 4; ++j)
+                sum += a.integers[2] ? input[r + j] : ET_INPUT(0)[et_sum_source(shape, rank, mask, row, r + j)];
+        }
+        for (et_u64 r = complete + threadIdx.x; r < count; r += 1024)
+            sum += a.integers[2] ? input[r] : ET_INPUT(0)[et_sum_source(shape, rank, mask, row, r)];
+        for (unsigned int offset = 16; offset; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        if (!lane) partials[warp] = sum;
+        __syncthreads();
+        if (!warp) {
+            sum = partials[lane];
+            for (unsigned int offset = 16; offset; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffffU, sum, offset);
+            if (!lane) ET_OUTPUT[row] = sum;
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ __launch_bounds__(1024) void et_reduce_last_wide(CudaKernelArgs a) {
+    et_u64 count = a.integers[1];
+    __shared__ float partials[32];
+    unsigned int lane = threadIdx.x & 31U, warp = threadIdx.x / 32;
+    for (et_u64 row = blockIdx.x; row < a.elements; row += gridDim.x) {
+        const double *input = ET_INPUT(0) + row * count;
+        float value = a.operation == 2 ? -1.0f / 0.0f : 1.0f / 0.0f;
+        for (et_u64 r = threadIdx.x; r < count; r += 1024)
+            value = a.operation == 2 ? fmaxf(value, input[r]) : fminf(value, input[r]);
+        for (unsigned int offset = 16; offset; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffffU, value, offset);
+            value = a.operation == 2 ? fmaxf(value, other) : fminf(value, other);
+        }
+        if (!lane) partials[warp] = value;
+        __syncthreads();
+        if (!warp) {
+            value = partials[lane];
+            for (unsigned int offset = 16; offset; offset >>= 1) {
+                float other = __shfl_down_sync(0xffffffffU, value, offset);
+                value = a.operation == 2 ? fmaxf(value, other) : fminf(value, other);
+            }
+            if (!lane) ET_OUTPUT[row] = value;
+        }
+        __syncthreads();
+    }
+}
+#endif
 extern "C" __global__ void et_reduce(CudaKernelArgs a) {
+#ifdef ET_COMPUTE_F32
+    if (a.operation == 0) {
+        // Backend-defined F32 Sum. Short reductions use a lane-strided warp;
+        // wide reductions use 1024 threads with four consecutive values per
+        // iteration and two descending warp trees. This bounds sequential
+        // accumulation depth without changing opmath or semantic narrowing.
+        unsigned int rank = et_meta(a)[1], lane = threadIdx.x & 31U;
+        if (rank > 64) { et_error(a, 4); return; }
+        const et_u64 *shape = et_shape(a, 0), *dims = et_tail(a);
+        et_u64 mask = 0, count = 1;
+        for (et_u64 i = 0; i < a.integers[0]; ++i) mask |= 1ULL << dims[i];
+        for (unsigned int i = 0; i < rank; ++i) if (mask & (1ULL << i)) count *= shape[i];
+        for (et_u64 row = et_thread() / 32; row < a.elements; row += (et_u64)gridDim.x * (blockDim.x / 32)) {
+            float sum = 0.0f;
+            for (et_u64 r = lane; r < count; r += 32) {
+                et_u64 out = row, reduced = r, source = 0, stride = 1;
+                for (int d = (int)rank - 1; d >= 0; --d) {
+                    bool selected = mask & (1ULL << d);
+                    et_u64 coordinate = selected ? reduced % shape[d] : out % shape[d];
+                    if (selected) reduced /= shape[d]; else out /= shape[d];
+                    source += coordinate * stride; stride *= shape[d];
+                }
+                sum += ET_INPUT(0)[source];
+            }
+            for (unsigned int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
+            if (!lane) ET_OUTPUT[row] = sum;
+        }
+        return;
+    }
+#endif
     unsigned int rank = et_meta(a)[1]; et_u64 metadata[128];
     if (rank > 64) { et_error(a, 4); return; }
     for (unsigned int d = 0; d < rank; ++d) { metadata[d] = et_shape(a, 0)[d]; metadata[rank + d] = 0; }
@@ -22,12 +123,40 @@ extern "C" __global__ void et_matmul(CudaKernelArgs a) {
     matmul_f64(ET_INPUT(0), ET_INPUT(1), ET_OUTPUT, a.elements, rank, shapes, a.compute_dtype);
 }
 extern "C" __global__ void et_rms_norm(CudaKernelArgs a) {
+#ifdef ET_COMPUTE_F32
+    // One warp per row, four independently rounded F32 partials per lane.
+    // fmad=false keeps square and accumulation boundaries distinct. Inputs
+    // are materialized opmath values; narrowing remains in the output plan.
+    et_u64 width = et_shape(a, 0)[et_meta(a)[1] - 1];
+    if (!width) return;
+    et_u64 rows = a.elements / width;
+    unsigned int lane = threadIdx.x & 31U;
+    for (et_u64 row = et_thread() / 32; row < rows; row += (et_u64)gridDim.x * (blockDim.x / 32)) {
+        const float *x = ET_INPUT(0) + row * width;
+        float partial[4] = {0, 0, 0, 0};
+        for (et_u64 k = lane * 4; k < width; k += 128) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) if (k + j < width) partial[j] += x[k + j] * x[k + j];
+        }
+        float sum = ((partial[0] + partial[1]) + partial[2]) + partial[3];
+        for (unsigned int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        sum = __shfl_sync(0xffffffffU, sum, 0);
+        float mean = sum * (1.0f / (float)width);
+        float inverse = rsqrtf(mean + (float)a.scalars[0]);
+        for (et_u64 k = lane; k < width; k += 32) {
+            float value = x[k] * inverse;
+            if (a.inputs[1]) value *= ET_INPUT(1)[k];
+            ET_OUTPUT[row * width + k] = value;
+        }
+    }
+#else
     et_u64 i = et_thread(); if (i >= a.elements) return;
     et_u64 width = et_shape(a, 0)[et_meta(a)[1] - 1], base = i / width * width;
     double sum = 0; for (et_u64 d = 0; d < width; ++d) { double v = ET_INPUT(0)[base + d]; sum += v * v; }
     double value = ET_INPUT(0)[i] / sqrt(sum / width + (double)a.scalars[0]);
     if (a.inputs[1]) value *= ET_INPUT(1)[i % width];
     ET_OUTPUT[i] = value;
+#endif
 }
 __device__ unsigned int et_ce_active(const CudaKernelArgs &a, int role, et_u64 rows, et_u64 classes) {
     unsigned int active = 0;

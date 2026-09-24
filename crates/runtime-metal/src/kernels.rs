@@ -882,6 +882,34 @@ pub fn copy_into(
     Ok(())
 }
 
+/// Precompile the device-ordered state and copy-on-write byte copy.
+pub fn warm_byte_copy(dev: &MetalDevice) -> Result<(), String> {
+    let wide = MetalDevice::WIDE;
+    dev.compile_lazy(
+        key(&[0xBC09]),
+        "et_bcopy",
+        || {
+            format!(
+                r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_bcopy(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]], constant ulong& n [[buffer(2)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    const ulong base = i * 4ul;
+    if (base < n) {{
+        const ulong end = min(base + 4ul, n);
+        for (ulong j = base; j < end; j++) {{
+            dst[j] = src[j];
+        }}
+    }}
+}}
+"#
+            )
+        },
+    )?;
+    Ok(())
+}
+
 /// Copies `bytes` from `source` at `source_offset` into `destination` at
 /// `destination_offset` with a flat device kernel on the current stream.
 /// Used for GPU-ordered state-transaction copies between deferred
@@ -905,29 +933,9 @@ pub fn copy_bytes_into(
     {
         return Err("metal byte copy exceeds its buffer".to_string());
     }
-    let wide = MetalDevice::WIDE;
-    let pipeline = dev.compile_lazy(
-        key(&[0xBC09]),
-        "et_bcopy",
-        || {
-            format!(
-                r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void et_bcopy(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]], constant ulong& n [[buffer(2)]], uint2 gid2 [[thread_position_in_grid]]) {{
-    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
-    const ulong base = i * 4ul;
-    if (base < n) {{
-        const ulong end = min(base + 4ul, n);
-        for (ulong j = base; j < end; j++) {{
-            dst[j] = src[j];
-        }}
-    }}
-}}
-"#
-            )
-        },
-    )?;
+    let pipeline = dev
+        .pipeline_cached(key(&[0xBC09]))
+        .ok_or("metal byte-copy pipeline is not warm")?;
     let words = bytes.div_ceil(4);
     let padded = words.div_ceil(256) * 256;
     let n = bytes as u64;

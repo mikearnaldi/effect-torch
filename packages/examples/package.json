@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "xor": "tsx xor.ts",
+    "serve-cuda": "tsx diffusion-gemma/serve-cuda.ts",
     "nano-gpt": "tsx nano-gpt.ts",
     "muse-glimmer:metal": "tsx muse-glimmer/inference-metal.ts",
     "muse-glimmer:cuda": "tsx muse-glimmer/inference-cuda.ts",
@@ -15,12 +16,14 @@
     "@effect-torch/backend-cpu": "workspace:*",
     "@effect-torch/backend-cuda": "workspace:*",
     "@effect-torch/core": "workspace:*",
+    "@effect-torch/serve": "workspace:*",
     "@effect-torch/tokenizers": "workspace:*",
     "@effect/platform-node": "4.0.0-beta.101",
     "@types/node": "^22.0.0",
     "effect": "^4.0.0-beta.101",
     "hyparquet": "^1.27.1",
     "hyparquet-compressors": "^1.1.1",
-    "tsx": "^4.20.0"
+    "tsx": "^4.20.0",
+    "@effect-torch/models": "workspace:*"
   }
 }

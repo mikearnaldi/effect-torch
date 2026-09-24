@@ -91,12 +91,6 @@ impl LoweredValue<CudaMemorySpace> for CudaValueMeta {
 }
 
 pub(super) enum CommandKind {
-    StateCopy {
-        persistent: ValueId,
-        transaction: ValueId,
-        component: StateComponent,
-        commit: bool,
-    },
     Prepare,
     Value(CudaValue),
     Input {
@@ -119,6 +113,22 @@ pub(super) enum CommandKind {
         out_f32: bool,
         workspace: ValueId,
     },
+    /// Exact active group sizes require bounded host control readback. This
+    /// command is non-capturable; all payloads and stable grouping stay on GPU.
+    GroupedExpert {
+        x: ValueId,
+        weight: ValueId,
+        indexes: ValueId,
+        rows: usize,
+        columns: usize,
+        inner: usize,
+        experts: usize,
+        control: ValueId,
+        row_map: ValueId,
+        gathered: ValueId,
+        projected: ValueId,
+        workspace: Option<ValueId>,
+    },
     /// Infallible numerical epilogue with by-value geometry and no status I/O.
     LinearBias {
         accumulator: ValueId,
@@ -134,6 +144,7 @@ pub(super) enum CommandKind {
         metadata: Vec<u64>,
         state: StateAccess,
         state_buffers: [Option<ValueId>; 4],
+        kv_matmul: Option<crate::kv_matmul::KvMatmulWorkspace>,
     },
 }
 pub(super) struct Command {
@@ -264,6 +275,7 @@ pub(super) struct CudaProgramBuilder {
     pub(super) conversion_count: usize,
     pub(super) conversion_bytes: usize,
     gemms: CudaGemmLoweringPlan,
+    bf16_kv_matmul: bool,
 }
 
 impl CudaProgramBuilder {
@@ -283,6 +295,11 @@ impl CudaProgramBuilder {
             conversion_count: 0,
             conversion_bytes: 0,
             gemms: CudaGemmLoweringPlan::new(index, legalization)?,
+            bf16_kv_matmul: legalization
+                .target()
+                .features
+                .iter()
+                .any(|f| f == "stepwise-bf16-kv-f32-gemm-active-rows-v1"),
         })
     }
 
@@ -388,7 +405,7 @@ impl CudaProgramBuilder {
         component: StateComponent,
         elements: usize,
         dtype: DType,
-        transaction: bool,
+        transaction: Option<usize>,
     ) -> Result<(ValueId, Option<ValueId>), String> {
         if let Some(ids) = self.state_values.get(&component) {
             return Ok(*ids);
@@ -406,7 +423,7 @@ impl CudaProgramBuilder {
                 },
             },
         )?;
-        let staging = if transaction {
+        let staging = if let Some(elements) = transaction {
             let id = self.value(
                 vec![elements],
                 dtype,
@@ -435,15 +452,6 @@ impl CudaProgramBuilder {
                     vec![ValueUse::read(fixed)],
                 ),
             );
-            self.commands.push(Command {
-                output: None,
-                kind: CommandKind::StateCopy {
-                    persistent: fixed,
-                    transaction: id,
-                    component,
-                    commit: false,
-                },
-            });
             Some(id)
         } else {
             None
@@ -459,6 +467,7 @@ impl CudaProgramBuilder {
         output: ValueId,
     ) -> Result<(), String> {
         spec.name = kernel_name(spec.name, spec.args.compute_dtype)?;
+        let mut kv_matmul = None;
         let mut state_buffers = [None; 4];
         let mut state_uses = Vec::new();
         match spec.state {
@@ -470,7 +479,67 @@ impl CudaProgramBuilder {
             } => {
                 let layout = self
                     .state_layout
+                    .clone()
                     .ok_or("compile: CUDA KV attention requires an explicit state layout")?;
+                let descriptor = layout
+                    .kv_layers
+                    .iter()
+                    .find(|d| d.layer_id as usize == layer)
+                    .ok_or("compile: KV layer descriptor missing")?;
+                if descriptor.kv_heads != heads || descriptor.head_dim != dim {
+                    return Err("compile: KV layer geometry mismatch".into());
+                }
+                let tokens = spec.args.integers[7] as usize;
+                let temporary_rows = product_checked(&[batch, tokens, heads])?;
+                let temporary_elements = product_checked(&[temporary_rows, dim])?;
+                let table_rows = (layout.capacity as usize)
+                    .checked_add(
+                        tokens
+                            .checked_mul(layout.packed_rows_per_sequence.unwrap_or(1) as usize)
+                            .ok_or("compile: KV rows overflow")?,
+                    )
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or("compile: KV table overflow")?;
+                // Keep the pointer table and per-query score rows in one planned
+                // invocation allocation. Scores become probabilities in place;
+                // no persistent KV storage is copied or used as scratch.
+                let table_bytes = product_checked(&[layout.slots as usize, table_rows, 4, 8])?;
+                let score_width = if spec.args.compute_dtype == 0 && spec.args.integers[6] == 0 {
+                    8
+                } else {
+                    4
+                };
+                let score_bytes = product_checked(&[
+                    batch,
+                    tokens,
+                    spec.args.integers[11] as usize,
+                    table_rows - 1,
+                    score_width,
+                ])?;
+                spec.args.integers[9] = (table_rows - 1) as u64;
+                spec.args.integers[12] = table_bytes as u64;
+                let mut workspace_bytes = table_bytes
+                    .checked_add(score_bytes)
+                    .ok_or("compile: KV score workspace overflow")?;
+                if self.bf16_kv_matmul
+                    && descriptor.dtype == DType::BF16
+                    && spec.args.integers[6] == 1
+                    && spec.args.integers[8] == 3
+                    && spec.args.compute_dtype == 1
+                    && self.values[output.index()].dtype == DType::F32
+                {
+                    kv_matmul = crate::kv_matmul::KvMatmulWorkspace::new(
+                        workspace_bytes,
+                        spec.args.integers[11] as usize,
+                        tokens,
+                        table_rows - 1,
+                        dim,
+                    );
+                    if let Some(plan) = kv_matmul {
+                        workspace_bytes = plan.bytes;
+                    }
+                }
+                spec.scratch[2] = Some((workspace_bytes, DType::U8));
                 layout.validate()?;
                 if product_checked(&[
                     layout.slots as usize,
@@ -491,14 +560,22 @@ impl CudaProgramBuilder {
                 .into_iter()
                 .enumerate()
                 {
-                    if slot >= 2 && layout.dtype != DType::U8 {
+                    if slot >= 2 && descriptor.dtype != DType::U8 {
                         continue;
                     }
                     let (_, transaction) = self.state_value(
                         component,
                         if slot < 2 { elements } else { rows },
-                        if slot < 2 { layout.dtype } else { DType::F32 },
-                        true,
+                        if slot < 2 {
+                            descriptor.dtype
+                        } else {
+                            DType::F32
+                        },
+                        Some(if slot < 2 {
+                            temporary_elements
+                        } else {
+                            temporary_rows
+                        }),
                     )?;
                     state_buffers[slot] = transaction;
                     state_uses.push(ValueUse::read_write(
@@ -517,6 +594,13 @@ impl CudaProgramBuilder {
                 batch,
                 elements_per_sequence,
             } => {
+                if self.state_layout.as_ref().is_some_and(|layout| {
+                    layout.access == effect_torch_runtime::StateAccessMode::ReadOnly
+                }) {
+                    return Err(
+                        "compile: read-only state does not support recurrent mutation".into(),
+                    );
+                }
                 let component = if matches!(spec.state, StateAccess::Kda { .. }) {
                     StateComponent::Kda(layer)
                 } else {
@@ -526,7 +610,7 @@ impl CudaProgramBuilder {
                     component,
                     product_checked(&[batch, elements_per_sequence])?,
                     DType::F32,
-                    false,
+                    None,
                 )?;
                 state_uses.push(ValueUse::read_write(fixed));
             }
@@ -560,6 +644,9 @@ impl CudaProgramBuilder {
         });
         let out = &self.values[output.index()];
         spec.args.elements = crate::value::element_count(&out.shape)? as u64;
+        if spec.name == "et_rms_norm_f32" {
+            spec.args.integers[0] = *out.shape.last().ok_or("compile: RMS input rank")? as u64;
+        }
         spec.args.output_dtype = dtype_code(out.dtype);
         let mut metadata = vec![out.shape.len() as u64];
         metadata.extend(
@@ -614,7 +701,11 @@ impl CudaProgramBuilder {
         self.lowered.push(
             LoweredInstruction::new(
                 id,
-                spec.name,
+                if kv_matmul.is_some() {
+                    "kv_stepwise_bf16_gemm_active_rows"
+                } else {
+                    spec.name
+                },
                 uses.into_iter().map(ValueUse::read).collect::<Vec<_>>(),
                 vec![OutputDecl::new(output)],
             )
@@ -645,6 +736,7 @@ impl CudaProgramBuilder {
                 metadata,
                 state: spec.state,
                 state_buffers,
+                kv_matmul,
             },
         });
         Ok(())
@@ -721,6 +813,9 @@ impl CudaProgramBuilder {
         }
         let native_gemm = self.gemms.operations[dense.index()];
         let output = match instruction {
+            Instruction::GroupedExpertLinearRows { x, weight, indexes } => {
+                self.grouped_expert(x, weight, indexes)?
+            }
             Instruction::Linear { x, bias, .. } if native_gemm.is_some() => {
                 self.row_major_gemm(native_gemm.unwrap(), x, node.shape.clone(), Some(bias))?
             }
@@ -888,6 +983,9 @@ impl CudaProgramBuilder {
                             }
                         }
                     }
+                    if selected.name == "et_kv_attention" {
+                        selected.args.integers[8] = u64::from(dtype_code(node.dtype));
+                    }
                     selected.args.compute_dtype =
                         dtype_code(operation.compute_dtype.unwrap_or(result.execution_dtype));
                     self.kernel(selected, inputs, id)?;
@@ -967,6 +1065,96 @@ impl CudaProgramBuilder {
         Ok(())
     }
 
+    fn grouped_expert(
+        &mut self,
+        x: usize,
+        weight: usize,
+        indexes: usize,
+    ) -> Result<ValueId, String> {
+        let (x, weight, indexes) = (
+            self.resolve(x)?,
+            self.resolve(weight)?,
+            self.resolve(indexes)?,
+        );
+        let dtype = self.values[x.index()].dtype;
+        let rows = self.values[x.index()].shape[0];
+        let inner = self.values[x.index()].shape[1];
+        let experts = self.values[weight.index()].shape[0];
+        let columns = self.values[weight.index()].shape[1];
+        let control = self.planned(
+            vec![experts.checked_add(2).ok_or("group control overflow")?],
+            DType::U32,
+            "group_control",
+        )?;
+        let row_map = self.planned(vec![rows], DType::U32, "group_rows")?;
+        let gathered = self.planned(vec![rows, inner], dtype, "group_input")?;
+        let projected = self.planned(vec![rows, columns], dtype, "group_output")?;
+        let workspace = if dtype == DType::BF16 && rows != 0 && inner != 0 && columns != 0 {
+            Some(self.planned(vec![CUBLAS_WORKSPACE_BYTES], DType::U8, "cublas_workspace")?)
+        } else {
+            None
+        };
+        let scratch = [
+            Some(control),
+            Some(row_map),
+            Some(gathered),
+            Some(projected),
+            workspace,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        for &id in &scratch {
+            self.emit("prepare", CommandKind::Prepare, Some(id), Vec::new(), true)?;
+        }
+        let output = self.planned(vec![rows, columns], dtype, "result")?;
+        let id = InstructionId::from_index(self.lowered.len())
+            .ok_or("compile: too many CUDA instructions")?;
+        self.lowered.push(
+            LoweredInstruction::new(
+                id,
+                "grouped_expert_linear_rows_host_control_non_capturable",
+                vec![
+                    ValueUse::read(x),
+                    ValueUse::read(weight),
+                    ValueUse::read(indexes),
+                ],
+                vec![OutputDecl::new(output)],
+            )
+            .with_resources(
+                scratch
+                    .into_iter()
+                    .map(ValueUse::read_write)
+                    .collect::<Vec<_>>(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_effects(InstructionEffects {
+                may_fail: true,
+                has_side_effects: false,
+            }),
+        );
+        self.commands.push(Command {
+            output: Some(output),
+            kind: CommandKind::GroupedExpert {
+                x,
+                weight,
+                indexes,
+                rows,
+                columns,
+                inner,
+                experts,
+                control,
+                row_map,
+                gathered,
+                projected,
+                workspace,
+            },
+        });
+        Ok(output)
+    }
+
     /// Native BF16 row-major GEMM for a Linear or Matmul.
     fn row_major_gemm(
         &mut self,
@@ -1030,31 +1218,38 @@ impl CudaProgramBuilder {
             })
             .collect::<Vec<_>>();
         transactions.sort_by_key(|(_, persistent, _)| *persistent);
-        for (component, persistent, transaction) in transactions {
+        for (_component, persistent, transaction) in transactions {
             let id = InstructionId::from_index(self.lowered.len())
                 .ok_or("compile: too many state commits")?;
-            self.lowered.push(
-                LoweredInstruction::new(id, "state_commit", Vec::new(), Vec::new())
-                    .with_resources(
-                        Vec::new(),
-                        vec![ValueUse::read(transaction)],
-                        Vec::new(),
-                        vec![ValueUse::write(persistent)],
-                    )
-                    .with_effects(InstructionEffects {
-                        may_fail: true,
-                        has_side_effects: true,
-                    }),
-            );
-            self.commands.push(Command {
-                output: None,
-                kind: CommandKind::StateCopy {
-                    persistent,
-                    transaction,
-                    component,
-                    commit: true,
-                },
+            let append = self.state_layout.as_ref().is_some_and(|layout| {
+                layout.access == effect_torch_runtime::StateAccessMode::Append
             });
+            self.lowered.push(
+                LoweredInstruction::new(
+                    id,
+                    if append {
+                        "state_commit"
+                    } else {
+                        "state_discard"
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_resources(
+                    Vec::new(),
+                    vec![ValueUse::read(transaction)],
+                    Vec::new(),
+                    if append {
+                        vec![ValueUse::write(persistent)]
+                    } else {
+                        Vec::new()
+                    },
+                )
+                .with_effects(InstructionEffects {
+                    may_fail: false,
+                    has_side_effects: append,
+                }),
+            );
         }
         let outputs = index
             .roots

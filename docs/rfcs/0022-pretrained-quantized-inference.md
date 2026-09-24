@@ -12,7 +12,7 @@ Add zero-dependency, native inference for one pinned pretrained GGUF model while
 preserving the existing execution contract:
 
 ```text
-Model.Model + Model.Params -> Model.inference
+Model.Definition + Model.Parameters -> AutoRegressive.compile
 ```
 
 The first target is text-only inference for:
@@ -29,7 +29,7 @@ The file is one unsharded GGUF v3 file with 731 tensors. It mixes F32, Q2_K,
 Q3_K, Q4_K, Q5_K, and Q6_K.
 
 `Gguf` is exported from `@effect-torch/core`, while `MuseGlimmer` is exported
-from `@effect-torch/core/models`. The implementation is one direct vertical path:
+from `@effect-torch/models`. The implementation is one direct vertical path:
 
 ```text
 local GGUF path
@@ -40,8 +40,8 @@ local GGUF path
   -> name/shape bijection with model.parameterSpecs
   -> active runtime loads GGUF natively
   -> Gguf.load validates returned descriptors and opaque tensor handles
-  -> ordinary Model.Model + Model.Params
-  -> Model.inference
+  -> ordinary Model.Definition + Model.Parameters
+  -> AutoRegressive.compile
 ```
 
 The CPU and Metal native extensions share the Rust GGUF parser. Native loading
@@ -56,12 +56,12 @@ Applications register core or custom implementations explicitly.
 ## Decisions
 
 1. There is one model abstraction. Pretrained inference produces an ordinary
-   `Model.Model` and `Model.Params`.
-2. `Model.Params` remains exactly `ReadonlyArray<Tensor.Any>`. Precision and
+   `Model.Definition` and `Model.Parameters`.
+2. `Model.Parameters` remains exactly `ReadonlyArray<Tensor.Any>`. Precision and
    physical encoding do not change parameter semantics.
 3. Acquisition is outside the loader. The loader accepts one local path and
    performs no download, authentication, revision resolution, or cache policy.
-4. A model architecture creates `Model.Model` from canonical configuration. It
+4. A model architecture creates `Model.Definition` from canonical configuration. It
    never receives weights, a GGUF file, a path, byte offsets, or runtime handles.
 5. Core `Gguf.load(path)` owns native inspection, exact architecture lookup,
    canonical configuration, model construction, catalog bijection, native load,
@@ -120,7 +120,7 @@ registered adapter is GGUF-specific because its canonical metadata translation,
 parameter catalog, and synthesized Q/K norm tensors follow llama.cpp conversion.
 
 The architecture creates the same logical model template regardless of storage
-precision. `Model.Params` remains an ordered array of ordinary tensors.
+precision. `Model.Parameters` remains an ordered array of ordinary tensors.
 
 ### GGML K-quants are not scalar dtypes
 
@@ -144,7 +144,7 @@ a dense model copy.
 
 ## Goals
 
-- Load the pinned local GGUF into `Model.Model + Model.Params`.
+- Load the pinned local GGUF into `Model.Definition + Model.Parameters`.
 - Keep Muse graph operations independent of GGUF while source-qualifying its
   converted-model adapter.
 - Let applications register custom model implementations explicitly and load
@@ -199,12 +199,12 @@ export type Params = ReadonlyArray<Tensor.Any>
 
 export interface Definition {
   readonly parameterSpecs: ReadonlyArray<ParameterSpec>
-  readonly forward: Model.Model["forward"]
+  readonly forward: Model.Definition["forward"]
 }
 
 export declare const define: (
   definition: Definition
-) => Effect.Effect<Model.Model, Model.ModelError>
+) => Effect.Effect<Model.Definition, Model.ModelError>
 ```
 
 `Model.define` validates non-empty unique names, logical shapes, and initializer
@@ -226,7 +226,7 @@ export interface ModelArchitecture {
   readonly id: string
   readonly create: (
     config: ModelConfig
-  ) => Effect.Effect<Model.Model, Model.ModelError>
+  ) => Effect.Effect<Model.Definition, Model.ModelError>
 }
 ```
 
@@ -284,8 +284,8 @@ with `Registry.emptyLayer`.
 
 ```ts
 export interface LoadedModel {
-  readonly model: Model.Model
-  readonly params: Model.Params
+  readonly model: Model.Definition
+  readonly params: Model.Parameters
 }
 
 export declare const load: (
@@ -320,7 +320,7 @@ The public loading flow is only:
 
 ```ts
 const loaded = yield* Gguf.load(path)
-const inference = yield* Model.inference(loaded.model, loaded.params, config)
+const inference = yield* AutoRegressive.compile(loaded.definition, loaded.parameters, config)
 ```
 
 Public loading has no intermediate lifecycle objects or alternate model
@@ -578,7 +578,7 @@ Muse passes `2048` for local layers and `null` for global layers.
 
 Decode specialization copies the resolved window onto each paged-attention
 instruction. The existing pool still stores all layers and all rows up to
-`InferenceConfig.maxTokens`. Local layers retain older rows but ignore them.
+`CompileOptions.maxTokens`. Local layers retain older rows but ignore them.
 If every layer is local, legacy pool eviction is allowed only when the global
 window is at least the largest resolved per-operation window; compilation rejects
 an unsafe smaller global window. Any full layer disables pool eviction.
@@ -790,7 +790,7 @@ The application must not modify or replace the local file while loading.
 The corrected vertical surface is implemented across core, CPU, Metal, and the
 shared Rust runtime:
 
-- `Model.Params` remains tensor-only, and `Model.define` supports parameter
+- `Model.Parameters` remains tensor-only, and `Model.define` supports parameter
   specs plus allocation-free load-only initialization failure.
 - `Registry` is an exact-key plain-map service.
 - core exports `Gguf` from its root and `MuseGlimmer` from its `models` subpath;
@@ -835,7 +835,7 @@ file is unavailable.
 
 - `Model.define` rejects empty and duplicate names and invalid logical shapes.
 - Load-only `init` fails before requesting a runtime.
-- `Model.Params` accepts dense and encoded tensors without changing arity,
+- `Model.Parameters` accepts dense and encoded tensors without changing arity,
   ordering, or forward signatures.
 - Existing constructors, combinators, training, save/load, and inference remain
   green.
@@ -922,9 +922,9 @@ file is unavailable.
 ## Acceptance Criteria
 
 1. `Gguf.load(path)` uses native inspection and native backend loading, resolves
-   Muse exactly, and returns an ordinary `Model.Model` and tensor-only
-   `Model.Params` for the pinned file.
-2. The same model runs through existing `Model.inference` without an alternate
+   Muse exactly, and returns an ordinary `Model.Definition` and tensor-only
+   `Model.Parameters` for the pinned file.
+2. The same model runs through existing `AutoRegressive.compile` without an alternate
    executable path.
 3. A custom architecture remains independent of GGUF and loads through exact
    registry lookup.

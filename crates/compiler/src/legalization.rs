@@ -251,6 +251,8 @@ pub enum F64ComputeClass {
 /// Derived once from the semantic operation; a target may not weaken it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NumericsContract {
+    /// Internal attention rounding, including stateful kernels.
+    pub attention_rounding: Option<effect_torch_graph::AttentionRounding>,
     pub operand_interpretations: Box<[OperandInterpretation]>,
     pub result_formations: Box<[ResultFormation]>,
     pub compute_dtype: Option<DType>,
@@ -393,6 +395,7 @@ pub struct ResultExecution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationExecution {
+    pub attention_rounding: Option<effect_torch_graph::AttentionRounding>,
     pub node: DenseNodeId,
     pub operands: Box<[OperandExecution]>,
     pub results: Box<[ResultExecution]>,
@@ -868,6 +871,7 @@ impl<'a> OperationDTypeSpec<'a> {
 
     fn direct_operation(&self) -> OperationExecution {
         OperationExecution {
+            attention_rounding: self.required_numerics.attention_rounding,
             node: self.node,
             operands: self
                 .operands
@@ -1077,7 +1081,9 @@ pub(crate) fn validate_execution(
                 operation.accumulation,
             ));
         }
-        if operation.rounding_boundaries != required.rounding_boundaries {
+        if operation.rounding_boundaries != required.rounding_boundaries
+            || operation.attention_rounding != required.attention_rounding
+        {
             return Err(format!(
                 "legalization: node {} semantic rounding boundaries mismatch",
                 spec.node
@@ -1261,7 +1267,7 @@ fn operand_role(operation: &NodeKind, index: usize) -> ValueRole {
             [ValueRole::Activation, ValueRole::Weight, ValueRole::Bias][index]
         }
         NodeKind::QuantizedEmbedding { .. } => [ValueRole::Indices, ValueRole::Weight][index],
-        NodeKind::ExpertLinearRows { .. } => {
+        NodeKind::ExpertLinearRows { .. } | NodeKind::GroupedExpertLinearRows { .. } => {
             [ValueRole::Activation, ValueRole::Weight, ValueRole::Indices][index]
         }
         NodeKind::AdamWStep { .. } => match index {
@@ -1399,9 +1405,11 @@ fn numerics(
                 | NodeKind::Min { .. }
                 | NodeKind::Prod { .. }
                 | NodeKind::Matmul { .. }
+                | NodeKind::GroupedExpertLinearRows { .. }
                 | NodeKind::Linear { .. }
                 | NodeKind::Sdpa { .. }
                 | NodeKind::SdpaBackward { .. }
+                | NodeKind::KvAttention { .. }
                 // These composites form one semantic result per output. Their
                 // statistics, nonlinear arithmetic, and rotation run in F32
                 // before restoring half outputs. They do not permit widening
@@ -1453,6 +1461,7 @@ fn numerics(
             | NodeKind::Linear { .. }
             | NodeKind::QuantizedLinear { .. }
             | NodeKind::ExpertLinearRows { .. }
+            | NodeKind::GroupedExpertLinearRows { .. }
             | NodeKind::Sdpa { .. }
             | NodeKind::SdpaBackward { .. }
             | NodeKind::KvAttention { .. }
@@ -1502,6 +1511,15 @@ fn numerics(
         Box::new([])
     };
     NumericsContract {
+        attention_rounding: match &semantic.kind {
+            NodeKind::SdpaConfigured { rounding, .. } | NodeKind::KvAttention { rounding, .. } => {
+                Some(*rounding)
+            }
+            NodeKind::Sdpa { .. } | NodeKind::SdpaBackward { .. } => {
+                Some(effect_torch_graph::AttentionRounding::Fused)
+            }
+            _ => None,
+        },
         operand_interpretations: operands
             .iter()
             .map(|operand| match operand.value.storage.representation {
@@ -1582,6 +1600,7 @@ pub fn operation_name(operation: &NodeKind) -> &'static str {
         NodeKind::CrossEntropy { .. } => "cross_entropy",
         NodeKind::CrossEntropyBackward { .. } => "cross_entropy_backward",
         NodeKind::Sdpa { .. } => "sdpa",
+        NodeKind::SdpaConfigured { .. } => "sdpa_configured",
         NodeKind::SdpaBackward { .. } => "sdpa_backward",
         NodeKind::SdpaBackwardOut { .. } => "sdpa_backward_out",
         NodeKind::PositionEmbedding { .. } => "position_embedding",
@@ -1599,6 +1618,7 @@ pub fn operation_name(operation: &NodeKind) -> &'static str {
         NodeKind::ShortConv1dBackwardX { .. } => "short_conv1d_backward_x",
         NodeKind::ShortConv1dBackwardW { .. } => "short_conv1d_backward_w",
         NodeKind::RotaryEmbedding { .. } => "rotary_embedding",
+        NodeKind::RotaryEmbeddingExplicit { .. } => "rotary_embedding_explicit",
         NodeKind::RotaryEmbeddingBackward { .. } => "rotary_embedding_backward",
         NodeKind::LayerNorm { .. } => "layer_norm",
         NodeKind::RmsNorm { .. } => "rms_norm",
@@ -1606,6 +1626,7 @@ pub fn operation_name(operation: &NodeKind) -> &'static str {
         NodeKind::LayerNormBackwardOut { .. } => "layer_norm_backward_out",
         NodeKind::Linear { .. } => "linear",
         NodeKind::ExpertLinearRows { .. } => "expertLinearRows",
+        NodeKind::GroupedExpertLinearRows { .. } => "groupedExpertLinearRows",
         NodeKind::QuantizedLinear { .. } => "quantized_linear",
         NodeKind::QuantizedEmbedding { .. } => "quantized_embedding",
         NodeKind::Conv1d { .. } => "conv1d",

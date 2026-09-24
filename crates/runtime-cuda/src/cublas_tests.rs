@@ -19,6 +19,93 @@ fn bf16_round(value: f32) -> f64 {
     bf16::from_f32(value).to_f64()
 }
 
+// Dense, signed BF16 operands spanning nine exponents. The independent
+// PyTorch 2.10.0+cu128 fixture uses linear(x, weight), default BF16 reduction,
+// TF32 disabled, and CUBLAS_WORKSPACE_CONFIG=:4096:8. Sample i is flat output
+// (i * 104729) % (M * N). These shapes distinguish reduction mode and workspace
+// selection; small dyadic or sparse fixtures do not exercise either failure.
+fn dense_bf16_fixture(count: usize, seed: u32) -> Vec<f64> {
+    (0..count)
+        .map(|index| {
+            let mut h = (index as u32).wrapping_add(seed);
+            h = (h ^ (h >> 16)).wrapping_mul(0x7feb352d);
+            h = (h ^ (h >> 15)).wrapping_mul(0x846ca68b);
+            h ^= h >> 16;
+            let bits = ((h >> 16) & 0x8000) | ((((h >> 24) % 9) + 120) << 7) | ((h >> 8) & 127);
+            bf16::from_bits(bits as u16).to_f64()
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn bf16_dense_projections_match_pinned_torch_reductions() {
+    let device = device();
+    let cases: [(usize, usize, usize, [u16; 64]); 2] = [
+        (
+            16,
+            128,
+            2816,
+            [
+                0xc265, 0x425a, 0xc2a4, 0xc2b6, 0x40a6, 0xc196, 0xc314, 0xc190, 0x428a, 0x41a2,
+                0xc1f7, 0x4147, 0xc0cd, 0xc1e3, 0xc346, 0x428a, 0x42d3, 0x4222, 0x4242, 0xc20f,
+                0xc25c, 0xc247, 0xc13e, 0xc0b4, 0x3fd0, 0x4259, 0xc231, 0x42d7, 0x41a8, 0x4227,
+                0xc29c, 0xc2b0, 0xc01e, 0x4187, 0xc26a, 0x3fbc, 0x430d, 0xc339, 0xc14c, 0xc242,
+                0x41be, 0xc1fa, 0xc1d5, 0x4204, 0xc231, 0x4237, 0x431b, 0xc2a7, 0xc331, 0xc240,
+                0xc2d8, 0xc296, 0xc2c3, 0x4298, 0x431c, 0xc2aa, 0xc287, 0xc29e, 0x4208, 0xc2b1,
+                0xc082, 0xc22b, 0xc054, 0xc211,
+            ],
+        ),
+        (
+            278,
+            2816,
+            2112,
+            [
+                0xc252, 0xbfb8, 0x42a7, 0x41e7, 0x40d4, 0x4303, 0xc20c, 0xc195, 0xc22c, 0x431d,
+                0xc194, 0x41ac, 0xc15c, 0x41f0, 0x41b1, 0xc262, 0x4268, 0xc238, 0xc134, 0xc040,
+                0xc291, 0x40d8, 0x42a5, 0xc26f, 0x42ee, 0x4238, 0x42dc, 0x4141, 0x42ee, 0x416e,
+                0xc300, 0x4228, 0x42e3, 0x3ec0, 0x408e, 0xc2df, 0x422e, 0xc29e, 0x42e0, 0xc311,
+                0x3f80, 0x414f, 0xc292, 0x42e1, 0x4281, 0x3e80, 0x4233, 0x429c, 0x429f, 0x4279,
+                0x4129, 0x426e, 0x42b6, 0xc294, 0xc1ff, 0xc088, 0xc31b, 0xc170, 0x4277, 0xc206,
+                0x4289, 0x4040, 0x41c4, 0xc1ee,
+            ],
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (m, n, k, expected) in cases {
+        let weight = Node::new(NodeKind::Permute {
+            a: input(1, &[n, k]),
+            dims: vec![1, 0],
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::Matmul {
+            a: input(0, &[m, k]),
+            b: weight,
+        })
+        .unwrap();
+        let outputs = run(
+            vec![root],
+            vec![
+                host(&device, vec![m, k], &dense_bf16_fixture(m * k, 17)),
+                host(&device, vec![n, k], &dense_bf16_fixture(n * k, 29)),
+            ],
+        );
+        let actual = outputs[0].readback().unwrap();
+        for (sample, bits) in expected.into_iter().enumerate() {
+            let index = sample * 104729 % (m * n);
+            let wanted = bf16::from_bits(bits).to_f64();
+            let step = 2f64.powi((((bits >> 7) & 255) as i32 - 134).max(-133));
+            if (actual[index] - wanted).abs() > step + 2e-6 {
+                mismatches.push(format!(
+                    "[{m},{n},{k}] index {index}: {} != {wanted}",
+                    actual[index]
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("; "));
+}
+
 fn input(slot: u32, shape: &[usize]) -> Arc<Node> {
     Node::new(NodeKind::Input {
         slot,

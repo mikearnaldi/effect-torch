@@ -1,15 +1,17 @@
 /**
- * Streams templated chat messages through a compiled generation program.
+ * Streams templated chat messages from autoregressive or block generation.
  *
  * This module connects four caller-supplied pieces: structured
  * {@link ChatMessage}s, a Jinja-compatible chat template, a
- * {@link ChatTokenizer}, and a decode-specialized {@link Model.InferenceProgram}.
+ * {@link ChatTokenizer}, and a generation operation. {@link streamWith}
+ * consumes nonempty committed token pages from any family. Zero-token
+ * refinement iterations stay inside the generator.
  * {@link stream} renders messages once, encodes the complete prompt with
  * tokenizer-added special tokens disabled, prefills one model sequence, then
  * repeatedly parses one sampled token into {@link ChatEvent}s before stepping
- * the sequence. Standard sampling uses a {@link Model.Generation} session and
+ * the sequence. Standard sampling uses a {@link AutoRegressive.Generation} session and
  * exposes no logits. A custom host callback uses a
- * {@link Model.StatefulExecution} session and reads each logits row back.
+ * {@link AutoRegressive.StatefulExecution} session and reads each logits row back.
  * Chat does not own a template language, tokenizer vocabulary, conversation
  * history store, or tool executor.
  *
@@ -24,17 +26,19 @@
  * event protocol has no replacement/retraction event for a decoder that revises
  * prior text.
  *
- * The returned stream opens one {@link Model.Generation} session for standard
- * sampling or one {@link Model.StatefulExecution} session for a custom sampler.
+ * The autoregressive stream opens one {@link AutoRegressive.Generation} session for standard
+ * sampling or one {@link AutoRegressive.StatefulExecution} session for a custom sampler.
  * It attempts to close the session and all live sequence state on normal
  * completion, failure, or interruption. Custom-sampler logits remain internal
  * tensors rather than event payloads. `done` is emitted only for normal
- * stop-token or `maxTokens` termination. Failure, interruption, or downstream
+ * stop-token, generator-policy, or `maxTokens` termination. Failure, interruption, or downstream
  * cancellation may end the stream without `end` or `done` events.
  *
  * @since 0.1.0
  */
-import { Data, Effect, Option, Predicate, Stream } from "effect"
+import { Data, Deferred, Effect, Exit, Option, Predicate, Queue, type Scope, Stream } from "effect"
+import type * as AutoRegressive from "./AutoRegressive.ts"
+import type * as Generation from "./Generation.ts"
 import type * as Model from "./Model.ts"
 import type * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
@@ -141,7 +145,7 @@ export type ChatSampler = (logits: Tensor.TypedArray) => number
  * `topK` to `0` (disabled), and `topP` to `1` (disabled). A missing seed is
  * generated once per stream. Each successful draw advances a stream-local
  * counter, so draws share no process-global sampler state. Chat forwards these
- * controls to a {@link Model.Generation} session, which returns token ids
+ * controls to a {@link AutoRegressive.Generation} session, which returns token ids
  * without exposing logits. Metal requires `topK` in `1..=64` for
  * positive-temperature `topP` filtering and rejects positive-temperature
  * `topK > 64`.
@@ -177,9 +181,11 @@ export type ChatSampling = ChatSamplingOptions | ChatSampler
  */
 export const greedy: ChatSampler = (logits) => {
   let selected = 0
+
   for (let index = 1; index < logits.length; index++) {
     if (Number(logits[index]) > Number(logits[selected])) selected = index
   }
+
   return selected
 }
 
@@ -285,8 +291,8 @@ export interface CompletedChatSegment extends ChatSegment {
  * Durations are coarse elapsed times, not monotonic device-kernel profiling.
  * Prompt rendering, encoding, and control validation happen before `prefillMs`.
  * `decodeMs` starts after prefill. It includes event-consumption backpressure,
- * native sampling or custom-sampler readback, tokenizer decoding, and decode
- * steps.
+ * generation, custom-sampler readback, and tokenizer decoding. For streamWith,
+ * prefill includes refinement until the first committed page is available.
  *
  * @since 0.1.0
  * @category models
@@ -296,7 +302,7 @@ export interface ChatStats {
   readonly promptTokens: number
   /** Sampled non-stop ids, including parser controls and ignored/header ids. */
   readonly generatedTokens: number
-  /** Elapsed milliseconds for prompt construction plus sampled or logits-returning session add. */
+  /** Elapsed milliseconds until the first token page or initial custom-sampler logits are available. */
   readonly prefillMs: number
   /** Elapsed milliseconds from completed prefill until normal termination. */
   readonly decodeMs: number
@@ -320,7 +326,7 @@ export interface ChatResult {
   readonly reasoning: string
   /** Completed segments in event order. */
   readonly segments: ReadonlyArray<CompletedChatSegment>
-  /** Whether termination came from a stop id or the application token limit. */
+  /** Whether termination came from a stop/policy or a generation token limit. */
   readonly finishReason: "stop" | "maxTokens"
   /** Wall-clock and token counters for this stream. */
   readonly stats: ChatStats
@@ -347,34 +353,45 @@ export interface ChatResult {
  */
 export type ChatEvent =
   /** Prompt prefill completed; always the first event on success. */
-  | { readonly _tag: "prefill"; readonly tokens: number; readonly durationMs: number }
+  | {
+    readonly _tag: "prefill"
+    readonly tokens: number
+    readonly durationMs: number
+  }
   /** A parsed segment began. */
-  | { readonly _tag: "start"; readonly segment: ChatSegment }
+  | {
+    readonly _tag: "start"
+    readonly segment: ChatSegment
+  }
   /** A nonempty append-only decoded suffix for the current segment. */
-  | { readonly _tag: "delta"; readonly segment: ChatSegment; readonly text: string }
+  | {
+    readonly _tag: "delta"
+    readonly segment: ChatSegment
+    readonly text: string
+  }
   /** The current segment completed. */
-  | { readonly _tag: "end"; readonly segment: ChatSegment; readonly finish: ChatSegmentFinish }
+  | {
+    readonly _tag: "end"
+    readonly segment: ChatSegment
+    readonly finish: ChatSegmentFinish
+  }
   /** Normal generation completed; always the final event when present. */
-  | { readonly _tag: "done"; readonly result: ChatResult }
+  | {
+    readonly _tag: "done"
+    readonly result: ChatResult
+  }
 
 /**
- * Configuration for one {@link stream} invocation. The program and tokenizer
- * must describe the same token-id vocabulary. Chat feeds encoded prompt ids to
- * the program and uses logits indexes with the tokenizer and parser. It
- * compares control and stop ids numerically but cannot validate that the
- * components agree.
+ * Template, tokenizer, and parser settings shared by {@link stream} and
+ * {@link streamWith}. The generator and tokenizer must describe the same
+ * token-id vocabulary. Chat compares control and stop ids numerically but
+ * cannot validate that the components agree.
  *
  * @since 0.1.0
  * @category models
  */
-export interface ChatStreamOptions<E = never, Value = unknown> {
-  /**
-   * Compiled inference artifact used to open one generation or stateful
-   * execution session. It must use `tokenDtype: "u32"`, matching
-   * `ChatTokenizer.encode`.
-   */
-  readonly program: Model.InferenceProgram
-  /** Template/token vocabulary implementation paired with `program`. */
+export interface ChatOptions<E = never, Value = unknown> {
+  /** Template/token vocabulary implementation paired with the generator. */
   readonly tokenizer: ChatTokenizer<E, Value>
   /** Nonempty Jinja-compatible template passed verbatim to `applyChatTemplate`. */
   readonly template: string
@@ -407,14 +424,6 @@ export interface ChatStreamOptions<E = never, Value = unknown> {
    */
   readonly maxTokens?: number | undefined
   /**
-   * Standard sampling controls or a custom host-side selector. An options
-   * object, including the defaults, opens a {@link Model.Generation} session
-   * that publishes token ids without logits. A function opens a
-   * {@link Model.StatefulExecution} session and reads each complete logits row
-   * into a host typed array.
-   */
-  readonly sampling?: ChatSampling | undefined
-  /**
    * Partial override of the default segmented control strings, or `false` for
    * one unsegmented assistant response. In segmented mode the structural
    * controls are resolved as one tokenizer token before template rendering;
@@ -428,6 +437,19 @@ export interface ChatStreamOptions<E = never, Value = unknown> {
    * inferred from control strings.
    */
   readonly stopTokens?: ReadonlyArray<number> | undefined
+}
+
+/**
+ * Autoregressive generation and sampling for {@link stream}.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ChatStreamOptions<E = never, Value = unknown> extends ChatOptions<E, Value> {
+  /** Compiled artifact using u32 tokens in the tokenizer vocabulary. */
+  readonly program: AutoRegressive.Artifact
+  /** Native sampling controls, or a custom caller-owned-logits selector. */
+  readonly sampling?: ChatSampling | undefined
 }
 
 const fail = (op: ChatError["op"], message: string): ChatError => new ChatError({ op, message })
@@ -489,15 +511,19 @@ const makeParser = <E, Value>(
     if (contentDecoder !== undefined) {
       return Effect.map(contentDecoder.step(token), (delta) => {
         if (delta === undefined) return ""
+
         content += delta
+
         return delta
       })
     }
+
     return Effect.map(
       tokenizer.decode(contentIds, { skipSpecialTokens: true }),
       (text) => {
         const delta = text.slice(content.length)
         content = text
+
         return delta
       }
     )
@@ -510,11 +536,13 @@ const makeParser = <E, Value>(
       recipient,
       kind: segmentKind(role, recipient)
     }
+
     return { _tag: "start", segment: current }
   }
 
   const end = (finish: ChatSegmentFinish): Array<ChatEvent> => {
     if (current === undefined) return []
+
     completed.push({ ...current, content, finish })
     const event: ChatEvent = { _tag: "end", segment: current, finish }
     current = undefined
@@ -522,8 +550,10 @@ const makeParser = <E, Value>(
     contentIds = []
     content = ""
     contentDecoder = undefined
+
     if (finish === "turn" || finish === "limit") state = "done"
     else state = "seekStart"
+
     return [event]
   }
 
@@ -532,12 +562,16 @@ const makeParser = <E, Value>(
       accept: (token) =>
         Effect.gen(function*() {
           const events: Array<ChatEvent> = []
+
           if (current === undefined) events.push(begin())
+
           contentIds.push(token)
           const delta = yield* decodeContent(token)
+
           if (delta.length > 0 && current !== undefined) {
             events.push({ _tag: "delta", segment: current, text: delta })
           }
+
           return events
         }),
       finish: end,
@@ -549,21 +583,27 @@ const makeParser = <E, Value>(
     accept: (token) =>
       Effect.gen(function*() {
         if (state === "done") return []
+
         if (state === "seekStart") {
           if (token !== controls.start) return []
+
           state = "header"
           role = initialRole
           recipient = undefined
           headerIds = []
           contentIds = []
           content = ""
+
           return []
         }
+
         if (state === "header") {
           if (token !== controls.message) {
             headerIds.push(token)
+
             return []
           }
+
           const header = (yield* tokenizer.decode(headerIds, { skipSpecialTokens: true })).trim()
           const first = header.split(/\s+/, 1)[0] ?? ""
           role = first.length === 0 || first.startsWith("to=") ? initialRole : first
@@ -573,13 +613,17 @@ const makeParser = <E, Value>(
           contentIds = []
           content = ""
           contentDecoder = newContentDecoder()
+
           return [begin()]
         }
+
         if (token === controls.endOfMessage || token === controls.endOfTurn) {
           return end(token === controls.endOfMessage ? "message" : "turn")
         }
+
         contentIds.push(token)
         const delta = yield* decodeContent(token)
+
         return delta.length > 0 && current !== undefined
           ? [{ _tag: "delta", segment: current, text: delta }]
           : []
@@ -589,6 +633,386 @@ const makeParser = <E, Value>(
   }
 }
 
+type GenerationRead<E, R> =
+  | {
+    readonly _tag: "Page"
+    readonly page: Effect.Effect<Generation.Page, E, R>
+    readonly next: (token: number) => Effect.Effect<GenerationRead<E, R>, E, R>
+  }
+  | {
+    readonly _tag: "Done"
+    readonly finishReason: ChatResult["finishReason"]
+  }
+
+type OpenGeneration<E, R> = (
+  request: Omit<Generation.Request, "onPage">
+) => Effect.Effect<GenerationRead<E, R>, E, R | Scope.Scope>
+
+type AutoregressiveError = ChatError | AutoRegressive.InferenceError | Model.ModelError | Tensor.TensorError
+
+const resolveSampling = (options: ChatSampling | undefined) =>
+  Effect.gen(function*() {
+    let customSampler: ChatSampler | undefined
+    let samplingOptions: ChatSamplingOptions | undefined
+
+    if (Predicate.isFunction(options)) {
+      customSampler = options
+    } else {
+      samplingOptions = options
+    }
+
+    const sampling = {
+      temperature: samplingOptions?.temperature ?? 0,
+      topK: samplingOptions?.topK ?? 0,
+      topP: samplingOptions?.topP ?? 1,
+      seed: samplingOptions?.seed ?? Math.floor(Math.random() * 0x1_0000_0000)
+    }
+
+    if (!Number.isFinite(sampling.temperature) || sampling.temperature < 0) {
+      return yield* fail("validate", `temperature must be finite and non-negative, got ${sampling.temperature}`)
+    }
+
+    if (!Number.isSafeInteger(sampling.topK) || sampling.topK < 0) {
+      return yield* fail("validate", `topK must be a non-negative integer, got ${sampling.topK}`)
+    }
+
+    if (!Number.isFinite(sampling.topP) || sampling.topP <= 0 || sampling.topP > 1) {
+      return yield* fail("validate", `topP must be finite and in (0, 1], got ${sampling.topP}`)
+    }
+
+    if (!Number.isSafeInteger(sampling.seed) || sampling.seed < 0) {
+      return yield* fail("validate", `seed must be a non-negative safe integer, got ${sampling.seed}`)
+    }
+
+    return customSampler === undefined
+      ? { _tag: "Native" as const, sampling }
+      : { _tag: "Custom" as const, sample: customSampler }
+  })
+
+const openAutoregressive = (
+  program: AutoRegressive.Artifact,
+  sampling: Effect.Success<ReturnType<typeof resolveSampling>>
+): OpenGeneration<AutoregressiveError, Runtime.Runtime> =>
+(request) =>
+  Effect.gen(function*() {
+    if (sampling._tag === "Native") {
+      const generation = yield* Effect.acquireRelease(
+        program.generation(),
+        (session) => Effect.ignore(session.close()),
+        {
+          interruptible: true
+        }
+      )
+
+      const prompt = yield* Tensor.fromTypedArray(request.prompt, [1, request.prompt.length])
+
+      const read = (page: AutoRegressive.TokenPage): GenerationRead<AutoregressiveError, Runtime.Runtime> => ({
+        _tag: "Page",
+        page: Effect.succeed(page),
+        next: () =>
+          Effect.gen(function*() {
+            const [next] = yield* generation.step([{ seq: page.seq, sampling: sampling.sampling }])
+
+            if (next === undefined) return yield* fail("sample", "generation returned no token page")
+
+            return read(next)
+          })
+      })
+
+      const [page] = yield* generation.add([{
+        prompt,
+        sampling: sampling.sampling,
+        maxTokens: request.maxTokens,
+        eosTokens: request.eosTokens
+      }])
+
+      if (page === undefined) return yield* fail("sample", "generation returned no token page")
+
+      return read(page)
+    }
+
+    const execution = yield* Effect.acquireRelease(program.execution(), (session) => Effect.ignore(session.close()), {
+      interruptible: true
+    })
+
+    let currentLogits: Tensor.Concrete | undefined
+
+    const releaseLogits = (logits: Tensor.Concrete) =>
+      Tensor.clear(logits).pipe(
+        Effect.onExit(() =>
+          Effect.sync(() => {
+            if (currentLogits === logits) currentLogits = undefined
+          })
+        )
+      )
+
+    yield* Effect.addFinalizer(() => currentLogits === undefined ? Effect.void : releaseLogits(currentLogits))
+    const prompt = yield* Tensor.fromTypedArray(request.prompt, [1, request.prompt.length])
+
+    const [entry] = yield* execution.add([prompt]).pipe(Effect.onExit((exit) => {
+      if (Exit.isSuccess(exit)) currentLogits = exit.value[0]?.logits
+
+      return Effect.void
+    }))
+
+    if (entry === undefined) return yield* fail("sample", "execution returned no sequence")
+
+    const read = (logits: Tensor.Concrete): GenerationRead<AutoregressiveError, Runtime.Runtime> => ({
+      _tag: "Page",
+      page: Effect.gen(function*() {
+        const token = yield* Effect.ensuring(
+          Effect.gen(function*() {
+            const values = yield* Tensor.toTypedArray(logits)
+
+            if (values.length === 0) return yield* fail("sample", "model produced an empty logits row")
+
+            return yield* Effect.try({
+              try: () => sampling.sample(values),
+              catch: (error) => fail("sample", error instanceof Error ? error.message : String(error))
+            })
+          }),
+          releaseLogits(logits)
+        )
+
+        if (!Number.isSafeInteger(token) || token < 0 || token >= logits.shape[0]) {
+          return yield* fail(
+            "sample",
+            "sampler returned invalid token " + token + " for " + logits.shape[0] + " logits"
+          )
+        }
+
+        return { tokens: [token] }
+      }),
+      next: (token) =>
+        Effect.gen(function*() {
+          const [next] = yield* execution.step([{ seq: entry.seq, token }]).pipe(Effect.onExit((exit) => {
+            if (Exit.isSuccess(exit)) currentLogits = exit.value[0]
+
+            return Effect.void
+          }))
+
+          if (next === undefined) return yield* fail("sample", "execution returned no logits")
+
+          return read(next)
+        })
+    })
+
+    return read(entry.logits)
+  })
+
+const openCallback = <E, R>(generate: Generation.Generator<E, R>): OpenGeneration<E, R> => (request) =>
+  Effect.gen(function*() {
+    type Message =
+      | {
+        readonly _tag: "Page"
+        readonly page: Generation.Page
+        readonly consumed: Deferred.Deferred<void>
+      }
+      | {
+        readonly _tag: "Done"
+        readonly finishReason: ChatResult["finishReason"]
+      }
+    const queue = yield* Queue.make<Message, E>({ capacity: 1 })
+    yield* Effect.addFinalizer(() => Queue.shutdown(queue))
+
+    const read: Effect.Effect<GenerationRead<E, R>, E> = Effect.suspend(() =>
+      Effect.map(Queue.take(queue), (message): GenerationRead<E, R> =>
+        message._tag === "Done" ? message : {
+          _tag: "Page",
+          page: Effect.succeed(message.page),
+          next: () => Deferred.succeed(message.consumed, undefined).pipe(Effect.andThen(read))
+        })
+    )
+
+    yield* Effect.suspend(() =>
+      generate({
+        ...request,
+        onPage: (page) =>
+          Effect.gen(function*() {
+            const consumed = yield* Deferred.make<void>()
+            yield* Queue.offer(queue, { _tag: "Page", page, consumed })
+            yield* Deferred.await(consumed)
+          })
+      })
+    ).pipe(
+      Effect.matchCauseEffect({
+        onFailure: (cause) => Queue.failCause(queue, cause),
+        onSuccess: (finishReason) => Queue.offer(queue, { _tag: "Done", finishReason })
+      }),
+      Effect.forkScoped
+    )
+
+    return yield* read
+  })
+
+const streamGeneration = <GE, GR, E, Value>(
+  options: ChatOptions<E, Value>,
+  prepareOpen: Effect.Effect<OpenGeneration<GE, GR>, GE, GR>
+): Stream.Stream<ChatEvent, ChatError | E | GE, GR> =>
+  Stream.unwrap(Effect.gen(function*() {
+    if (options.template.length === 0) {
+      return yield* fail("template", "chat template must be non-empty")
+    }
+
+    if (options.messages.length === 0) {
+      return yield* fail("validate", "messages must not be empty")
+    }
+
+    if (
+      options.maxTokens !== undefined &&
+      (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0)
+    ) {
+      return yield* fail("validate", `maxTokens must be a positive integer, got ${options.maxTokens}`)
+    }
+
+    const open = yield* prepareOpen
+    const tokenizer = options.tokenizer
+
+    const controls = options.controls === false
+      ? undefined
+      : { ...defaultControls, ...options.controls }
+
+    const resolvedControls = controls === undefined
+      ? undefined
+      : {
+        start: yield* requireTokenId(tokenizer, controls.start),
+        message: yield* requireTokenId(tokenizer, controls.message),
+        endOfMessage: yield* requireTokenId(tokenizer, controls.endOfMessage),
+        endOfTurn: controls.endOfTurn === undefined
+          ? undefined
+          : yield* requireTokenId(tokenizer, controls.endOfTurn)
+      }
+
+    const stopTokens = options.stopTokens === undefined
+      ? new Set([
+        ...(resolvedControls?.endOfTurn === undefined ? [] : [resolvedControls.endOfTurn]),
+        yield* requireTokenId(tokenizer, controls?.endOfText ?? defaultControls.endOfText)
+      ])
+      : new Set(options.stopTokens)
+
+    const bosToken = options.bosTokenId === undefined
+      ? Option.none<string>()
+      : tokenizer.idToToken(options.bosTokenId)
+
+    if (options.bosTokenId !== undefined && Option.isNone(bosToken)) {
+      return yield* fail("validate", `bosTokenId ${options.bosTokenId} is not in the tokenizer`)
+    }
+
+    const rendered = yield* tokenizer.applyChatTemplate(options.template, options.messages, {
+      addGenerationPrompt: options.addGenerationPrompt ?? true,
+      variables: {
+        bos_token: Option.isSome(bosToken) ? bosToken.value : undefined,
+        ...options.variables
+      }
+    })
+
+    const encoded = yield* tokenizer.encode(rendered, { addSpecialTokens: false })
+    const prefillStarted = Date.now()
+
+    const initialRead = yield* open({
+      prompt: encoded.data,
+      maxTokens: options.maxTokens,
+      eosTokens: Array.from(stopTokens)
+    })
+
+    const prefillMs = Date.now() - prefillStarted
+    const parser = makeParser(tokenizer, resolvedControls, "assistant", options.addGenerationPrompt ?? true)
+    const decodeStarted = Date.now()
+    let generatedTokens = 0
+    let sampledTokens = 0
+
+    const finish = (events: Array<ChatEvent>, finishReason: ChatResult["finishReason"]) => {
+      events.push(...parser.finish(finishReason === "stop" ? "turn" : "limit"))
+      const decodeMs = Date.now() - decodeStarted
+      const segments = parser.segments()
+
+      const result: ChatResult = {
+        content: segments.filter((segment) => segment.kind === "content").map((segment) => segment.content)
+          .join(""),
+        reasoning: segments.filter((segment) => segment.kind === "reasoning").map((segment) => segment.content)
+          .join("\n\n"),
+        segments,
+        finishReason,
+        stats: {
+          promptTokens: encoded.data.length,
+          generatedTokens,
+          prefillMs,
+          decodeMs,
+          decodeTokensPerSecond: generatedTokens === 0 || decodeMs === 0
+            ? 0
+            : generatedTokens * 1000 / decodeMs
+        }
+      }
+
+      events.push({ _tag: "done", result })
+
+      return events
+    }
+
+    type State =
+      | { readonly _tag: "Prefill" }
+      | {
+        readonly _tag: "Read"
+        readonly read: GenerationRead<GE, GR>
+      }
+      | {
+        readonly _tag: "Next"
+        readonly read: Extract<GenerationRead<GE, GR>, { readonly _tag: "Page" }>
+        readonly token: number
+      }
+      | {
+        readonly _tag: "Tokens"
+        readonly read: Extract<GenerationRead<GE, GR>, { readonly _tag: "Page" }>
+        readonly page: Generation.Page
+        readonly offset: number
+      }
+    const initialState: State = { _tag: "Prefill" }
+
+    return Stream.paginate(
+      initialState,
+      (state): Effect.Effect<readonly [ReadonlyArray<ChatEvent>, Option.Option<State>], ChatError | E | GE, GR> =>
+        Effect.gen(function*() {
+          if (state._tag === "Prefill") {
+            return [
+              [{ _tag: "prefill", tokens: encoded.data.length, durationMs: prefillMs }],
+              Option.some({ _tag: "Read", read: initialRead })
+            ]
+          }
+
+          const read = state._tag === "Next" ? yield* state.read.next(state.token) : state.read
+
+          if (read._tag === "Done") return [finish([], read.finishReason), Option.none()]
+
+          const page = state._tag === "Tokens" ? state.page : yield* read.page
+          const offset = state._tag === "Tokens" ? state.offset : 0
+          const token = page.tokens[offset]
+
+          if (token === undefined) return yield* fail("sample", "generation returned an empty token page")
+
+          const events = yield* parser.accept(token)
+          sampledTokens++
+          const stopped = stopTokens.has(token)
+
+          if (!stopped) generatedTokens++
+
+          const pageStopped = offset + 1 === page.tokens.length ? page.stopReason : undefined
+
+          if (
+            stopped || pageStopped !== undefined ||
+            (options.maxTokens !== undefined && sampledTokens >= options.maxTokens)
+          ) {
+            return [finish(events, stopped || pageStopped === "eos" ? "stop" : "maxTokens"), Option.none()]
+          }
+
+          if (offset + 1 < page.tokens.length) {
+            return [events, Option.some({ _tag: "Tokens", read, page, offset: offset + 1 })]
+          }
+
+          return [events, Option.some({ _tag: "Next", read, token })]
+        })
+    )
+  }))
+
 /**
  * Renders the supplied history once, encodes and prefills it, then samples and
  * parses one token at a time. Template rendering receives
@@ -596,9 +1020,9 @@ const makeParser = <E, Value>(
  * uses `addSpecialTokens: false`; templates are therefore responsible for all
  * model-required BOS/EOS/control text.
  *
- * Standard sampling opens a {@link Model.Generation} session and returns token
+ * Standard sampling opens a {@link AutoRegressive.Generation} session and returns token
  * ids without output logits. A custom `sampling` callback opens a
- * {@link Model.StatefulExecution} session and reads each complete logits row to
+ * {@link AutoRegressive.StatefulExecution} session and reads each complete logits row to
  * a host typed array. Chat clears that row if sampling, readback, or the
  * callback fails or is interrupted. Chat parses a valid non-stop token before
  * committing it with a session step. It parses the final stop or limit token
@@ -626,250 +1050,32 @@ const makeParser = <E, Value>(
  */
 export const stream = <E = never, Value = unknown>(
   options: ChatStreamOptions<E, Value>
-): Stream.Stream<
-  ChatEvent,
-  ChatError | E | Model.InferenceError | Model.ModelError | Tensor.TensorError,
-  Runtime.Runtime
-> =>
-  Stream.unwrap(Effect.gen(function*() {
-    if (options.template.length === 0) {
-      return yield* fail("template", "chat template must be non-empty")
-    }
-    if (options.messages.length === 0) {
-      return yield* fail("validate", "messages must not be empty")
-    }
-    if (
-      options.maxTokens !== undefined &&
-      (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0)
-    ) {
-      return yield* fail("validate", `maxTokens must be a positive integer, got ${options.maxTokens}`)
-    }
-    let customSampler: ChatSampler | undefined
-    let samplingOptions: ChatSamplingOptions | undefined
-    if (Predicate.isFunction(options.sampling)) {
-      customSampler = options.sampling
-    } else {
-      samplingOptions = options.sampling
-    }
-    const sampling = {
-      temperature: samplingOptions?.temperature ?? 0,
-      topK: samplingOptions?.topK ?? 0,
-      topP: samplingOptions?.topP ?? 1,
-      seed: samplingOptions?.seed ?? Math.floor(Math.random() * 0x1_0000_0000)
-    }
-    if (!Number.isFinite(sampling.temperature) || sampling.temperature < 0) {
-      return yield* fail("validate", `temperature must be finite and non-negative, got ${sampling.temperature}`)
-    }
-    if (!Number.isSafeInteger(sampling.topK) || sampling.topK < 0) {
-      return yield* fail("validate", `topK must be a non-negative integer, got ${sampling.topK}`)
-    }
-    if (!Number.isFinite(sampling.topP) || sampling.topP <= 0 || sampling.topP > 1) {
-      return yield* fail("validate", `topP must be finite and in (0, 1], got ${sampling.topP}`)
-    }
-    if (!Number.isSafeInteger(sampling.seed) || sampling.seed < 0) {
-      return yield* fail("validate", `seed must be a non-negative safe integer, got ${sampling.seed}`)
-    }
-    const tokenizer = options.tokenizer
-    const controls = options.controls === false
-      ? undefined
-      : { ...defaultControls, ...options.controls }
-    const resolvedControls = controls === undefined
-      ? undefined
-      : {
-        start: yield* requireTokenId(tokenizer, controls.start),
-        message: yield* requireTokenId(tokenizer, controls.message),
-        endOfMessage: yield* requireTokenId(tokenizer, controls.endOfMessage),
-        endOfTurn: controls.endOfTurn === undefined
-          ? undefined
-          : yield* requireTokenId(tokenizer, controls.endOfTurn)
-      }
-    const stopTokens = options.stopTokens === undefined
-      ? new Set([
-        ...(resolvedControls?.endOfTurn === undefined ? [] : [resolvedControls.endOfTurn]),
-        yield* requireTokenId(tokenizer, controls?.endOfText ?? defaultControls.endOfText)
-      ])
-      : new Set(options.stopTokens)
-    const bosToken = options.bosTokenId === undefined
-      ? Option.none<string>()
-      : tokenizer.idToToken(options.bosTokenId)
-    if (options.bosTokenId !== undefined && Option.isNone(bosToken)) {
-      return yield* fail("validate", `bosTokenId ${options.bosTokenId} is not in the tokenizer`)
-    }
-    const rendered = yield* tokenizer.applyChatTemplate(options.template, options.messages, {
-      addGenerationPrompt: options.addGenerationPrompt ?? true,
-      variables: {
-        bos_token: Option.isSome(bosToken) ? bosToken.value : undefined,
-        ...options.variables
-      }
-    })
-    const encoded = yield* tokenizer.encode(rendered, { addSpecialTokens: false })
-    const useSampledGeneration = customSampler === undefined
-    const generation = useSampledGeneration
-      ? yield* Effect.acquireRelease(
-        options.program.generation(),
-        (session) => Effect.ignore(session.close()),
-        { interruptible: true }
-      )
-      : undefined
-    const execution = useSampledGeneration
-      ? undefined
-      : yield* Effect.acquireRelease(
-        options.program.execution(),
-        (session) => Effect.ignore(session.close()),
-        { interruptible: true }
-      )
-    type RunState =
-      | { readonly _tag: "fused"; readonly page: Model.TokenPage; readonly offset: number; readonly step: number }
-      | { readonly _tag: "legacy"; readonly logits: Tensor.Concrete; readonly step: number }
+): Stream.Stream<ChatEvent, E | AutoregressiveError, Runtime.Runtime> =>
+  streamGeneration(
+    options,
+    Effect.map(resolveSampling(options.sampling), (sampling) => openAutoregressive(options.program, sampling))
+  )
 
-    const prefillStarted = Date.now()
-    const prompt = yield* Tensor.fromTypedArray(encoded.data, [1, encoded.data.length])
-    let seq: Model.GenerationSeq | undefined
-    let executionSeq: Model.StatefulExecutionSeq | undefined
-    let initialRun: RunState
-    let currentLogits: Tensor.Concrete | undefined
-    if (!useSampledGeneration) {
-      if (execution === undefined) return yield* fail("sample", "execution session is unavailable")
-      const [entry] = yield* execution.add([prompt])
-      if (entry === undefined) return yield* fail("sample", "execution returned no sequence")
-      executionSeq = entry.seq
-      currentLogits = entry.logits
-      initialRun = { _tag: "legacy", logits: entry.logits, step: 0 }
-    } else {
-      if (generation === undefined) return yield* fail("sample", "generation session is unavailable")
-      const [page] = yield* generation.add([{
-        prompt,
-        sampling,
-        maxTokens: options.maxTokens,
-        eosTokens: Array.from(stopTokens)
-      }])
-      if (page === undefined) return yield* fail("sample", "generation returned no token page")
-      seq = page.seq
-      initialRun = { _tag: "fused", page, offset: 0, step: 0 }
-    }
-    const releaseLogits = (logits: Tensor.Concrete) =>
-      Tensor.clear(logits).pipe(
-        Effect.tap(() =>
-          Effect.sync(() => {
-            if (currentLogits === logits) currentLogits = undefined
-          })
-        )
-      )
-    const prefillMs = Date.now() - prefillStarted
-    const parser = makeParser(
-      tokenizer,
-      resolvedControls,
-      "assistant",
-      options.addGenerationPrompt ?? true
-    )
-    const decodeStarted = Date.now()
-    let generatedTokens = 0
-
-    type State = { readonly _tag: "prefill" } | RunState
-    const initialState: State = { _tag: "prefill" }
-
-    // Fused pages carry only sampled ids. Legacy pages carry the current logits
-    // ownership and clear it before terminating or installing the next row.
-    return Stream.paginate(
-      initialState,
-      (state): Effect.Effect<
-        readonly [ReadonlyArray<ChatEvent>, Option.Option<State>],
-        ChatError | E | Model.InferenceError | Model.ModelError | Tensor.TensorError,
-        Runtime.Runtime
-      > => {
-        if (state._tag === "prefill") {
-          return Effect.succeed([
-            [{ _tag: "prefill", tokens: encoded.data.length, durationMs: prefillMs }] satisfies Array<ChatEvent>,
-            Option.some(initialRun)
-          ])
-        }
-        return Effect.gen(function*() {
-          let token: number
-          if (state._tag === "fused") {
-            const pageToken = state.page.tokens[state.offset]
-            if (pageToken === undefined) return yield* fail("sample", "generation returned an empty token page")
-            token = pageToken
-          } else {
-            const logits = state.logits
-            token = yield* Effect.ensuring(
-              Effect.gen(function*() {
-                const values = yield* Tensor.toTypedArray(logits)
-                if (values.length === 0) {
-                  return yield* fail("sample", "model produced an empty logits row")
-                }
-                return yield* Effect.try({
-                  try: () => (customSampler ?? greedy)(values),
-                  catch: (error) => fail("sample", error instanceof Error ? error.message : String(error))
-                })
-              }),
-              releaseLogits(logits)
-            )
-            if (!Number.isSafeInteger(token) || token < 0 || token >= logits.shape[0]) {
-              return yield* fail("sample", `sampler returned invalid token ${token} for ${logits.shape[0]} logits`)
-            }
-          }
-          const events = yield* parser.accept(token)
-          const stopped = stopTokens.has(token)
-          if (!stopped) generatedTokens++
-          const pageStopped = state._tag === "fused" && state.offset + 1 === state.page.tokens.length
-            ? state.page.stopReason
-            : undefined
-          if (
-            stopped || pageStopped !== undefined ||
-            (options.maxTokens !== undefined && state.step + 1 >= options.maxTokens)
-          ) {
-            const finishReason = stopped || pageStopped === "eos" ? "stop" : "maxTokens"
-            events.push(...parser.finish(finishReason === "stop" ? "turn" : "limit"))
-            const decodeMs = Date.now() - decodeStarted
-            const segments = parser.segments()
-            const result: ChatResult = {
-              content: segments.filter((segment) => segment.kind === "content").map((segment) => segment.content)
-                .join(""),
-              reasoning: segments.filter((segment) => segment.kind === "reasoning").map((segment) => segment.content)
-                .join("\n\n"),
-              segments,
-              finishReason,
-              stats: {
-                promptTokens: encoded.data.length,
-                generatedTokens,
-                prefillMs,
-                decodeMs,
-                decodeTokensPerSecond: generatedTokens === 0 || decodeMs === 0
-                  ? 0
-                  : generatedTokens * 1000 / decodeMs
-              }
-            }
-            events.push({ _tag: "done", result })
-            return [events, Option.none<State>()]
-          }
-          if (state._tag === "fused") {
-            if (state.offset + 1 < state.page.tokens.length) {
-              return [
-                events,
-                Option.some({ ...state, offset: state.offset + 1, step: state.step + 1 } satisfies State)
-              ]
-            }
-            if (seq === undefined) return yield* fail("sample", "generation sequence is unavailable")
-            if (generation === undefined) return yield* fail("sample", "generation session is unavailable")
-            const [next] = yield* generation.step([{ seq, sampling }])
-            if (next === undefined) return yield* fail("sample", "generation returned no token page")
-            return [
-              events,
-              Option.some({ _tag: "fused", page: next, offset: 0, step: state.step + 1 } satisfies State)
-            ]
-          }
-          if (executionSeq === undefined) return yield* fail("sample", "execution sequence is unavailable")
-          if (execution === undefined) return yield* fail("sample", "execution session is unavailable")
-          const [next] = yield* execution.step([{ seq: executionSeq, token }])
-          if (next === undefined) return yield* fail("sample", "execution returned no logits")
-          currentLogits = next
-          return [
-            events,
-            Option.some({ _tag: "legacy", logits: next, step: state.step + 1 } satisfies State)
-          ]
-        })
-      }
-    ).pipe(
-      Stream.ensuring(Effect.suspend(() => currentLogits === undefined ? Effect.void : releaseLogits(currentLogits)))
-    )
-  }))
+/**
+ * Renders and tokenizes chat history once, then consumes committed pages from
+ * the supplied generation operation using the same parser and events as stream.
+ * Sampling and refinement policy belong to generate. Empty refinement steps
+ * stay inside that operation; publishing an empty page fails with ChatError.
+ *
+ * Page tokens are parsed in order and their events are emitted before Chat
+ * requests the next page. Chat stops at the first stop ID or token limit, even
+ * within a page, and interrupts the generator. Awaiting onPage provides
+ * backpressure. Generation completion supplies the stopping reason
+ * when no token or page policy has already ended the response. Failure and
+ * downstream cancellation emit no synthetic terminal events.
+ *
+ * The prefill event measures time until the first committed page is available.
+ * For block generators this includes refinement of the first block.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const streamWith = <GE, GR, E = never, Value = unknown>(
+  generate: Generation.Generator<GE, GR>,
+  options: ChatOptions<E, Value>
+): Stream.Stream<ChatEvent, ChatError | E | GE, GR> => streamGeneration(options, Effect.succeed(openCallback(generate)))

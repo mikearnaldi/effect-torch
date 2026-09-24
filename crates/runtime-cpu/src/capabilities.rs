@@ -43,7 +43,7 @@ impl TargetDTypeCapabilities for CpuDTypeCapabilities {
         &self.fingerprint
     }
     fn policy_revision(&self) -> u64 {
-        4
+        6
     }
 
     fn storage_support(&self, value: &ValueSpec<'_>) -> StorageSupport {
@@ -316,7 +316,7 @@ fn operand_role(operation: &NodeKind, index: usize) -> ValueRole {
             [ValueRole::Activation, ValueRole::Weight, ValueRole::Bias][index]
         }
         NodeKind::QuantizedEmbedding { .. } => [ValueRole::Indices, ValueRole::Weight][index],
-        NodeKind::ExpertLinearRows { .. } => {
+        NodeKind::ExpertLinearRows { .. } | NodeKind::GroupedExpertLinearRows { .. } => {
             [ValueRole::Activation, ValueRole::Weight, ValueRole::Indices][index]
         }
         NodeKind::AdamWStep { .. } => match index {
@@ -347,6 +347,9 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
         }
     };
     match kind {
+        NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+            Err("semantic operation requires native semantic preparation".into())
+        }
         NodeKind::Neg { a } if a.dtype == DType::U8 => {
             Err("neg does not support CPU dtype u8".into())
         }
@@ -412,8 +415,10 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
                 Err("chunked head CE requires CPU f32 or f64".into())
             }
         }
-        NodeKind::KvAttention { q, .. } if q.dtype != DType::F32 => {
-            Err("kv_attention requires CPU f32".into())
+        NodeKind::KvAttention { q, .. }
+            if !matches!(q.dtype, DType::F32 | DType::F16 | DType::BF16) =>
+        {
+            Err("kv_attention requires CPU f32, f16, or bf16".into())
         }
         NodeKind::LayerNorm {
             x, weight, bias, ..
@@ -515,6 +520,7 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
         | NodeKind::LayerNormBackwardOut { .. }
         | NodeKind::QuantizedLinear { .. }
         | NodeKind::ExpertLinearRows { .. }
+        | NodeKind::GroupedExpertLinearRows { .. }
         | NodeKind::QuantizedEmbedding { .. }
         | NodeKind::Conv1d { .. }
         | NodeKind::Conv2d { .. }

@@ -37,7 +37,7 @@ const createModel = Effect.gen(function*() {
   return model
 })
 
-const init = (model: Model.Model) =>
+const init = (model: Model.Definition) =>
   Effect.gen(function*() {
     const params = yield* Model.initialize(model)
     for (const [i, { name }] of model.parameterSpecs.entries()) {
@@ -47,7 +47,7 @@ const init = (model: Model.Model) =>
   })
 
 const createTrainer = (
-  model: Model.Model,
+  model: Model.Definition,
   x: Tensor.Any,
   y: Tensor.Any
 ) =>
@@ -85,20 +85,21 @@ class MispredictionError extends Data.TaggedError("MispredictionError")<{
   }
 }
 
-// Model.execute traces once for [1, 2], then reuses that inference program for
-// each truth-table row; the first wrong classification fails the Effect.
+// Model.compile traces once for [1, 2], then reuses the program for each
+// truth-table row. The first wrong classification fails the Effect.
 const evaluate = (
-  model: Model.Model,
-  params: Model.Params,
+  model: Model.Definition,
+  params: Model.Parameters,
   x: Tensor.Any,
   y: Tensor.Any
 ) =>
   Effect.gen(function*() {
+    const program = yield* Model.compile(model, params)
     const inputs = yield* Tensor.toNumberArray(x)
     const targets = yield* Tensor.toNumberArray(y)
     for (let i = 0; i < targets.length; i++) {
       const single = yield* Tensor.fromTypedArray(new Float32Array([inputs[i * 2], inputs[i * 2 + 1]]), [1, 2])
-      const pred = yield* model.execute(params, single)
+      const pred = yield* program.run(single)
       const [value] = yield* Tensor.toNumberArray(pred)
       const rounded = value > 0.5 ? 1 : 0
       const ok = rounded === targets[i]

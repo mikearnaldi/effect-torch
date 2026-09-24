@@ -61,7 +61,7 @@ on failure or interruption. Execution inherits the caller's interruptibility.
 graphs. `Model.executor` supplies token validation, absolute positions, layer
 execution, observation, and output ownership. Model modules provide graph
 definitions; compiler options and diagnostic observers belong to the executor.
-DiffusionGemma uses this shared path through `Model.executor(DiffusionGemma.make(loaded))`.
+DiffusionGemma uses this shared path through `Model.executor(DiffusionGemma.define(loaded))`.
 
 The shared prefill handoff records outputs and releases the final hidden state
 in execution's onExit success callback. Its enclosing failure handler releases
@@ -636,7 +636,7 @@ outputs do not expire when the warm set is busy.
 
 Caller-bound outputs and donation require explicit APIs because both change
 ownership assumptions. They can begin as runtime-internal facilities for
-`Trainer` and `InferenceProgram` before becoming general public operations.
+`Trainer` and `Artifact` before becoming general public operations.
 
 ### Concurrency
 
@@ -703,7 +703,7 @@ general API must specify:
 Inference separates three layers:
 
 ```text
-InferenceProgram
+Artifact
   immutable plans and shared weights
 
 InferenceContext

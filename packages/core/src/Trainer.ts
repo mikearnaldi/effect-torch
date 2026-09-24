@@ -241,7 +241,7 @@ export interface Resume<S> {
  */
 export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never> {
   /** Model whose parameter order and forward graph define the training step. */
-  readonly model: Model.Model
+  readonly model: Model.Definition
   /**
    * Configuration retained by reference. Mutating it through an alias does not
    * invalidate compiled cache entries; treat the model, optimizer, and graph
@@ -265,7 +265,7 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
    * defects rather than typed failures.
    */
   readonly train: (
-    params: Model.Params,
+    params: Model.Parameters,
     resume?: Resume<S>
   ) => Effect.Effect<
     Trained<S>,
@@ -302,7 +302,7 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
  * @category constructors
  */
 export const make = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
-  model: Model.Model,
+  model: Model.Definition,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
 ): Effect.Effect<Trainer<S, EL, RL, ED, RD, EO, RO>> =>
   Effect.sync(() => {
@@ -331,7 +331,7 @@ export const make = <S, EL = never, RL = never, ED = never, RD = never, EO = nev
  * @category constructors
  */
 export const makeUncompiled = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
-  model: Model.Model,
+  model: Model.Definition,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
 ): Effect.Effect<Trainer<S, EL, RL, ED, RD, EO, RO>> =>
   Effect.succeed({
@@ -343,9 +343,9 @@ export const makeUncompiled = <S, EL = never, RL = never, ED = never, RD = never
   })
 
 const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
-  model: Model.Model,
+  model: Model.Definition,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
-  params: Model.Params,
+  params: Model.Parameters,
   state: S,
   data: TrainData,
   step: number
@@ -388,9 +388,9 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
 // time. The placeholders take their signatures from the current step's
 // tensors, so the trace is valid for exactly one cache-key signature.
 const traceStep = <S, EL, RL, ED, RD, EO, RO>(
-  model: Model.Model,
+  model: Model.Definition,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
-  params: Model.Params,
+  params: Model.Parameters,
   stateRoots: ReadonlyArray<Tensor.Any>,
   state: S,
   data: TrainData
@@ -432,10 +432,10 @@ const traceStep = <S, EL, RL, ED, RD, EO, RO>(
   })
 
 const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
-  model: Model.Model,
+  model: Model.Definition,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
   cache: Tensor.ProgramCache,
-  params: Model.Params,
+  params: Model.Parameters,
   state: S,
   data: TrainData,
   step: number
@@ -479,9 +479,9 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
 // is released on replacement and retained for failure cleanup until ownership
 // transfers to the next generation.
 const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
-  model: Model.Model,
+  model: Model.Definition,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
-  initial: Model.Params,
+  initial: Model.Parameters,
   resume: Resume<S> | undefined,
   cache: Tensor.ProgramCache | undefined
 ): Effect.Effect<
@@ -494,7 +494,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
     const releaseOwned = (tensors: ReadonlyArray<Tensor.Concrete>) => Tensor.clearAll(tensors)
     return Effect.onExit(
       Effect.gen(function*() {
-        let params: Model.Params = initial
+        let params: Model.Parameters = initial
         const runtime = yield* Runtime.Runtime
         if (config.precision === "mixedBf16" && !runtime.capabilities.features.includes("mixed-bf16")) {
           return yield* new Model.ModelError({

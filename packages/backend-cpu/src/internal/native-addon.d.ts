@@ -21,10 +21,12 @@ export declare class CancellationToken {
  * against the cached signature.
  */
 export declare class Executable {
+  executeReadOnly(bindings: Array<NativeTensor>, prefixes: Array<NativeKvPrefix>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, cancellationToken?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   get stateful(): boolean
   get batch(): number
   get allowsWindowEviction(): boolean
   get diagnostics(): NativeExecutableDiagnostics
+  get kvLayers(): Array<NativeKvLayerDescriptor>
   get layers(): number
   get kvHeads(): number
   get headDim(): number
@@ -112,6 +114,8 @@ export declare class LazyTensor {
   gather(dim: number, indexes: LazyTensor): LazyTensor
   crossEntropy(target: LazyTensor, ignoreIndex: number): LazyTensor
   scaledDotProductAttention(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean, window: number): LazyTensor
+  scaledDotProductAttentionConfigured(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean, window: number, rounding: string, layerId?: number | undefined | null, retentionWindow?: number | undefined | null): LazyTensor
+  rotaryEmbeddingExplicit(positions: LazyTensor, inverseFrequencies: LazyTensor, layout: string): LazyTensor
   kdaChunk(k: LazyTensor, v: LazyTensor, logDecay: LazyTensor, beta: LazyTensor, scale: number): LazyTensor
   shortConv1d(weight: LazyTensor): LazyTensor
   positionEmbedding(seqLen: number): LazyTensor
@@ -120,6 +124,7 @@ export declare class LazyTensor {
   rmsNorm(weight: LazyTensor | undefined | null, eps: number): LazyTensor
   linear(weight: LazyTensor, bias: LazyTensor): LazyTensor
   quantizedLinear(weight: LazyTensor, bias?: LazyTensor | undefined | null): LazyTensor
+  groupedExpertLinearRows(weight: LazyTensor, indexes: LazyTensor): LazyTensor
   expertLinearRows(weight: LazyTensor, indexes: LazyTensor): LazyTensor
   quantizedEmbedding(weight: LazyTensor, paddingIndex?: number | undefined | null): LazyTensor
   conv1d(weight: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
@@ -197,11 +202,21 @@ export declare class NativeKvPool {
    * `max_tokens` must be a positive multiple of `block_size`, whose
    * default is 16.
    */
-  constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, dtype?: NativeDType | undefined | null, recurrent?: NativeRecurrentStateSchema | undefined | null)
+  constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, dtype?: NativeDType | undefined | null, recurrent?: NativeRecurrentStateSchema | undefined | null, kvLayers?: Array<NativeKvLayerDescriptor> | undefined | null)
   get capacity(): number
   get freeBlocks(): number
   get cachedBlocks(): number
   makeSequence(): NativeKvSequence
+}
+
+export declare class NativeKvPrefix {
+  release(): void
+  get cursor(): number
+  get retainedBytes(): number
+  get sharedBytes(): number
+  get copiedBytes(): number
+  fork(): NativeKvSequence
+  inspect(): NativeKvSnapshotInspection
 }
 
 /**
@@ -211,6 +226,7 @@ export declare class NativeKvPool {
  * exactly once. `run_lock` serializes execution against release.
  */
 export declare class NativeKvSequence {
+  snapshot(): NativeKvPrefix
   get cursor(): number
   release(): void
   prefillMatch(tokens: Array<number>): number
@@ -529,7 +545,34 @@ export interface NativeInstructionDiagnostics {
   count: number
 }
 
+export interface NativeKvLayerDescriptor {
+  layerId: number
+  kvHeads: number
+  headDim: number
+  dtype: NativeDType
+  retentionWindow?: number | undefined
+}
+
+export interface NativeKvLayerSnapshot {
+  layerId: number
+  startPosition: number
+  kvHeads: number
+  headDim: number
+  dtype: NativeDType
+  keys: Array<number>
+  values: Array<number>
+}
+
+export interface NativeKvSnapshotInspection {
+  cursor: number
+  retainedBytes: number
+  sharedBytes: number
+  copiedBytes: number
+  layers: Array<NativeKvLayerSnapshot>
+}
+
 export interface NativeKvStateSchema {
+  access?: string | undefined
   maxTokens: number
   blockSize: number
   kvDtype: NativeDType

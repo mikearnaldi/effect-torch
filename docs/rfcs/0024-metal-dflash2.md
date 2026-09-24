@@ -200,7 +200,7 @@ The RFC builds on code already present in the repository.
 
 ### Original DFlash graph
 
-`packages/core/src/proposers/DFlash.ts` currently provides:
+`packages/models/src/DFlash.ts` currently provides:
 
 - canonical DFlash GGUF metadata and tensor validation;
 - target-feature concatenation, projection, and normalization;
@@ -275,7 +275,7 @@ The published config does not contain a target checkpoint fingerprint. The
 first-party Muse loader establishes compatibility through an explicit
 Muse-Glimmer target profile: model architecture, vocabulary and token IDs,
 hidden width, target layer count, tap IDs and shapes, RoPE contract, and shared
-embedding/LM-head contracts must all match during `Model.inference`. A future
+embedding/LM-head contracts must all match during `AutoRegressive.compile`. A future
 generic loader may additionally require a converter-supplied target fingerprint
 but cannot pretend one came from the published config.
 

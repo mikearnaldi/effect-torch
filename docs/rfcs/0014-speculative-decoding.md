@@ -137,7 +137,7 @@ generate(prompt, k, maxNew, sampler) -> Vec<u32>
   on rejection, resample from `normalize(max(0, p_target − p_draft))`.
   Requires per-token probabilities from both models (softmax over
   logits, native) and the seeded streams above.
-- Engine inputs: two `InferenceProgram`s (draft, target) with their
+- Engine inputs: two `Artifact`s (draft, target) with their
   frozen programs, pools, and parameters exposed through internal
   handles; config = `{ k, maxTokens, sampler }`.
 - Interaction with existing machinery: chunked prefill already runs

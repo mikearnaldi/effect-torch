@@ -8,6 +8,10 @@
 
 ## Summary
 
+RFC 0027 separates family-specific inference from these generic model building
+blocks. Autoregressive APIs now live in `AutoRegressive`; see the
+[symbol migration map](../autoregressive-model-migration.md).
+
 Add a `Model` module to `@effect-torch/core`. A **model** is a pure value
 pairing parameter *construction* with a parameterised *forward* graph
 builder:
