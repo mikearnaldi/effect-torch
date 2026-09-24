@@ -23,6 +23,7 @@ impl CudaCapabilities {
         let mut features = vec!["typed-reference-kernels-v1".into()];
         features.push("grouped-expert-stable-exact-rows-host-control-v1".into());
         features.push("grouped-expert-routing-reuse-v1".into());
+        features.push("grouped-expert-compact-routed-input-v1".into());
         features.push("rms-f32-warp-four-partials-mean-factor-rsqrt-v1".into());
         features.push("rms-f32-wide-block-output-v1".into());
         features.push("sum-f32-warp-or-block1024-vector4-v2".into());

@@ -102,15 +102,19 @@ extern "C" __global__ void et_grouped_rows(CudaKernelArgs a) {
     }
 }
 extern "C" __global__ void et_grouped_gather(CudaKernelArgs a) {
-    for (et_u64 i = et_thread(); i < a.elements; i += (et_u64)gridDim.x * blockDim.x) {
-        et_u64 width = a.integers[0], row = ((const unsigned int *)a.inputs[1])[i / width];
-        et_copy(a.inputs[0], a.output, a.output_dtype, row * width + i % width, i);
+    et_u64 width = a.integers[0], rows = a.elements / width;
+    for (et_u64 destination = blockIdx.x; destination < rows; destination += gridDim.x) {
+        et_u64 source = ((const unsigned int *)a.inputs[1])[destination] % a.integers[1];
+        for (et_u64 column = threadIdx.x; column < width; column += blockDim.x)
+            et_copy(a.inputs[0], a.output, a.output_dtype, source * width + column, destination * width + column);
     }
 }
 extern "C" __global__ void et_grouped_scatter(CudaKernelArgs a) {
-    for (et_u64 i = et_thread(); i < a.elements; i += (et_u64)gridDim.x * blockDim.x) {
-        et_u64 width = a.integers[0], row = ((const unsigned int *)a.inputs[1])[i / width];
-        et_copy(a.inputs[0], a.output, a.output_dtype, i, row * width + i % width);
+    et_u64 width = a.integers[0], rows = a.elements / width;
+    for (et_u64 source = blockIdx.x; source < rows; source += gridDim.x) {
+        et_u64 destination = ((const unsigned int *)a.inputs[1])[source];
+        for (et_u64 column = threadIdx.x; column < width; column += blockDim.x)
+            et_copy(a.inputs[0], a.output, a.output_dtype, source * width + column, destination * width + column);
     }
 }
 // Same sequential F32 multiply/add order as et_matmul_f32, with row-oriented

@@ -133,6 +133,7 @@ pub(super) enum CommandKind {
         projected: ValueId,
         workspace: Option<ValueId>,
         reuse_routing: bool,
+        source_rows: usize,
     },
     /// Infallible numerical epilogue with by-value geometry and no status I/O.
     LinearBias {
@@ -309,6 +310,7 @@ pub(super) struct CudaProgramBuilder {
     semantic_values: Vec<Option<ValueId>>,
     semantic_results: Vec<Vec<ValueId>>,
     elementwise_views: Vec<Option<ElementwiseView>>,
+    routed_row_views: Vec<Option<RoutedRowsView>>,
     grouped_routing: std::collections::HashMap<(usize, usize, usize), (ValueId, ValueId)>,
     state_layout: Option<CudaStateLayout>,
     state_values: std::collections::HashMap<StateComponent, (ValueId, Option<ValueId>)>,
@@ -325,6 +327,14 @@ struct ElementwiseView {
     shape: Vec<usize>,
     strides: Vec<usize>,
     offset: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RoutedRowsView {
+    source: ValueId,
+    routes: usize,
+    rows: usize,
+    width: usize,
 }
 
 fn contiguous_strides(shape: &[usize]) -> Result<Vec<usize>, String> {
@@ -424,6 +434,7 @@ impl CudaProgramBuilder {
             semantic_values: vec![None; index.order.len()],
             semantic_results: vec![Vec::new(); index.order.len()],
             elementwise_views: vec![None; index.order.len()],
+            routed_row_views: vec![None; index.order.len()],
             grouped_routing: std::collections::HashMap::new(),
             state_layout,
             state_values: std::collections::HashMap::new(),
@@ -526,6 +537,29 @@ impl CudaProgramBuilder {
                     index.node(consumer).map(|node| &node.kind),
                     Some(NodeKind::Reshape { .. })
                 ) && Self::feeds_only_fused_consumer(index, optimization, consumer)
+            })
+    }
+
+    fn feeds_only_grouped_input(index: &GraphIndex, dense: DenseNodeId) -> bool {
+        if index.roots.iter().any(|root| root.index() == dense.index()) {
+            return false;
+        }
+        let Some(producer) = index.node(dense) else {
+            return false;
+        };
+        let Some(consumers) = index.consumers_of(dense) else {
+            return false;
+        };
+        !consumers.is_empty()
+            && consumers.iter().all(|&consumer| {
+                let Some(node) = index.node(consumer) else {
+                    return false;
+                };
+                match &node.kind {
+                    NodeKind::GroupedExpertLinearRows { x, .. } => x.id == producer.id,
+                    NodeKind::Reshape { .. } => Self::feeds_only_grouped_input(index, consumer),
+                    _ => false,
+                }
             })
     }
 
@@ -973,12 +1007,37 @@ impl CudaProgramBuilder {
                 .results
                 .iter()
                 .all(|result| result.completion == ResultCompletion::Direct);
+        let fused_consumer = Self::feeds_only_fused_consumer(index, optimization, dense);
+        let grouped_input = Self::feeds_only_grouped_input(index, dense);
         if direct_boundary
             && boundary_storage.representation == StorageRepresentation::Dense
-            && Self::feeds_only_fused_consumer(index, optimization, dense)
+            && (fused_consumer || grouped_input)
         {
             if let NodeKind::BroadcastTo { a, .. } = &node.kind {
-                if node.dtype == a.dtype && a.shape.len() <= node.shape.len() {
+                if grouped_input
+                    && a.shape.len() == 3
+                    && node.shape.len() == 3
+                    && a.shape[0] == 1
+                    && a.shape[1] == node.shape[1]
+                    && a.shape[2] == node.shape[2]
+                    && node.shape[0] != 0
+                {
+                    let parent = index
+                        .dense_id(a.id)
+                        .ok_or("compile: CUDA routed-row source is missing")?;
+                    let source = self.resolve(parent.index())?;
+                    let view = RoutedRowsView {
+                        source,
+                        routes: node.shape[0],
+                        rows: node.shape[1],
+                        width: node.shape[2],
+                    };
+                    self.semantic_values[dense.index()] = Some(source);
+                    self.semantic_results[dense.index()] = vec![source];
+                    self.routed_row_views[dense.index()] = Some(view);
+                    return Ok(());
+                }
+                if fused_consumer && node.dtype == a.dtype && a.shape.len() <= node.shape.len() {
                     let parent = index
                         .dense_id(a.id)
                         .ok_or("compile: CUDA broadcast source is missing")?;
@@ -1025,7 +1084,7 @@ impl CudaProgramBuilder {
                 }
             }
             if let NodeKind::Slice { a, ranges } = &node.kind {
-                if node.dtype == a.dtype && ranges.len() == a.shape.len() {
+                if fused_consumer && node.dtype == a.dtype && ranges.len() == a.shape.len() {
                     let parent = index
                         .dense_id(a.id)
                         .ok_or("compile: CUDA slice source is missing")?;
@@ -1077,12 +1136,60 @@ impl CudaProgramBuilder {
                     return Ok(());
                 }
             }
+            if let NodeKind::Permute { a, dims } = &node.kind {
+                if fused_consumer
+                    && node.dtype == a.dtype
+                    && dims.len() == a.shape.len()
+                    && dims.iter().all(|&dimension| dimension < a.shape.len())
+                {
+                    let parent = index
+                        .dense_id(a.id)
+                        .ok_or("compile: CUDA permute source is missing")?;
+                    let source = self.resolve(parent.index())?;
+                    let base =
+                        self.elementwise_views[parent.index()]
+                            .clone()
+                            .unwrap_or(ElementwiseView {
+                                source,
+                                shape: a.shape.clone(),
+                                strides: contiguous_strides(&a.shape)?,
+                                offset: 0,
+                            });
+                    let strides = dims
+                        .iter()
+                        .map(|&dimension| base.strides[dimension])
+                        .collect::<Vec<_>>();
+                    let view = ElementwiseView {
+                        source: base.source,
+                        shape: node.shape.clone(),
+                        strides,
+                        offset: base.offset,
+                    };
+                    self.semantic_values[dense.index()] = Some(base.source);
+                    self.semantic_results[dense.index()] = vec![base.source];
+                    self.elementwise_views[dense.index()] = Some(view);
+                    return Ok(());
+                }
+            }
             if let NodeKind::Reshape { a, .. } = &node.kind {
                 let parent = index
                     .dense_id(a.id)
                     .ok_or("compile: CUDA reshape source is missing")?;
-                if let Some(view) = self.elementwise_views[parent.index()]
-                    .as_ref()
+                if let Some(view) = self.routed_row_views[parent.index()].clone() {
+                    let routed_rows = view
+                        .routes
+                        .checked_mul(view.rows)
+                        .ok_or("compile: CUDA routed-row geometry overflow")?;
+                    if node.shape.as_slice() == [routed_rows, view.width] {
+                        self.semantic_values[dense.index()] = Some(view.source);
+                        self.semantic_results[dense.index()] = vec![view.source];
+                        self.routed_row_views[dense.index()] = Some(view);
+                        return Ok(());
+                    }
+                }
+                if let Some(view) = fused_consumer
+                    .then(|| self.elementwise_views[parent.index()].as_ref())
+                    .flatten()
                     .and_then(|view| reshape_view(view, &node.shape))
                 {
                     self.semantic_values[dense.index()] = Some(view.source);
@@ -1520,6 +1627,7 @@ impl CudaProgramBuilder {
         weight: usize,
         indexes: usize,
     ) -> Result<ValueId, String> {
+        let routed = self.routed_row_views[x].clone();
         let indexes_semantic = indexes;
         let (x, weight, indexes) = (
             self.resolve(x)?,
@@ -1527,8 +1635,21 @@ impl CudaProgramBuilder {
             self.resolve(indexes)?,
         );
         let dtype = self.values[x.index()].dtype;
-        let rows = self.values[x.index()].shape[0];
-        let inner = self.values[x.index()].shape[1];
+        let (rows, inner, source_rows) = if let Some(view) = routed {
+            (
+                view.routes
+                    .checked_mul(view.rows)
+                    .ok_or("compile: CUDA routed-row count overflow")?,
+                view.width,
+                view.rows,
+            )
+        } else {
+            (
+                self.values[x.index()].shape[0],
+                self.values[x.index()].shape[1],
+                self.values[x.index()].shape[0],
+            )
+        };
         let experts = self.values[weight.index()].shape[0];
         let columns = self.values[weight.index()].shape[1];
         let routing_key = (indexes_semantic, rows, experts);
@@ -1624,6 +1745,7 @@ impl CudaProgramBuilder {
                 projected,
                 workspace,
                 reuse_routing,
+                source_rows,
             },
         });
         if !reuse_routing && rows != 0 && inner != 0 && columns != 0 {

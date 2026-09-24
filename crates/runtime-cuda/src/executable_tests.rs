@@ -353,6 +353,101 @@ fn grouped_experts_reuse_unchanged_routing_control_and_row_map() {
 }
 
 #[test]
+fn grouped_experts_gather_repeated_routes_from_compact_rows() {
+    let rows = Node::new(NodeKind::Reshape {
+        a: input(0, &[2, 5], DType::BF16),
+        shape: vec![1, 2, 5],
+    })
+    .unwrap();
+    let routed = Node::new(NodeKind::BroadcastTo {
+        a: rows,
+        shape: vec![3, 2, 5],
+    })
+    .unwrap();
+    let expanded = Node::new(NodeKind::Reshape {
+        a: routed,
+        shape: vec![6, 5],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: expanded,
+        weight: input(1, &[4, 7, 5], DType::BF16),
+        indexes: input(2, &[6], DType::U32),
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let CommandKind::GroupedExpert {
+        x,
+        rows,
+        inner,
+        source_rows,
+        ..
+    } = &commands
+        .iter()
+        .find(|command| matches!(command.kind, CommandKind::GroupedExpert { .. }))
+        .expect("grouped expert command")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!((*rows, *inner, *source_rows), (6, 5, 2));
+    assert_eq!(program.values[x.index()].shape, [1, 2, 5]);
+    assert!(!commands.iter().any(|command| {
+        matches!(
+            command.kind,
+            CommandKind::Kernel {
+                name: "et_reindex",
+                ..
+            }
+        ) && command
+            .output
+            .is_some_and(|output| program.values[output.index()].shape == [3, 2, 5])
+    }));
+}
+
+#[test]
+fn grouped_experts_materialize_general_broadcast_inputs() {
+    let broadcast = Node::new(NodeKind::BroadcastTo {
+        a: input(0, &[1, 2], DType::BF16),
+        shape: vec![4, 2],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: broadcast,
+        weight: input(1, &[3, 2, 2], DType::BF16),
+        indexes: input(2, &[4], DType::U32),
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let CommandKind::GroupedExpert {
+        x,
+        rows,
+        source_rows,
+        ..
+    } = &commands
+        .iter()
+        .find(|command| matches!(command.kind, CommandKind::GroupedExpert { .. }))
+        .expect("grouped expert command")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!((*rows, *source_rows), (4, 4));
+    assert_eq!(program.values[x.index()].shape, [4, 2]);
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command.kind,
+            CommandKind::Kernel {
+                name: "et_reindex",
+                ..
+            }
+        ) && command
+            .output
+            .is_some_and(|output| program.values[output.index()].shape == [4, 2])
+    }));
+}
+
+#[test]
 fn scatter_add_uses_compact_indexes_for_an_inner_broadcast() {
     let compact = input(1, &[2, 3], DType::U32);
     let columns = Node::new(NodeKind::Reshape {

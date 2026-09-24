@@ -2626,12 +2626,14 @@ impl CudaExecutable {
                         indexes,
                         control,
                         reuse_routing,
+                        source_rows,
                         ..
                     } => serde_json::json!({
                         "kernel": "grouped_expert_linear_rows", "rows": rows, "columns": columns,
                         "inner": inner, "experts": experts, "capturable": false,
                         "indexesValue": indexes.get(), "controlValue": control.get(),
                         "routingReused": reuse_routing,
+                        "sourceRows": source_rows,
                         "controlReadbackBytes": if *reuse_routing { 0 } else { (experts + 2) * 4 }
                     }),
                     CommandKind::Scalar { .. } => serde_json::json!({ "kernel": "et_fill" }),
@@ -2774,6 +2776,7 @@ impl CudaExecutable {
                     projected,
                     workspace,
                     reuse_routing,
+                    source_rows,
                 } => {
                     let output = self.planned_value(&resources, output_id)?;
                     if *rows != 0 {
@@ -2866,6 +2869,7 @@ impl CudaExecutable {
                             args.output_dtype = dtype_code(meta.dtype);
                             args.elements = (*rows * *inner) as u64;
                             args.integers[0] = *inner as u64;
+                            args.integers[1] = *source_rows as u64;
                             self.launch("et_grouped_gather", &args)?;
                             let width = meta.dtype.size_in_bytes();
                             let weights = address(weight)?;
@@ -3238,6 +3242,25 @@ impl CudaExecutable {
                 launch.launch(LaunchConfig {
                     grid_dim: (rows.min(65535) as u32, 1, 1),
                     block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if matches!(name, "et_grouped_gather" | "et_grouped_scatter") {
+            let width = args.integers[0];
+            if width == 0 || args.elements % width != 0 {
+                return Err("groupedExpertLinearRows: invalid copy geometry".into());
+            }
+            let rows = args.elements / width;
+            let function = self.device.kernel(name)?;
+            let mut launch = self.device.stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows.min(65535) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })
             }
