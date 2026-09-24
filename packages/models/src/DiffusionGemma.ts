@@ -2472,6 +2472,8 @@ export interface LoadOptions {
   readonly directory: string
   readonly id: string
   readonly maxTokens?: number
+  /** Additional initialized model buffers retained by the caller's scope. */
+  readonly initializedState?: Readonly<Record<string, Tensor.Any>>
 }
 
 type ServeLoadOptions = ServeModel.DiffusionLoadOptions<
@@ -2504,16 +2506,18 @@ export const load = (
       { interruptible: true }
     )
     const template = yield* loadPinned(options.directory)
+    const initializedState = options.initializedState ?? {}
+    const model = fromTensors(loaded, { ...loaded.tensors, ...initializedState })
 
     const loadOptions: ServeLoadOptions = {
       family: "Diffusion" as const,
       id: options.id,
-      definition: define(loaded),
-      parameters: loaded.ownedParameters,
+      definition: model.definition,
+      parameters: model.parameters,
       compile: {
         maxTokens: options.maxTokens ?? 16384,
         blockSize: 16,
-        prefillChunks: [16, 64, 256],
+        prefillChunks: [16, 64, 256, 512],
         canvasLengths: [loaded.config.canvas_length],
         selectedReadouts: Array.from({ length: 255 }, (_, index) => ({ rows: 1, labels: index + 1 }))
       } satisfies Diffusion.CompileOptions,
