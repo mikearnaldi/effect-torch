@@ -1,15 +1,19 @@
 //! CUDA lowering with independent semantic, instruction, and materialized value IDs.
-use crate::cublas::{plan_row_bf16_gemm, Bf16GemmPlan, RowGemmKind, CUBLAS_WORKSPACE_BYTES};
+use crate::cublas::{
+    plan_row_bf16_gemm, Bf16GemmPlan, RowGemmKind, CUBLAS_WORKSPACE_BYTES, EXPERT_BLAS_STREAMS,
+};
 use crate::executable::{
     dtype_code, CudaKernelArgs, CudaStateLayout, Instruction, KernelSpec, StateAccess,
 };
 use crate::workspace::{CudaMemorySpace, CUDA_STORAGE_ALIGNMENT};
-use crate::CudaValue;
+use crate::{CudaDevice, CudaValue};
+use cudarc::driver::CudaFunction;
 use effect_torch_compiler::{
-    DenseNodeId, ExecutableDTypePlan, ExecutionRealization, GraphIndex, InstructionEffects,
-    LegalizationPlan, LoweredInstruction, LoweredProgram, LoweredValue, LoweringUnit,
-    OperandInterpretation, OperandPreparation, OperationDTypeSpec, OutputDecl, ResultCompletion,
-    ValueDecl, ValueStorage, ValueUse,
+    legalize_region_expressions, DenseNodeId, ExecutableDTypePlan, ExecutionRealization,
+    GraphIndex, InstructionEffects, LegalizationPlan, LoweredInstruction, LoweredProgram,
+    LoweredValue, LoweringUnit, NativeRegion, OperandInterpretation, OperandPreparation,
+    OperationDTypeSpec, OptimizationPlan, OutputDecl, RegionId, ResultCompletion, ValueDecl,
+    ValueStorage, ValueUse,
 };
 use effect_torch_graph::{node_children, Node, NodeKind};
 use effect_torch_runtime::{
@@ -128,6 +132,7 @@ pub(super) enum CommandKind {
         gathered: ValueId,
         projected: ValueId,
         workspace: Option<ValueId>,
+        reuse_routing: bool,
     },
     /// Infallible numerical epilogue with by-value geometry and no status I/O.
     LinearBias {
@@ -135,12 +140,18 @@ pub(super) enum CommandKind {
         bias: ValueId,
         args: CudaKernelArgs,
     },
+    FusedElementwise {
+        function: CudaFunction,
+        args: CudaKernelArgs,
+        inputs: [Option<ValueId>; 8],
+    },
     Kernel {
         name: &'static str,
         args: CudaKernelArgs,
         inputs: [Option<ValueId>; 8],
         scratch: [Option<ValueId>; 3],
-        status: ValueId,
+        status: Option<ValueId>,
+        checked: bool,
         metadata: Vec<u64>,
         state: StateAccess,
         state_buffers: [Option<ValueId>; 4],
@@ -164,6 +175,33 @@ pub(super) enum StateComponent {
 
 fn product_checked(shape: &[usize]) -> Result<usize, String> {
     crate::value::element_count(shape)
+}
+
+fn supports_inline_conversion(name: &str) -> bool {
+    matches!(
+        name,
+        "et_binary"
+            | "et_unary"
+            | "et_reindex"
+            | "et_where"
+            | "et_concat"
+            | "et_index"
+            | "et_rms_norm"
+    )
+}
+
+fn kernel_can_report_error(name: &str, args: &CudaKernelArgs) -> bool {
+    match name {
+        "et_convert" | "et_unary" | "et_where" | "et_reindex" | "et_concat" | "et_rms_norm_f32"
+        | "et_rms_norm_f64" | "et_random_f32" | "et_random_f64" | "et_sequence"
+        | "et_reduce_f32" | "et_reduce_f64" => false,
+        "et_binary" => args.compute_dtype >= 4 && args.operation == 3,
+        // Empty arg reductions fail during compilation. Cumsum performs no
+        // indexed read, so only selection and scatter variants can report an
+        // out-of-range index.
+        "et_index" => args.operation >= 3,
+        _ => true,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -270,12 +308,62 @@ pub(super) struct CudaProgramBuilder {
     lowered: Vec<LoweredInstruction<&'static str>>,
     semantic_values: Vec<Option<ValueId>>,
     semantic_results: Vec<Vec<ValueId>>,
+    elementwise_views: Vec<Option<ElementwiseView>>,
+    grouped_routing: std::collections::HashMap<(usize, usize, usize), (ValueId, ValueId)>,
     state_layout: Option<CudaStateLayout>,
     state_values: std::collections::HashMap<StateComponent, (ValueId, Option<ValueId>)>,
+    status: Option<ValueId>,
     pub(super) conversion_count: usize,
     pub(super) conversion_bytes: usize,
     gemms: CudaGemmLoweringPlan,
     bf16_kv_matmul: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ElementwiseView {
+    source: ValueId,
+    shape: Vec<usize>,
+    strides: Vec<usize>,
+    offset: usize,
+}
+
+fn contiguous_strides(shape: &[usize]) -> Result<Vec<usize>, String> {
+    let mut strides = vec![1usize; shape.len()];
+    for dimension in (0..shape.len().saturating_sub(1)).rev() {
+        strides[dimension] = strides[dimension + 1]
+            .checked_mul(shape[dimension + 1])
+            .ok_or("compile: CUDA view stride overflow")?;
+    }
+    Ok(strides)
+}
+
+fn reshape_view(view: &ElementwiseView, shape: &[usize]) -> Option<ElementwiseView> {
+    let old = view
+        .shape
+        .iter()
+        .copied()
+        .zip(view.strides.iter().copied())
+        .filter(|(size, _)| *size != 1)
+        .collect::<Vec<_>>();
+    let new = shape
+        .iter()
+        .copied()
+        .filter(|size| *size != 1)
+        .collect::<Vec<_>>();
+    if old.iter().map(|(size, _)| *size).ne(new.iter().copied()) {
+        return None;
+    }
+    let mut physical = old.iter().map(|(_, stride)| *stride);
+    let strides = shape
+        .iter()
+        .map(|&size| if size == 1 { Some(0) } else { physical.next() })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ElementwiseView {
+        source: view.source,
+        shape: shape.to_vec(),
+        strides,
+        offset: view.offset,
+    })
 }
 
 impl CudaProgramBuilder {
@@ -290,8 +378,11 @@ impl CudaProgramBuilder {
             lowered: Vec::new(),
             semantic_values: vec![None; index.order.len()],
             semantic_results: vec![Vec::new(); index.order.len()],
+            elementwise_views: vec![None; index.order.len()],
+            grouped_routing: std::collections::HashMap::new(),
             state_layout,
             state_values: std::collections::HashMap::new(),
+            status: None,
             conversion_count: 0,
             conversion_bytes: 0,
             gemms: CudaGemmLoweringPlan::new(index, legalization)?,
@@ -352,6 +443,32 @@ impl CudaProgramBuilder {
             .copied()
             .flatten()
             .ok_or_else(|| format!("compile: missing CUDA semantic value {semantic}"))
+    }
+
+    fn feeds_only_elementwise_region(
+        index: &GraphIndex,
+        optimization: &OptimizationPlan,
+        dense: DenseNodeId,
+    ) -> bool {
+        if index.roots.iter().any(|root| root.index() == dense.index()) {
+            return false;
+        }
+        let Some(consumers) = index.consumers_of(dense) else {
+            return false;
+        };
+        !consumers.is_empty()
+            && consumers.iter().all(|&consumer| {
+                if let Some(region) = optimization.node_region[consumer.index()] {
+                    return matches!(
+                        optimization.regions.get(region.index()),
+                        Some(NativeRegion::Elementwise(_))
+                    );
+                }
+                matches!(
+                    index.node(consumer).map(|node| &node.kind),
+                    Some(NodeKind::Reshape { .. })
+                ) && Self::feeds_only_elementwise_region(index, optimization, consumer)
+            })
     }
     fn emit(
         &mut self,
@@ -467,6 +584,12 @@ impl CudaProgramBuilder {
         output: ValueId,
     ) -> Result<(), String> {
         spec.name = kernel_name(spec.name, spec.args.compute_dtype)?;
+        if matches!(spec.name, "et_reduce_f32" | "et_reduce_f64") {
+            let input = inputs[0].ok_or("compile: CUDA reduction input is missing")?;
+            if self.values[input.index()].shape.len() > 64 {
+                return Err("compile: CUDA reduction rank exceeds 64".into());
+            }
+        }
         let mut kv_matmul = None;
         let mut state_buffers = [None; 4];
         let mut state_uses = Vec::new();
@@ -622,14 +745,29 @@ impl CudaProgramBuilder {
                 scratch[slot] = Some(self.planned(vec![*elements], *dtype, "scratch")?);
             }
         }
-        let status = self.planned(vec![1], DType::U32, "status")?;
+        let checked = kernel_can_report_error(spec.name, &spec.args);
+        let (status, define_status) = if checked {
+            if let Some(status) = self.status {
+                (Some(status), false)
+            } else {
+                let status = self.planned(vec![1], DType::I64, "status")?;
+                self.status = Some(status);
+                (Some(status), true)
+            }
+        } else {
+            (None, false)
+        };
         let mut definitions = scratch
             .iter()
             .flatten()
             .copied()
             .map(OutputDecl::new)
             .collect::<Vec<_>>();
-        definitions.push(OutputDecl::new(status));
+        if define_status {
+            definitions.push(OutputDecl::new(
+                status.ok_or("compile: CUDA status is missing")?,
+            ));
+        }
         let prepare_id = InstructionId::from_index(self.lowered.len())
             .ok_or("compile: too many CUDA instructions")?;
         self.lowered.push(LoweredInstruction::new(
@@ -717,11 +855,14 @@ impl CudaProgramBuilder {
                     .map(ValueUse::read_write)
                     .collect::<Vec<_>>(),
                 Vec::new(),
-                vec![ValueUse::read_write(status)],
+                status
+                    .into_iter()
+                    .map(ValueUse::read_write)
+                    .collect::<Vec<_>>(),
                 state_uses,
             )
             .with_effects(InstructionEffects {
-                may_fail: true,
+                may_fail: checked,
                 has_side_effects: stateful,
             }),
         );
@@ -733,6 +874,7 @@ impl CudaProgramBuilder {
                 inputs,
                 scratch,
                 status,
+                checked,
                 metadata,
                 state: spec.state,
                 state_buffers,
@@ -747,6 +889,7 @@ impl CudaProgramBuilder {
         dense: DenseNodeId,
         node: &Node,
         index: &GraphIndex,
+        optimization: &OptimizationPlan,
         instruction: Instruction,
         plan: &ExecutableDTypePlan,
     ) -> Result<(), String> {
@@ -763,6 +906,86 @@ impl CudaProgramBuilder {
             .operation(dense)
             .ok_or("compile: CUDA legalization entry is missing")?;
         let boundary_storage = node.storage.clone();
+        let direct_boundary = operation
+            .operands
+            .iter()
+            .all(|operand| operand.preparation == OperandPreparation::Direct)
+            && operation
+                .results
+                .iter()
+                .all(|result| result.completion == ResultCompletion::Direct);
+        if direct_boundary
+            && boundary_storage.representation == StorageRepresentation::Dense
+            && Self::feeds_only_elementwise_region(index, optimization, dense)
+        {
+            if let NodeKind::Slice { a, ranges } = &node.kind {
+                if node.dtype == a.dtype && ranges.len() == a.shape.len() {
+                    let parent = index
+                        .dense_id(a.id)
+                        .ok_or("compile: CUDA slice source is missing")?;
+                    let source = self.resolve(parent.index())?;
+                    let base =
+                        self.elementwise_views[parent.index()]
+                            .clone()
+                            .unwrap_or(ElementwiseView {
+                                source,
+                                shape: a.shape.clone(),
+                                strides: contiguous_strides(&a.shape)?,
+                                offset: 0,
+                            });
+                    let mut offset = base.offset;
+                    let mut strides = Vec::with_capacity(ranges.len());
+                    for ((&(start, _, step), &stride), (&source_size, &result_size)) in ranges
+                        .iter()
+                        .zip(&base.strides)
+                        .zip(a.shape.iter().zip(&node.shape))
+                    {
+                        if step == 0 || start >= source_size {
+                            return Err("compile: CUDA elementwise slice view is invalid".into());
+                        }
+                        offset = offset
+                            .checked_add(
+                                start
+                                    .checked_mul(stride)
+                                    .ok_or("compile: CUDA slice offset overflow")?,
+                            )
+                            .ok_or("compile: CUDA slice offset overflow")?;
+                        strides.push(
+                            stride
+                                .checked_mul(step)
+                                .ok_or("compile: CUDA slice stride overflow")?,
+                        );
+                        if result_size == 0 {
+                            return Err("compile: empty CUDA elementwise slice view".into());
+                        }
+                    }
+                    let view = ElementwiseView {
+                        source: base.source,
+                        shape: node.shape.clone(),
+                        strides,
+                        offset,
+                    };
+                    self.semantic_values[dense.index()] = Some(base.source);
+                    self.semantic_results[dense.index()] = vec![base.source];
+                    self.elementwise_views[dense.index()] = Some(view);
+                    return Ok(());
+                }
+            }
+            if let NodeKind::Reshape { a, .. } = &node.kind {
+                let parent = index
+                    .dense_id(a.id)
+                    .ok_or("compile: CUDA reshape source is missing")?;
+                if let Some(view) = self.elementwise_views[parent.index()]
+                    .as_ref()
+                    .and_then(|view| reshape_view(view, &node.shape))
+                {
+                    self.semantic_values[dense.index()] = Some(view.source);
+                    self.semantic_results[dense.index()] = vec![view.source];
+                    self.elementwise_views[dense.index()] = Some(view);
+                    return Ok(());
+                }
+            }
+        }
         // A 2D transpose that only feeds a row-oriented BF16 weight position is
         // a physical view. Lowering keeps the original bytes and lets the GEMM
         // consume them through its transpose operand, so no weight transpose
@@ -951,7 +1174,9 @@ impl CudaProgramBuilder {
                         if self.values[source.index()].dtype != conversion.source {
                             return Err("compile: conversion source mismatch".into());
                         }
-                        source = self.conversion(source, conversion.destination)?;
+                        if !supports_inline_conversion(spec.name) {
+                            source = self.conversion(source, conversion.destination)?;
+                        }
                     }
                     for (slot, input) in spec.inputs.iter().enumerate() {
                         if *input == Some(semantic) {
@@ -963,9 +1188,22 @@ impl CudaProgramBuilder {
                 let mut results = Vec::with_capacity(operation.results.len());
                 for (position, result) in operation.results.iter().enumerate() {
                     let boundary = &semantic_spec.results[position].value;
+                    let inline_destination = match result.completion {
+                        ResultCompletion::ConvertToBoundary(conversion)
+                            if supports_inline_conversion(spec.name) =>
+                        {
+                            if result.execution_dtype != conversion.source
+                                || boundary.semantic_dtype != conversion.destination
+                            {
+                                return Err("compile: CUDA boundary dtype mismatch".into());
+                            }
+                            Some(conversion.destination)
+                        }
+                        _ => None,
+                    };
                     let id = self.planned(
                         boundary.logical_shape.to_vec(),
-                        result.execution_dtype,
+                        inline_destination.unwrap_or(result.execution_dtype),
                         "result",
                     )?;
                     let mut selected = spec.clone();
@@ -997,7 +1235,11 @@ impl CudaProgramBuilder {
                             {
                                 return Err("compile: CUDA boundary dtype mismatch".into());
                             }
-                            self.conversion(id, conversion.destination)?
+                            if inline_destination.is_some() {
+                                id
+                            } else {
+                                self.conversion(id, conversion.destination)?
+                            }
                         }
                     });
                 }
@@ -1009,6 +1251,100 @@ impl CudaProgramBuilder {
         self.semantic_values[dense.index()] = Some(output);
         if self.semantic_results[dense.index()].is_empty() {
             self.semantic_results[dense.index()] = vec![output];
+        }
+        Ok(())
+    }
+
+    pub(super) fn add_region(
+        &mut self,
+        index: &GraphIndex,
+        optimization: &OptimizationPlan,
+        region_id: RegionId,
+        dtype_plan: &ExecutableDTypePlan,
+        device: &CudaDevice,
+    ) -> Result<(), String> {
+        if !matches!(
+            dtype_plan.execution().realization,
+            ExecutionRealization::DirectKernel | ExecutionRealization::KernelLocal
+        ) {
+            return Err("compile: CUDA region requires direct or kernel-local execution".into());
+        }
+        let native = optimization
+            .regions
+            .get(region_id.index())
+            .ok_or_else(|| format!("compile: CUDA region {region_id} is out of range"))?;
+        let NativeRegion::Elementwise(region) = native else {
+            return Err("compile: unsupported CUDA optimization region".into());
+        };
+        if !region.device.is_cuda() {
+            return Err("compile: CUDA region targets another device".into());
+        }
+        if region.inputs.len() > 8 {
+            return Err("compile: CUDA fused region has more than eight inputs".into());
+        }
+        let expressions = legalize_region_expressions(native, dtype_plan)?;
+        let expression = expressions
+            .first()
+            .ok_or("compile: CUDA fused region has no expression")?;
+        let mut inputs = [None; 8];
+        let mut lane_strides = region.lane_strides.to_vec();
+        let mut lane_offsets = vec![0; region.inputs.len()];
+        for (slot, semantic) in region.inputs.iter().enumerate() {
+            if let Some(view) = &self.elementwise_views[semantic.index()] {
+                if view.shape != region.shape.as_ref()
+                    || lane_strides[slot].as_ref() != contiguous_strides(&view.shape)?.as_slice()
+                {
+                    return Err(
+                        "compile: CUDA elementwise view requires an unbroadcast region input"
+                            .into(),
+                    );
+                }
+                inputs[slot] = Some(view.source);
+                lane_strides[slot] = view.strides.clone().into_boxed_slice();
+                lane_offsets[slot] = view.offset;
+            } else {
+                inputs[slot] = Some(self.resolve(semantic.index())?);
+            }
+        }
+        let output = self.planned(region.shape.to_vec(), region.dtype, "fused_elementwise")?;
+        let source =
+            crate::emit::elementwise(expression, &lane_strides, &lane_offsets, &region.shape)?;
+        let function = device.fused_elementwise(&source)?;
+        let mut args = CudaKernelArgs {
+            elements: product_checked(&region.shape)? as u64,
+            output_dtype: dtype_code(region.dtype),
+            compute_dtype: dtype_code(DType::F32),
+            ..Default::default()
+        };
+        for (slot, value) in inputs.iter().enumerate() {
+            if let Some(value) = value {
+                args.input_dtypes[slot] = dtype_code(self.values[value.index()].dtype);
+            }
+        }
+        self.emit(
+            "fused_elementwise",
+            CommandKind::FusedElementwise {
+                function,
+                args,
+                inputs,
+            },
+            Some(output),
+            inputs
+                .iter()
+                .flatten()
+                .copied()
+                .map(ValueUse::read)
+                .collect(),
+            true,
+        )?;
+        let semantic = region.output.semantic_node;
+        self.semantic_values[semantic.index()] = Some(output);
+        self.semantic_results[semantic.index()] = vec![output];
+        let node = index
+            .node(semantic)
+            .ok_or("compile: CUDA fused output semantic node is missing")?;
+        if node.shape.as_slice() != region.shape.as_ref() || node.dtype != region.dtype {
+            return Err("compile: CUDA fused output metadata mismatch".into());
         }
         Ok(())
     }
@@ -1071,6 +1407,7 @@ impl CudaProgramBuilder {
         weight: usize,
         indexes: usize,
     ) -> Result<ValueId, String> {
+        let indexes_semantic = indexes;
         let (x, weight, indexes) = (
             self.resolve(x)?,
             self.resolve(weight)?,
@@ -1081,19 +1418,45 @@ impl CudaProgramBuilder {
         let inner = self.values[x.index()].shape[1];
         let experts = self.values[weight.index()].shape[0];
         let columns = self.values[weight.index()].shape[1];
-        let control = self.planned(
-            vec![experts.checked_add(2).ok_or("group control overflow")?],
-            DType::U32,
-            "group_control",
-        )?;
-        let row_map = self.planned(vec![rows], DType::U32, "group_rows")?;
+        let routing_key = (indexes_semantic, rows, experts);
+        let previous_routing = self.grouped_routing.get(&routing_key).copied();
+        let (control, row_map, reuse_routing) = if let Some((control, row_map)) = previous_routing {
+            (control, row_map, true)
+        } else {
+            (
+                self.planned(
+                    vec![experts.checked_add(2).ok_or("group control overflow")?],
+                    DType::U32,
+                    "group_control",
+                )?,
+                self.planned(vec![rows], DType::U32, "group_rows")?,
+                false,
+            )
+        };
         let gathered = self.planned(vec![rows, inner], dtype, "group_input")?;
         let projected = self.planned(vec![rows, columns], dtype, "group_output")?;
         let workspace = if dtype == DType::BF16 && rows != 0 && inner != 0 && columns != 0 {
-            Some(self.planned(vec![CUBLAS_WORKSPACE_BYTES], DType::U8, "cublas_workspace")?)
+            Some(self.planned(
+                vec![CUBLAS_WORKSPACE_BYTES * EXPERT_BLAS_STREAMS],
+                DType::U8,
+                "cublas_workspace",
+            )?)
         } else {
             None
         };
+        let owned_scratch = [
+            (!reuse_routing).then_some(control),
+            (!reuse_routing).then_some(row_map),
+            Some(gathered),
+            Some(projected),
+            workspace,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        for &id in &owned_scratch {
+            self.emit("prepare", CommandKind::Prepare, Some(id), Vec::new(), true)?;
+        }
         let scratch = [
             Some(control),
             Some(row_map),
@@ -1104,9 +1467,6 @@ impl CudaProgramBuilder {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        for &id in &scratch {
-            self.emit("prepare", CommandKind::Prepare, Some(id), Vec::new(), true)?;
-        }
         let output = self.planned(vec![rows, columns], dtype, "result")?;
         let id = InstructionId::from_index(self.lowered.len())
             .ok_or("compile: too many CUDA instructions")?;
@@ -1150,8 +1510,12 @@ impl CudaProgramBuilder {
                 gathered,
                 projected,
                 workspace,
+                reuse_routing,
             },
         });
+        if !reuse_routing && rows != 0 && inner != 0 && columns != 0 {
+            self.grouped_routing.insert(routing_key, (control, row_map));
+        }
         Ok(output)
     }
 
@@ -1248,6 +1612,22 @@ impl CudaProgramBuilder {
                 .with_effects(InstructionEffects {
                     may_fail: false,
                     has_side_effects: append,
+                }),
+            );
+        }
+        if let Some(status) = self.status {
+            let id = InstructionId::from_index(self.lowered.len())
+                .ok_or("compile: too many CUDA instructions")?;
+            self.lowered.push(
+                LoweredInstruction::new(
+                    id,
+                    "status_check",
+                    vec![ValueUse::read(status)],
+                    Vec::new(),
+                )
+                .with_effects(InstructionEffects {
+                    may_fail: true,
+                    has_side_effects: false,
                 }),
             );
         }

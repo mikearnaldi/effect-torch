@@ -1,5 +1,5 @@
-use crate::cublas::CudaBlas;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream};
+use crate::cublas::{Bf16GemmPlan, CudaBlas, CUBLAS_WORKSPACE_BYTES, EXPERT_BLAS_STREAMS};
+use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -55,6 +55,7 @@ const TYPED_KERNELS: &[&str] = &[
     "et_where",
     "et_concat",
     "et_index",
+    "et_arg_index_last_wide",
     "et_top_k_indices",
     "et_expert_linear_rows",
     "et_grouped_counts",
@@ -153,9 +154,15 @@ pub struct CudaDevice {
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) f32: CudaF32Kernels,
     pub(crate) cublas: CudaBlas,
+    expert_cublas: Vec<CudaBlas>,
+    /// Serializes graph capture/replay on the shared stream. CUDA graphs are
+    /// not internally synchronized and capture must not overlap submissions
+    /// from another executable using this device.
+    pub(crate) graph_execution: Mutex<()>,
     pub(crate) greedy_argmax_output: Mutex<CudaSlice<u32>>,
     pub(crate) topk_output: Mutex<CudaSlice<f32>>,
     kernels: HashMap<String, CudaFunction>,
+    fused_kernels: Mutex<HashMap<String, CudaFunction>>,
 }
 
 impl CudaDevice {
@@ -176,6 +183,89 @@ impl CudaDevice {
         self.kernels
             .get(name)
             .ok_or_else(|| format!("CUDA kernel {name} is not registered"))
+    }
+
+    pub(crate) fn fused_elementwise(&self, source: &str) -> Result<CudaFunction, String> {
+        let mut kernels = self
+            .fused_kernels
+            .lock()
+            .map_err(|_| "CUDA fused-kernel cache lock poisoned")?;
+        if let Some(function) = kernels.get(source) {
+            return Ok(function.clone());
+        }
+        let module = compile_module(
+            self.stream.context(),
+            "fused-elementwise.cu",
+            &[TYPED_HEADER, source],
+        )?;
+        let function = load(&module, "et_fused_elementwise")?;
+        kernels.insert(source.to_string(), function.clone());
+        Ok(function)
+    }
+
+    /// Runs independent expert products on separate streams and joins them
+    /// back into the primary stream before the caller scatters their rows.
+    ///
+    /// # Safety
+    /// The pointers must remain valid through the primary-stream completion
+    /// fence and each worker must receive a disjoint workspace and output.
+    pub(crate) unsafe fn grouped_gemm_bf16(
+        &self,
+        groups: &[(Bf16GemmPlan, u64, u64, u64)],
+        workspace: u64,
+    ) -> Result<Vec<CudaEvent>, String> {
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workers = groups.len().min(self.expert_cublas.len());
+        let mut partitions = vec![Vec::new(); workers];
+        let mut loads = vec![0usize; workers];
+        let mut ordered = groups.to_vec();
+        ordered.sort_unstable_by_key(|(plan, ..)| std::cmp::Reverse(plan.m));
+        for group in ordered {
+            let worker = loads
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, load)| **load)
+                .map(|(worker, _)| worker)
+                .ok_or("CUDA expert worker is missing")?;
+            loads[worker] = loads[worker]
+                .checked_add(group.0.m)
+                .ok_or("CUDA expert worker load overflow")?;
+            partitions[worker].push(group);
+        }
+        let ready = self
+            .stream
+            .record_event(None)
+            .map_err(|error| error.to_string())?;
+        for (index, (worker, groups)) in self.expert_cublas[..workers]
+            .iter()
+            .zip(&partitions)
+            .enumerate()
+        {
+            worker
+                .stream()
+                .wait(&ready)
+                .map_err(|error| error.to_string())?;
+            unsafe {
+                worker.gemm_bf16_sequence(
+                    groups,
+                    workspace + (index * CUBLAS_WORKSPACE_BYTES) as u64,
+                )?;
+            }
+        }
+        let mut completed = Vec::with_capacity(workers);
+        for worker in &self.expert_cublas[..workers] {
+            let event = worker
+                .stream()
+                .record_event(None)
+                .map_err(|error| error.to_string())?;
+            self.stream
+                .wait(&event)
+                .map_err(|error| error.to_string())?;
+            completed.push(event);
+        }
+        Ok(completed)
     }
 
     fn new(ordinal: u32) -> Result<Self, String> {
@@ -241,6 +331,12 @@ impl CudaDevice {
             }
         }
         let cublas = CudaBlas::new(stream.clone())?;
+        let expert_cublas = (0..EXPERT_BLAS_STREAMS)
+            .map(|_| {
+                let worker = context.new_stream().map_err(|error| error.to_string())?;
+                CudaBlas::new(worker)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let greedy_argmax_output =
             unsafe { stream.alloc::<u32>(2) }.map_err(|error| error.to_string())?;
         let topk_output =
@@ -251,9 +347,12 @@ impl CudaDevice {
             stream,
             f32: sampling.ok_or("CUDA sampling module was not registered")?,
             cublas,
+            expert_cublas,
+            graph_execution: Mutex::new(()),
             greedy_argmax_output: Mutex::new(greedy_argmax_output),
             topk_output: Mutex::new(topk_output),
             kernels,
+            fused_kernels: Mutex::new(HashMap::new()),
         })
     }
 

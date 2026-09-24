@@ -132,11 +132,13 @@ extern "C" __global__ void et_rms_norm(CudaKernelArgs a) {
     et_u64 rows = a.elements / width;
     unsigned int lane = threadIdx.x & 31U;
     for (et_u64 row = et_thread() / 32; row < rows; row += (et_u64)gridDim.x * (blockDim.x / 32)) {
-        const float *x = ET_INPUT(0) + row * width;
         float partial[4] = {0, 0, 0, 0};
         for (et_u64 k = lane * 4; k < width; k += 128) {
             #pragma unroll
-            for (int j = 0; j < 4; ++j) if (k + j < width) partial[j] += x[k + j] * x[k + j];
+            for (int j = 0; j < 4; ++j) if (k + j < width) {
+                float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k + j);
+                partial[j] += value * value;
+            }
         }
         float sum = ((partial[0] + partial[1]) + partial[2]) + partial[3];
         for (unsigned int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
@@ -144,18 +146,18 @@ extern "C" __global__ void et_rms_norm(CudaKernelArgs a) {
         float mean = sum * (1.0f / (float)width);
         float inverse = rsqrtf(mean + (float)a.scalars[0]);
         for (et_u64 k = lane; k < width; k += 32) {
-            float value = x[k] * inverse;
-            if (a.inputs[1]) value *= ET_INPUT(1)[k];
-            ET_OUTPUT[row * width + k] = value;
+            float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k) * inverse;
+            if (a.inputs[1]) value *= et_load<float>(a.inputs[1], a.input_dtypes[1], k);
+            et_store(a.output, a.output_dtype, row * width + k, value);
         }
     }
 #else
     et_u64 i = et_thread(); if (i >= a.elements) return;
     et_u64 width = et_shape(a, 0)[et_meta(a)[1] - 1], base = i / width * width;
-    double sum = 0; for (et_u64 d = 0; d < width; ++d) { double v = ET_INPUT(0)[base + d]; sum += v * v; }
-    double value = ET_INPUT(0)[i] / sqrt(sum / width + (double)a.scalars[0]);
-    if (a.inputs[1]) value *= ET_INPUT(1)[i % width];
-    ET_OUTPUT[i] = value;
+    double sum = 0; for (et_u64 d = 0; d < width; ++d) { double v = et_load<double>(a.inputs[0], a.input_dtypes[0], base + d); sum += v * v; }
+    double value = et_load<double>(a.inputs[0], a.input_dtypes[0], i) / sqrt(sum / width + (double)a.scalars[0]);
+    if (a.inputs[1]) value *= et_load<double>(a.inputs[1], a.input_dtypes[1], i % width);
+    et_store(a.output, a.output_dtype, i, value);
 #endif
 }
 __device__ unsigned int et_ce_active(const CudaKernelArgs &a, int role, et_u64 rows, et_u64 classes) {

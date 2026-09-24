@@ -1990,8 +1990,7 @@ export const generate = <E = never, R = never>(
 
     const sampler = yield* Tensor.compile(
       explicitRandom === undefined
-        ? ([logits, temperature]) =>
-          generationStatisticsWithDeviceNoise(logits!, temperature!, program.predictionDtype)
+        ? ([logits, temperature]) => generationStatisticsWithDeviceNoise(logits!, temperature!, program.predictionDtype)
         : ([logits, exponentials, temperature]) =>
           generationStatistics(logits!, exponentials!, temperature!, program.predictionDtype),
       options.compile
@@ -2049,10 +2048,12 @@ export const generate = <E = never, R = never>(
 
             if (exponentials !== undefined) inputs.push(yield* Tensor.fromTypedArray(exponentials, logits.shape))
 
-            inputs.push(yield* Tensor.full(
-              [],
-              generationTemperature(minTemperature, maxTemperature, maxSteps, step.remaining)
-            ))
+            inputs.push(
+              yield* Tensor.full(
+                [],
+                generationTemperature(minTemperature, maxTemperature, maxSteps, step.remaining)
+              )
+            )
 
             const outputs = yield* Effect.acquireRelease(
               sampler.call(inputs).pipe(Effect.onExit((exit) =>

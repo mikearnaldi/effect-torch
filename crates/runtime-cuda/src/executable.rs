@@ -7,7 +7,7 @@ use crate::lowering::{
 use crate::value::element_count;
 use crate::workspace::{self, CudaMemorySpace, InvocationResources, CUDA_STORAGE_ALIGNMENT};
 use crate::{CudaDevice, CudaValue};
-use cudarc::driver::{DeviceRepr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{sys, CudaGraph, DeviceRepr, LaunchConfig, PushKernelArg};
 use effect_torch_compiler::{
     build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport,
     DiagnosticsInput, GraphIndex, LoweringUnit, MemoryPlannerConfig, ProgramRequest,
@@ -18,9 +18,10 @@ use effect_torch_runtime::{
     CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, KvLayerDescriptor, MemoryPlan,
     StateAccessMode, ValueId,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 #[cfg(test)]
@@ -42,7 +43,7 @@ pub(crate) struct CudaKernelArgs {
     pub(crate) output_dtype: u32,
     pub(crate) compute_dtype: u32,
     pub(crate) operation: u32,
-    pub(crate) reserved: u32,
+    pub(crate) error_context: u32,
 }
 
 // SAFETY: repr(C), scalar fields only, and all fields are initialized. The CUDA
@@ -193,11 +194,15 @@ impl Instruction {
                 indexes,
                 src,
                 dim,
+                width,
+                trailing,
                 ..
             } => {
                 let mut s = KernelSpec::new("et_index", &[Some(*a), *indexes, *src]);
                 s.args.operation = *op;
                 s.args.integers[0] = u64::from(*dim);
+                s.args.integers[1] = *width as u64;
+                s.args.integers[2] = u64::from(*trailing);
                 s
             }
             Self::RmsNorm { x, weight, eps, .. } => {
@@ -687,6 +692,8 @@ pub(super) enum Instruction {
         indexes: Option<usize>,
         src: Option<usize>,
         dim: u32,
+        width: usize,
+        trailing: bool,
     },
     RmsNorm {
         x: usize,
@@ -1145,6 +1152,8 @@ fn semantic_instruction(
             indexes: None,
             src: None,
             dim: u32::try_from(*dim).map_err(|_| "CUDA index dimension exceeds u32")?,
+            width: a.shape[*dim],
+            trailing: *dim + 1 == a.shape.len(),
         },
         NodeKind::Cumsum { a, dim } => Instruction::Index {
             op: 2,
@@ -1152,6 +1161,8 @@ fn semantic_instruction(
             indexes: None,
             src: None,
             dim: u32::try_from(*dim).map_err(|_| "CUDA index dimension exceeds u32")?,
+            width: a.shape[*dim],
+            trailing: *dim + 1 == a.shape.len(),
         },
         NodeKind::IndexSelect { a, dim, indexes } => Instruction::Index {
             op: 3,
@@ -1159,6 +1170,8 @@ fn semantic_instruction(
             indexes: Some(child_index(&index, indexes)?),
             src: None,
             dim: u32::try_from(*dim).map_err(|_| "CUDA index dimension exceeds u32")?,
+            width: a.shape[*dim],
+            trailing: *dim + 1 == a.shape.len(),
         },
         NodeKind::Gather { a, dim, indexes } => Instruction::Index {
             op: 4,
@@ -1166,6 +1179,8 @@ fn semantic_instruction(
             indexes: Some(child_index(&index, indexes)?),
             src: None,
             dim: u32::try_from(*dim).map_err(|_| "CUDA index dimension exceeds u32")?,
+            width: a.shape[*dim],
+            trailing: *dim + 1 == a.shape.len(),
         },
         NodeKind::ScatterAdd {
             a,
@@ -1178,6 +1193,8 @@ fn semantic_instruction(
             indexes: Some(child_index(&index, indexes)?),
             src: Some(child_index(&index, src)?),
             dim: u32::try_from(*dim).map_err(|_| "CUDA index dimension exceeds u32")?,
+            width: a.shape[*dim],
+            trailing: *dim + 1 == a.shape.len(),
         },
         NodeKind::RmsNorm { x, weight, eps } => Instruction::RmsNorm {
             x: child_index(&index, x)?,
@@ -1935,6 +1952,28 @@ pub struct CudaExecutable {
     diagnostics: ExecutableDiagnostics,
     compiler_work: CompilerWorkReport,
     runs: AtomicU64,
+    graph_runtime: Mutex<GraphRuntime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GraphKey {
+    start: usize,
+    end: usize,
+    pointers: Arc<[u64]>,
+}
+
+struct CapturedGraph(CudaGraph);
+
+// SAFETY: CUDA graph access is serialized by `graph_runtime`; cudarc binds the
+// graph's context to the calling thread before each launch and destruction.
+unsafe impl Send for CapturedGraph {}
+
+#[derive(Default)]
+struct GraphRuntime {
+    cache: HashMap<GraphKey, CapturedGraph>,
+    hits: u64,
+    captures: u64,
+    seen: HashSet<GraphKey>,
 }
 
 /// Physical KV layout frozen before lowering and memory planning.
@@ -2023,12 +2062,27 @@ pub struct CudaStateInvocation {
 
 struct InvocationFence {
     stream: Arc<cudarc::driver::CudaStream>,
+    worker_events: Vec<cudarc::driver::CudaEvent>,
     complete: bool,
 }
 impl Drop for InvocationFence {
     fn drop(&mut self) {
         if !self.complete {
             let _ = self.stream.synchronize();
+        }
+    }
+}
+
+struct StreamCaptureFence {
+    stream: Arc<cudarc::driver::CudaStream>,
+    active: bool,
+}
+impl Drop for StreamCaptureFence {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.stream.end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+            );
         }
     }
 }
@@ -2185,6 +2239,192 @@ impl CudaExecutable {
             self.buffer(resources, id)?,
         )
     }
+    fn graph_segment_end(&self, start: usize) -> Option<usize> {
+        fn captures_work(command: &Command) -> bool {
+            command.output.is_some()
+                && match &command.kind {
+                    CommandKind::Gemm { .. }
+                    | CommandKind::LinearBias { .. }
+                    | CommandKind::FusedElementwise { .. } => true,
+                    CommandKind::Kernel {
+                        name,
+                        checked,
+                        state,
+                        kv_matmul,
+                        ..
+                    } => {
+                        !checked
+                            && matches!(state, StateAccess::None)
+                            && kv_matmul.is_none()
+                            && !name.starts_with("et_random_")
+                    }
+                    _ => false,
+                }
+        }
+        fn bridges_work(command: &Command) -> bool {
+            matches!(
+                command.kind,
+                CommandKind::Prepare
+                    | CommandKind::Value(_)
+                    | CommandKind::Input { .. }
+                    | CommandKind::Alias { .. }
+            )
+        }
+        if !self.commands.get(start).is_some_and(captures_work) {
+            return None;
+        }
+        let mut cursor = start + 1;
+        let mut end = cursor;
+        let mut work = 1usize;
+        while let Some(command) = self.commands.get(cursor) {
+            if captures_work(command) {
+                work += 1;
+                end = cursor + 1;
+            } else if !bridges_work(command) {
+                break;
+            }
+            cursor += 1;
+        }
+        (work >= 2).then_some(end)
+    }
+    fn materialize_graph_values(
+        &self,
+        resources: &InvocationResources,
+        bindings: &[CudaValue],
+        values: &mut [Option<CudaValue>],
+        start: usize,
+        end: usize,
+    ) -> Result<(), String> {
+        for command in &self.commands[start..end] {
+            let Some(output) = command.output else {
+                continue;
+            };
+            let meta = &self.program.values[output.index()];
+            let value = match &command.kind {
+                CommandKind::Prepare => continue,
+                CommandKind::Value(value) => value.clone(),
+                CommandKind::Input { binding } => {
+                    let value = bindings
+                        .get(*binding)
+                        .ok_or_else(|| format!("execute: missing CUDA binding {binding}"))?;
+                    if value.ordinal() != self.device.ordinal
+                        || value.shape() != meta.shape
+                        || value.dtype() != meta.dtype
+                        || value.spec().storage.representation != meta.storage.representation
+                    {
+                        return Err(format!(
+                            "execute: CUDA binding {binding} violates its value specification"
+                        ));
+                    }
+                    value.clone()
+                }
+                CommandKind::Alias { source } => values[source.index()]
+                    .as_ref()
+                    .ok_or("execute: captured alias source is unavailable")?
+                    .reshape_dense(meta.shape.clone())?,
+                _ => self.planned_value(resources, output)?,
+            };
+            values[output.index()] = Some(value);
+        }
+        Ok(())
+    }
+    fn graph_key(
+        &self,
+        resources: &InvocationResources,
+        values: &[Option<CudaValue>],
+        start: usize,
+        end: usize,
+    ) -> Result<GraphKey, String> {
+        let value_address = |id: ValueId| {
+            values[id.index()]
+                .as_ref()
+                .map(CudaValue::storage_address)
+                .ok_or_else(|| {
+                    format!(
+                        "execute: captured CUDA value {id} unavailable in segment {start}..{end}"
+                    )
+                })
+        };
+        let mut pointers = Vec::new();
+        for (offset, command) in self.commands[start..end].iter().enumerate() {
+            if matches!(command.kind, CommandKind::Prepare) {
+                continue;
+            }
+            let Some(output) = command.output else {
+                continue;
+            };
+            pointers.push(value_address(output)?);
+            match &command.kind {
+                CommandKind::Gemm {
+                    x,
+                    weight,
+                    workspace,
+                    ..
+                } => {
+                    pointers.extend([
+                        value_address(*x)?,
+                        value_address(*weight)?,
+                        self.buffer(resources, *workspace)?.address(),
+                    ]);
+                }
+                CommandKind::LinearBias {
+                    accumulator, bias, ..
+                } => {
+                    pointers.extend([value_address(*accumulator)?, value_address(*bias)?]);
+                }
+                CommandKind::FusedElementwise { inputs, .. } => {
+                    for input in inputs.iter().flatten() {
+                        pointers.push(value_address(*input)?);
+                    }
+                }
+                CommandKind::Kernel {
+                    inputs, scratch, ..
+                } => {
+                    for input in inputs.iter().flatten() {
+                        pointers.push(value_address(*input)?);
+                    }
+                    for scratch in scratch.iter().flatten() {
+                        pointers.push(self.buffer(resources, *scratch)?.address());
+                    }
+                    pointers.push(
+                        self.metadata[start + offset]
+                            .as_ref()
+                            .ok_or("execute: captured kernel metadata missing")?
+                            .address(),
+                    );
+                }
+                CommandKind::Prepare
+                | CommandKind::Value(_)
+                | CommandKind::Input { .. }
+                | CommandKind::Alias { .. } => {}
+                _ => return Err("execute: non-capturable command in CUDA graph segment".into()),
+            }
+        }
+        Ok(GraphKey {
+            start,
+            end,
+            pointers: pointers.into(),
+        })
+    }
+    fn status_result(&self, failure: u64) -> Result<(), String> {
+        if failure == 0 {
+            return Ok(());
+        }
+        let code = failure as u32;
+        let position = (failure >> 32) as usize;
+        let name = match self.commands.get(position).map(|command| &command.kind) {
+            Some(CommandKind::Kernel { name, .. }) => *name,
+            _ => return Err("execute: CUDA error context is invalid".into()),
+        };
+        Err(match code {
+            1 => format!("{name}: index is out of range"),
+            2 => format!("{name}: no active targets"),
+            3 => format!("{name}: matrix is singular"),
+            5 => "topKIndices: NaN input".into(),
+            6 => "expertLinearRows: expert index is out of range".into(),
+            _ => format!("{name}: invalid arithmetic"),
+        })
+    }
     fn execute_inner(
         &self,
         bindings: &[CudaValue],
@@ -2198,12 +2438,17 @@ impl CudaExecutable {
         // Drop the fence before returning leases on errors or interruption.
         let mut fence = InvocationFence {
             stream: self.device.stream.clone(),
+            worker_events: Vec::new(),
             complete: false,
         };
         let run = self.runs.fetch_add(1, Ordering::Relaxed);
         // Opt-in diagnosis of a bounded run. Synchronization below attributes
         // asynchronous GEMMs to their own command rather than the next kernel.
         let trace = std::env::var("EFFECT_TORCH_CUDA_TRACE").is_ok_and(|value| value == "1");
+        let graph_trace =
+            std::env::var("EFFECT_TORCH_CUDA_GRAPH_TRACE").is_ok_and(|value| value == "1");
+        let graphs_requested =
+            std::env::var("EFFECT_TORCH_CUDA_GRAPHS").is_ok_and(|value| value == "1");
         // Node may make stderr nonblocking. Use an explicit append-only file
         // rather than allowing diagnostic output to panic on EAGAIN.
         let mut trace_file = if trace {
@@ -2226,12 +2471,87 @@ impl CudaExecutable {
             }
             Ok(())
         };
+        let graph_candidate = self.commands.iter().any(|command| {
+            matches!(
+                command.kind,
+                CommandKind::Kernel {
+                    state: StateAccess::Kv { .. }
+                        | StateAccess::Kda { layer: Some(_), .. }
+                        | StateAccess::Conv { layer: Some(_), .. },
+                    ..
+                }
+            )
+        });
+        #[cfg(test)]
+        let graph_enabled = graph_candidate
+            && graphs_requested
+            && !trace
+            && after_gemm.is_none()
+            && after_kv.is_none();
+        #[cfg(not(test))]
+        let graph_enabled = graph_candidate && graphs_requested && !trace;
+        let _graph_execution = graph_enabled
+            .then(|| self.device.graph_execution.lock())
+            .transpose()
+            .map_err(|_| "execute: CUDA graph execution lock poisoned")?;
+        let mut graph_runtime = graph_enabled
+            .then(|| self.graph_runtime.lock())
+            .transpose()
+            .map_err(|_| "execute: CUDA graph cache lock poisoned")?;
+        let mut capture_fence = StreamCaptureFence {
+            stream: self.device.stream.clone(),
+            active: false,
+        };
+        let mut capture: Option<(GraphKey, usize)> = None;
+        let mut deferred_status = None;
+        let mut grouped_routing = HashMap::<ValueId, Vec<u32>>::new();
         let mut values: Vec<Option<CudaValue>> = vec![None; self.program.values.len()];
-        for (position, command) in self.commands.iter().enumerate() {
+        let mut position = 0usize;
+        while position < self.commands.len() {
             if cancelled.is_cancelled() {
                 return Err("operation aborted".into());
             }
+            if capture.is_none() {
+                if let (Some(runtime), Some(end)) =
+                    (graph_runtime.as_mut(), self.graph_segment_end(position))
+                {
+                    self.materialize_graph_values(
+                        &resources,
+                        bindings,
+                        &mut values,
+                        position,
+                        end,
+                    )?;
+                    let key = self.graph_key(&resources, &values, position, end)?;
+                    if let Some(graph) = runtime.cache.get(&key) {
+                        graph.0.launch().map_err(|error| error.to_string())?;
+                        if graph_trace {
+                            self.device.stream.synchronize().map_err(|error| {
+                                format!(
+                                    "CUDA graph replay {}..{} failed: {error}",
+                                    key.start, key.end
+                                )
+                            })?;
+                        }
+                        runtime.hits += 1;
+                        position = end;
+                        continue;
+                    }
+                    // Loader programs often repeat with different weight addresses.
+                    // Capture only after this exact command and pointer set repeats.
+                    if !runtime.seen.insert(key.clone()) {
+                        self.device
+                            .stream
+                            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+                            .map_err(|error| format!("CUDA graph capture failed: {error}"))?;
+                        capture_fence.active = true;
+                        capture = Some((key, end));
+                    }
+                }
+            }
+            let command = &self.commands[position];
             let Some(output_id) = command.output else {
+                position += 1;
                 continue;
             };
             let meta = &self.program.values[output_id.index()];
@@ -2257,12 +2577,13 @@ impl CudaExecutable {
                         name,
                         inputs,
                         args,
+                        checked,
                         state,
                         kv_matmul,
                         ..
                     } => serde_json::json!({
                         "kernel": if kv_matmul.is_some() { "kv_stepwise_bf16_gemm_active_rows" } else { name },
-                        "capturable": false,
+                        "capturable": !checked && kv_matmul.is_none(),
                         "dynamicGemmDimensions": kv_matmul.is_some(),
                         "workspaceBytes": kv_matmul.map(|plan| plan.bytes),
                         "inputs": inputs.iter().flatten().map(|id| value(*id)).collect::<Vec<_>>(),
@@ -2279,16 +2600,25 @@ impl CudaExecutable {
                     CommandKind::LinearBias { .. } => {
                         serde_json::json!({ "kernel": "et_linear_bias_f32" })
                     }
+                    CommandKind::FusedElementwise { inputs, .. } => serde_json::json!({
+                        "kernel": "fused_elementwise", "capturable": true,
+                        "inputs": inputs.iter().flatten().map(|id| value(*id)).collect::<Vec<_>>()
+                    }),
                     CommandKind::GroupedExpert {
                         rows,
                         columns,
                         inner,
                         experts,
+                        indexes,
+                        control,
+                        reuse_routing,
                         ..
                     } => serde_json::json!({
                         "kernel": "grouped_expert_linear_rows", "rows": rows, "columns": columns,
                         "inner": inner, "experts": experts, "capturable": false,
-                        "controlReadbackBytes": (experts + 2) * 4
+                        "indexesValue": indexes.get(), "controlValue": control.get(),
+                        "routingReused": reuse_routing,
+                        "controlReadbackBytes": if *reuse_routing { 0 } else { (experts + 2) * 4 }
                     }),
                     CommandKind::Scalar { .. } => serde_json::json!({ "kernel": "et_fill" }),
                     CommandKind::Cursor { .. } => serde_json::json!({ "kernel": "cursor_upload" }),
@@ -2308,7 +2638,10 @@ impl CudaExecutable {
                 None
             };
             let output = match &command.kind {
-                CommandKind::Prepare => continue,
+                CommandKind::Prepare => {
+                    position += 1;
+                    continue;
+                }
                 CommandKind::Value(value) => value.clone(),
                 CommandKind::Input { binding } => {
                     let value = bindings
@@ -2426,6 +2759,7 @@ impl CudaExecutable {
                     gathered,
                     projected,
                     workspace,
+                    reuse_routing,
                 } => {
                     let output = self.planned_value(&resources, output_id)?;
                     if *rows != 0 {
@@ -2435,8 +2769,9 @@ impl CudaExecutable {
                                 .ok_or("execute: grouped expert operand unavailable")?
                                 .storage_address())
                         };
+                        let control_id = *control;
                         let control = self
-                            .buffer(&resources, *control)?
+                            .buffer(&resources, control_id)?
                             .cast::<u32>(experts + 2)?;
                         let row_map = self.buffer(&resources, *row_map)?;
                         let gathered = self.buffer(&resources, *gathered)?;
@@ -2447,32 +2782,50 @@ impl CudaExecutable {
                             output_dtype: dtype_code(DType::U32),
                             ..Default::default()
                         };
-                        let control_started = trace.then(std::time::Instant::now);
-                        self.launch("et_fill", &args)?;
                         args.inputs[0] = address(indexes)?;
-                        args.elements = *rows as u64;
                         args.integers[0] = *experts as u64;
-                        self.launch("et_grouped_counts", &args)?;
-                        args.elements = 1;
-                        self.launch("et_grouped_offsets", &args)?;
-                        // This is an explicit non-capturable host completion point.
-                        // Only status and E+1 offsets cross the host. No padded
-                        // groups, activations, weights, or row maps are read back.
-                        let readback_started = trace.then(std::time::Instant::now);
-                        let offsets = self
-                            .device
-                            .stream
-                            .clone_dtoh(&control)
-                            .map_err(|e| e.to_string())?;
-                        if let Some(started) = control_started {
-                            emit_trace(serde_json::json!({
-                                "event": "grouped_control", "program": format!("{self:p}"), "run": run,
-                                "instruction": position, "capturable": false, "bytes": (experts + 2) * 4,
-                                "milliseconds": started.elapsed().as_secs_f64() * 1000.0,
-                                "readbackAndWaitMilliseconds": readback_started.unwrap().elapsed().as_secs_f64() * 1000.0,
-                                "activeGroupRows": offsets[1..].windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>()
-                            }))?;
-                        }
+                        let offsets = if *reuse_routing {
+                            grouped_routing
+                                .get(&control_id)
+                                .cloned()
+                                .ok_or("execute: grouped expert routing cache is missing")?
+                        } else {
+                            let control_started = trace.then(std::time::Instant::now);
+                            self.launch("et_fill", &args)?;
+                            args.elements = *rows as u64;
+                            self.launch("et_grouped_counts", &args)?;
+                            args.elements = 1;
+                            self.launch("et_grouped_offsets", &args)?;
+                            // This is an explicit non-capturable host completion point.
+                            // Only status and E+1 offsets cross the host. No padded
+                            // groups, activations, weights, or row maps are read back.
+                            let readback_started = trace.then(std::time::Instant::now);
+                            let offsets = self
+                                .device
+                                .stream
+                                .clone_dtoh(&control)
+                                .map_err(|e| e.to_string())?;
+                            if let Some(started) = control_started {
+                                emit_trace(serde_json::json!({
+                                    "event": "grouped_control", "program": format!("{self:p}"), "run": run,
+                                    "instruction": position, "capturable": false, "bytes": (experts + 2) * 4,
+                                    "milliseconds": started.elapsed().as_secs_f64() * 1000.0,
+                                    "readbackAndWaitMilliseconds": readback_started.unwrap().elapsed().as_secs_f64() * 1000.0,
+                                    "activeGroupRows": offsets[1..].windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>()
+                                }))?;
+                            }
+                            if let Some(status) = deferred_status {
+                                let status = self.buffer(&resources, status)?.cast::<u64>(1)?;
+                                let failure = self
+                                    .device
+                                    .stream
+                                    .clone_dtoh(&status)
+                                    .map_err(|e| e.to_string())?[0];
+                                self.status_result(failure)?;
+                            }
+                            grouped_routing.insert(control_id, offsets.clone());
+                            offsets
+                        };
                         if offsets[0] != 0 {
                             return Err(
                                 "groupedExpertLinearRows: expert index is out of range".into()
@@ -2487,10 +2840,12 @@ impl CudaExecutable {
                             args.elements = (*rows * *columns) as u64;
                             self.launch("et_fill", &args)?;
                         } else if *columns != 0 {
-                            args.elements = *rows as u64;
-                            args.inputs[1] = control.address();
-                            args.output = row_map.address();
-                            self.launch("et_grouped_rows", &args)?;
+                            if !*reuse_routing {
+                                args.elements = *rows as u64;
+                                args.inputs[1] = control.address();
+                                args.output = row_map.address();
+                                self.launch("et_grouped_rows", &args)?;
+                            }
                             args.inputs[0] = address(x)?;
                             args.inputs[1] = row_map.address();
                             args.output = gathered.address();
@@ -2503,6 +2858,7 @@ impl CudaExecutable {
                             let workspace = workspace
                                 .map(|id| self.buffer(&resources, id))
                                 .transpose()?;
+                            let mut bf16_groups = Vec::new();
                             for (expert, range) in offsets[1..].windows(2).enumerate() {
                                 if cancelled.is_cancelled() {
                                     return Err("operation aborted".into());
@@ -2525,23 +2881,7 @@ impl CudaExecutable {
                                         stride_weight: 0,
                                         stride_out: count * *columns,
                                     };
-                                    // SAFETY: checked geometry and invocation-planned
-                                    // allocations, retained through the completion fence.
-                                    // The handle lock covers mode/workspace/submission.
-                                    unsafe {
-                                        self.device.cublas.gemm_bf16(
-                                            plan,
-                                            true,
-                                            x,
-                                            weight,
-                                            out,
-                                            false,
-                                            workspace
-                                                .as_ref()
-                                                .ok_or("grouped GEMM workspace missing")?
-                                                .address(),
-                                        )?;
-                                    }
+                                    bf16_groups.push((plan, x, weight, out));
                                 } else {
                                     let mut gemm = CudaKernelArgs {
                                         output: out,
@@ -2556,6 +2896,20 @@ impl CudaExecutable {
                                 #[cfg(test)]
                                 if let Some(after_gemm) = after_gemm {
                                     after_gemm();
+                                }
+                            }
+                            if !bf16_groups.is_empty() {
+                                // SAFETY: every group uses checked geometry and
+                                // invocation-planned allocations retained by the fence.
+                                unsafe {
+                                    let events = self.device.grouped_gemm_bf16(
+                                        &bf16_groups,
+                                        workspace
+                                            .as_ref()
+                                            .ok_or("grouped GEMM workspace missing")?
+                                            .address(),
+                                    )?;
+                                    fence.worker_events.extend(events);
                                 }
                             }
                             if cancelled.is_cancelled() {
@@ -2593,12 +2947,43 @@ impl CudaExecutable {
                     self.launch(BF16_LINEAR_BIAS_KERNEL, &args)?;
                     output
                 }
+                CommandKind::FusedElementwise {
+                    function,
+                    args,
+                    inputs,
+                } => {
+                    let output = self.planned_value(&resources, output_id)?;
+                    let mut args = *args;
+                    args.output = output.storage_address();
+                    for (slot, input) in inputs.iter().enumerate() {
+                        if let Some(input) = input {
+                            args.inputs[slot] = values[input.index()]
+                                .as_ref()
+                                .ok_or("execute: fused CUDA input unavailable")?
+                                .storage_address();
+                        }
+                    }
+                    if args.elements != 0 {
+                        let mut launch = self.device.stream.launch_builder(function);
+                        launch.arg(&args);
+                        unsafe {
+                            launch.launch(LaunchConfig {
+                                grid_dim: (args.elements.div_ceil(256).min(65535) as u32, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                        }
+                        .map_err(|error| error.to_string())?;
+                    }
+                    output
+                }
                 CommandKind::Kernel {
                     name,
                     args,
                     inputs,
                     scratch,
                     status,
+                    checked,
                     state: access,
                     state_buffers,
                     kv_matmul,
@@ -2628,12 +3013,23 @@ impl CudaExecutable {
                             args.scratch[slot] = buffer.address();
                         }
                     }
-                    let mut status = self.buffer(&resources, *status)?.cast::<u32>(1)?;
-                    self.device
-                        .stream
-                        .memcpy_htod(&[0u32], &mut status)
-                        .map_err(|e| e.to_string())?;
-                    args.scratch[3] = status.address();
+                    if *checked {
+                        let status = status.ok_or("execute: checked CUDA kernel has no status")?;
+                        if deferred_status.is_some_and(|current| current != status) {
+                            return Err("execute: checked CUDA kernels do not share status".into());
+                        }
+                        let mut buffer = self.buffer(&resources, status)?.cast::<u64>(1)?;
+                        if deferred_status.is_none() {
+                            self.device
+                                .stream
+                                .memcpy_htod(&[0u64], &mut buffer)
+                                .map_err(|e| e.to_string())?;
+                            deferred_status = Some(status);
+                        }
+                        args.scratch[3] = buffer.address();
+                        args.error_context = u32::try_from(position)
+                            .map_err(|_| "execute: CUDA error context exceeds u32")?;
+                    }
                     if name.starts_with("et_random_") {
                         args.integers[0] =
                             args.integers[0].wrapping_add(run.wrapping_mul(0x9e3779b97f4a7c15));
@@ -2669,20 +3065,6 @@ impl CudaExecutable {
                     } else {
                         self.launch(name, &args)?;
                     }
-                    let code = self
-                        .device
-                        .stream
-                        .clone_dtoh(&status)
-                        .map_err(|e| e.to_string())?[0];
-                    match code {
-                        0 => {}
-                        1 => return Err(format!("{name}: index is out of range")),
-                        2 => return Err(format!("{name}: no active targets")),
-                        3 => return Err(format!("{name}: matrix is singular")),
-                        5 => return Err("topKIndices: NaN input".into()),
-                        6 => return Err("expertLinearRows: expert index is out of range".into()),
-                        _ => return Err(format!("{name}: invalid arithmetic")),
-                    }
                     #[cfg(test)]
                     if matches!(access, StateAccess::Kv { .. }) {
                         if let Some(hook) = after_kv {
@@ -2705,14 +3087,65 @@ impl CudaExecutable {
                 }))?;
             }
             values[output_id.index()] = Some(output);
+            position += 1;
+            if capture.as_ref().is_some_and(|(_, end)| *end == position) {
+                let (key, _) = capture.take().unwrap();
+                let graph = self
+                    .device
+                    .stream
+                    .end_capture(
+                        sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+                    )
+                    .map_err(|error| format!("CUDA graph instantiation failed: {error}"))?
+                    .ok_or("CUDA graph capture produced no graph")?;
+                capture_fence.active = false;
+                graph.launch().map_err(|error| error.to_string())?;
+                if graph_trace {
+                    self.device.stream.synchronize().map_err(|error| {
+                        format!(
+                            "CUDA captured graph {}..{} failed: {error}",
+                            key.start, key.end
+                        )
+                    })?;
+                }
+                graph_runtime
+                    .as_mut()
+                    .ok_or("execute: CUDA graph cache unavailable")?
+                    .cache
+                    .insert(key, CapturedGraph(graph));
+                graph_runtime
+                    .as_mut()
+                    .ok_or("execute: CUDA graph cache unavailable")?
+                    .captures += 1;
+            }
         }
-        self.device
-            .stream
-            .synchronize()
-            .map_err(|e| e.to_string())?;
+        let failure = if let Some(status) = deferred_status {
+            let status = self.buffer(&resources, status)?.cast::<u64>(1)?;
+            self.device
+                .stream
+                .clone_dtoh(&status)
+                .map_err(|e| e.to_string())?[0]
+        } else {
+            self.device
+                .stream
+                .synchronize()
+                .map_err(|e| e.to_string())?;
+            0
+        };
         fence.complete = true;
+        self.status_result(failure)?;
         if cancelled.is_cancelled() {
             return Err("operation aborted".into());
+        }
+        if graph_trace {
+            if let Some(runtime) = graph_runtime.as_ref() {
+                eprintln!(
+                    "CUDA graph run={run} cache={} hits={} captures={}",
+                    runtime.cache.len(),
+                    runtime.hits,
+                    runtime.captures
+                );
+            }
         }
         self.program
             .outputs
@@ -2753,6 +3186,25 @@ impl CudaExecutable {
         // Current rows must be stored before query/head warps read them,
         // including future rows in a bidirectional canvas. Both launches use
         // the same stream and invocation-owned transaction/scratch storage.
+        let wide_arg_index = name == "et_index"
+            && args.operation <= 1
+            && args.input_dtypes[0] == dtype_code(DType::F32)
+            && args.integers[2] != 0
+            && args.integers[1] >= 4096;
+        if wide_arg_index {
+            let function = self.device.kernel("et_arg_index_last_wide")?;
+            let mut launch = self.device.stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (args.elements.min(65535) as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         let warp_sum = name == "et_reduce_f32" && args.operation == 0;
         let wide_trailing =
             name == "et_reduce_f32" && args.integers[2] != 0 && args.integers[1] >= 4096;
@@ -2794,6 +3246,7 @@ impl CudaExecutable {
             args.integers[5]
                 .checked_mul(args.integers[2])
                 .and_then(|n| n.checked_mul(args.integers[7]))
+                .and_then(|n| n.checked_mul(256))
                 .ok_or("CUDA KV store grid overflow")?
         } else if name == "et_top_k_indices" {
             // One block per row. Thread zero owns the stable insertion output.
@@ -2831,6 +3284,7 @@ pub(super) fn physical_counts(
 ) -> (usize, usize) {
     let mut submissions = 0;
     let mut completions = 1; // Final stream completion before output publication.
+    let mut has_checked_kernel = false;
     for command in commands {
         match &command.kind {
             CommandKind::Gemm { .. } | CommandKind::Cursor { .. } => submissions += 1,
@@ -2839,18 +3293,21 @@ pub(super) fn physical_counts(
                 columns,
                 inner,
                 experts,
+                reuse_routing,
                 ..
             } => {
                 if *rows != 0 {
-                    // Reset/count/prefix/readback plus at most min(N,E) GEMMs.
-                    // Exact dynamic counts and wait time are emitted by trace.
-                    submissions += 4;
-                    completions += 1;
+                    if !*reuse_routing {
+                        // Reset/count/prefix/readback. An initialized deferred
+                        // status is read after the same completion point.
+                        submissions += 4 + usize::from(has_checked_kernel);
+                        completions += 1;
+                    }
                     if *columns != 0 {
                         submissions += if *inner == 0 {
                             1
                         } else {
-                            3 + rows.min(experts)
+                            2 + usize::from(!*reuse_routing) + rows.min(experts)
                         };
                     }
                 }
@@ -2862,14 +3319,19 @@ pub(super) fn physical_counts(
                         .is_some_and(|id| program.values[id.index()].decl.bytes != 0),
                 );
             }
+            CommandKind::FusedElementwise { args, .. } => {
+                submissions += usize::from(args.elements != 0);
+            }
             CommandKind::Kernel {
                 name,
                 args,
+                checked,
                 state,
                 kv_matmul,
                 ..
             } => {
-                // Status reset, optional launch, and status readback.
+                // Checked kernels share one invocation status. Its reset and
+                // final readback are counted once below.
                 let launches = if *name == "et_expert_linear_rows" {
                     args.integers[0] != 0
                 } else {
@@ -2887,8 +3349,8 @@ pub(super) fn physical_counts(
                 } else {
                     1
                 };
-                submissions += 2 + usize::from(launches) * kernel_submissions;
-                completions += 1;
+                submissions += usize::from(launches) * kernel_submissions;
+                has_checked_kernel |= *checked;
                 submissions += match state {
                     StateAccess::Rotary => 1,
                     StateAccess::Kv { .. } => 3,
@@ -2910,6 +3372,7 @@ pub(super) fn physical_counts(
             | CommandKind::Alias { .. } => {}
         }
     }
+    submissions += 2 * usize::from(has_checked_kernel);
     (submissions, completions)
 }
 
@@ -2986,13 +3449,15 @@ fn compile_inner(
     let mut driver = CompilerDriver::new(&prepared, &capabilities)?;
     let mut builder =
         CudaProgramBuilder::new(&prepared.index, state_layout.clone(), driver.legalization())?;
-    driver.lower(|unit, index, _, plan| {
-        let LoweringUnit::Node(dense) = unit else {
-            return Err("compile: CUDA regions unsupported".into());
-        };
-        let node = index.node(dense).ok_or("compile: CUDA node missing")?;
-        let instruction = semantic_instruction(node, index, &device, ordinal, state_cursor)?;
-        builder.add(dense, node, index, instruction, plan)
+    driver.lower(|unit, index, optimization, plan| match unit {
+        LoweringUnit::Node(dense) => {
+            let node = index.node(dense).ok_or("compile: CUDA node missing")?;
+            let instruction = semantic_instruction(node, index, &device, ordinal, state_cursor)?;
+            builder.add(dense, node, index, optimization, instruction, plan)
+        }
+        LoweringUnit::Region(region) => {
+            builder.add_region(index, optimization, region, plan, &device)
+        }
     })?;
     driver.record_materialized_conversions(builder.conversion_count, builder.conversion_bytes);
     let (program, commands) = builder.finish(&prepared.index)?;
@@ -3075,6 +3540,7 @@ fn compile_inner(
         diagnostics,
         compiler_work: work,
         runs: AtomicU64::new(0),
+        graph_runtime: Mutex::new(GraphRuntime::default()),
     };
     executable.diagnostics.compile_phases = executable.compiler_work.compile_phases.clone();
     Ok(executable)

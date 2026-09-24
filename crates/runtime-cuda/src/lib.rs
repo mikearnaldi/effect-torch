@@ -7,6 +7,7 @@ mod buffer;
 mod capabilities;
 mod cublas;
 mod device;
+mod emit;
 mod executable;
 mod kv_matmul;
 mod lowering;

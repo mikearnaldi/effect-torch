@@ -301,6 +301,52 @@ extern "C" __global__ void et_index(CudaKernelArgs a) {
     else if (a.input_dtypes[0] == 0) et_index_impl<double>(a, i);
     else et_index_impl<float>(a, i);
 }
+extern "C" __global__ __launch_bounds__(1024) void et_arg_index_last_wide(CudaKernelArgs a) {
+    et_u64 width = a.integers[1];
+    __shared__ float values[32];
+    __shared__ unsigned int indexes[32];
+    unsigned int lane = threadIdx.x & 31U, warp = threadIdx.x / 32;
+    for (et_u64 row = blockIdx.x; row < a.elements; row += gridDim.x) {
+        const float *input = (const float *)a.inputs[0] + row * width;
+        float best = a.operation == 0 ? -1.0f / 0.0f : 1.0f / 0.0f;
+        unsigned int best_index = 0xffffffffU;
+        for (et_u64 column = threadIdx.x; column < width; column += 1024) {
+            float value = input[column];
+            bool better = !isnan(value) && (
+                (a.operation == 0 && value > best) ||
+                (a.operation == 1 && value < best) ||
+                (value == best && column < best_index)
+            );
+            if (better) { best = value; best_index = (unsigned int)column; }
+        }
+        for (unsigned int offset = 16; offset; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffffU, best, offset);
+            unsigned int other_index = __shfl_down_sync(0xffffffffU, best_index, offset);
+            bool better = (a.operation == 0 && other > best) ||
+                (a.operation == 1 && other < best) ||
+                (other == best && other_index < best_index);
+            if (better) { best = other; best_index = other_index; }
+        }
+        if (!lane) { values[warp] = best; indexes[warp] = best_index; }
+        __syncthreads();
+        if (!warp) {
+            best = values[lane]; best_index = indexes[lane];
+            for (unsigned int offset = 16; offset; offset >>= 1) {
+                float other = __shfl_down_sync(0xffffffffU, best, offset);
+                unsigned int other_index = __shfl_down_sync(0xffffffffU, best_index, offset);
+                bool better = (a.operation == 0 && other > best) ||
+                    (a.operation == 1 && other < best) ||
+                    (other == best && other_index < best_index);
+                if (better) { best = other; best_index = other_index; }
+            }
+            if (!lane) {
+                if (isnan(input[0])) best_index = 0;
+                et_store(a.output, a.output_dtype, row, (et_i64)best_index);
+            }
+        }
+        __syncthreads();
+    }
+}
 extern "C" __global__ void et_sequence(CudaKernelArgs a) {
     et_u64 i = et_thread(); if (i >= a.elements) return;
     if (a.integers[0] == 1) {

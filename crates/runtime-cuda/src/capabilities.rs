@@ -2,7 +2,7 @@
 //! row-major BF16 GEMM.
 use crate::cublas::{plan_row_bf16_gemm, RowGemmKind, BF16_GEMM_MIN_MAJOR};
 use effect_torch_compiler::{
-    DTypeDisposition, DTypeRequirement, ExecutionRealization, LayoutConstraintSpec,
+    DTypeDisposition, DTypeRequirement, ExecutionRealization, LayoutConstraintSpec, NativeRegion,
     OperationDTypeSpec, RegionDTypeSpec, StorageSupport, TargetBackend, TargetDTypeCapabilities,
     TargetFingerprint, UnsupportedDType, ValueRole, ValueSpec,
 };
@@ -18,12 +18,15 @@ pub(crate) struct CudaCapabilities {
 impl CudaCapabilities {
     pub(crate) fn new(ordinal: u32, major: i32, minor: i32) -> Self {
         let mut fingerprint =
-            TargetFingerprint::new(TargetBackend::Cuda, format!("sm_{major}{minor}"), 5);
+            TargetFingerprint::new(TargetBackend::Cuda, format!("sm_{major}{minor}"), 6);
         let bf16_gemm = major >= BF16_GEMM_MIN_MAJOR;
         let mut features = vec!["typed-reference-kernels-v1".into()];
         features.push("grouped-expert-stable-exact-rows-host-control-v1".into());
+        features.push("grouped-expert-routing-reuse-v1".into());
         features.push("rms-f32-warp-four-partials-mean-factor-rsqrt-v1".into());
         features.push("sum-f32-warp-or-block1024-vector4-v2".into());
+        features.push("fused-elementwise-nvrtc-v1".into());
+        features.push("fused-elementwise-strided-slice-views-v1".into());
         if bf16_gemm {
             features.push("stepwise-bf16-kv-f32-gemm-active-rows-v1".into());
             features.push("cublas-bf16-row-major-f32-accum-v3".into());
@@ -358,11 +361,61 @@ impl TargetDTypeCapabilities for CudaCapabilities {
         }
         DTypeDisposition::Native(execution)
     }
-    fn classify_region(&self, _spec: &RegionDTypeSpec<'_>) -> DTypeDisposition {
-        unsupported(
-            DTypeRequirement::Region,
-            "CUDA region lowering is not hardware-validated",
-        )
+    fn classify_region(&self, spec: &RegionDTypeSpec<'_>) -> DTypeDisposition {
+        let NativeRegion::Elementwise(region) = spec.region else {
+            return unsupported(
+                DTypeRequirement::Region,
+                "CUDA only lowers elementwise optimization regions",
+            );
+        };
+        if region.inputs.len() > 8 {
+            return unsupported(
+                DTypeRequirement::Region,
+                "CUDA fused elementwise kernels support at most eight inputs",
+            );
+        }
+        let Some(first) = spec.boundary_results.first() else {
+            return unsupported(DTypeRequirement::Region, "region has no results");
+        };
+        let dtype = first.value.semantic_dtype;
+        if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return unsupported(
+                DTypeRequirement::Region,
+                "CUDA fusion requires F32, F16, or BF16 storage",
+            );
+        }
+        if spec.boundary_inputs.iter().any(|input| {
+            !matches!(
+                input.value.semantic_dtype,
+                DType::F32 | DType::F16 | DType::BF16
+            ) || input.value.storage.representation != StorageRepresentation::Dense
+                || input.value.logical_shape.is_empty()
+        }) {
+            return unsupported(
+                DTypeRequirement::Region,
+                "CUDA fusion requires floating non-scalar dense inputs",
+            );
+        }
+        let mut execution = spec.native_execution();
+        let mut transformed = false;
+        for (operation, recipe) in spec.operations.iter().zip(execution.operations.iter_mut()) {
+            match self.classify_node(operation) {
+                DTypeDisposition::Unsupported(error) => {
+                    return DTypeDisposition::Unsupported(error)
+                }
+                DTypeDisposition::Native(plan) => *recipe = plan.operations[0].clone(),
+                DTypeDisposition::Legalize(plan) => {
+                    transformed = true;
+                    *recipe = plan.operations[0].clone();
+                }
+            }
+        }
+        if transformed {
+            execution.realization = ExecutionRealization::KernelLocal;
+            DTypeDisposition::Legalize(execution)
+        } else {
+            DTypeDisposition::Native(execution)
+        }
     }
 }
 

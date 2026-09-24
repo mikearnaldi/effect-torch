@@ -27,6 +27,7 @@ pub(crate) const BF16_GEMM_MIN_MAJOR: i32 = 8;
 /// default split-K algorithms at larger projection shapes and changes BF16
 /// results. 32 MiB matches the deterministic :4096:8 cuBLAS workspace.
 pub(crate) const CUBLAS_WORKSPACE_BYTES: usize = 32 << 20;
+pub(crate) const EXPERT_BLAS_STREAMS: usize = 10;
 
 /// Which semantic operation the row-major GEMM realizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +236,10 @@ impl CudaBlas {
         })
     }
 
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// Executes one row-major BF16 GEMM with F32 accumulation.
     ///
     /// weight_transposed selects a row-oriented [n, k] weight that is consumed
@@ -328,6 +333,76 @@ impl CudaBlas {
         status
             .result()
             .map_err(|error| format!("CUDA cuBLAS BF16 GEMM failed: {error}"))
+    }
+
+    /// Executes independent row-major BF16 GEMMs while retaining one handle
+    /// lock, math-mode setup, and workspace binding for the sequence.
+    ///
+    /// # Safety
+    /// Every pointer must refer to the geometry in its plan and remain valid
+    /// until the stream completes. Workspace follows [`Self::gemm_bf16`].
+    pub(crate) unsafe fn gemm_bf16_sequence(
+        &self,
+        groups: &[(Bf16GemmPlan, u64, u64, u64)],
+        workspace: u64,
+    ) -> Result<(), String> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| e.to_string())?;
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| "CUDA cuBLAS handle lock poisoned")?;
+        unsafe { sys::cublasSetMathMode(handle.0, sys::cublasMath_t::CUBLAS_DEFAULT_MATH) }
+            .result()
+            .map_err(|error| format!("CUDA cuBLAS math-mode setup failed: {error}"))?;
+        unsafe {
+            sys::cublasSetWorkspace_v2(handle.0, workspace as *mut c_void, CUBLAS_WORKSPACE_BYTES)
+        }
+        .result()
+        .map_err(|error| format!("CUDA cuBLAS workspace setup failed: {error}"))?;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        for (plan, x, weight, out) in groups {
+            let m = as_i32(plan.n).ok_or("CUDA cuBLAS dimension N exceeds i32")?;
+            let n = as_i32(plan.m).ok_or("CUDA cuBLAS dimension M exceeds i32")?;
+            let k = as_i32(plan.k).ok_or("CUDA cuBLAS dimension K exceeds i32")?;
+            let status = unsafe {
+                sys::cublasGemmStridedBatchedEx(
+                    handle.0,
+                    sys::cublasOperation_t::CUBLAS_OP_T,
+                    sys::cublasOperation_t::CUBLAS_OP_N,
+                    m,
+                    n,
+                    k,
+                    (&alpha) as *const f32 as *const c_void,
+                    *weight as *const c_void,
+                    sys::cudaDataType_t::CUDA_R_16BF,
+                    k,
+                    0,
+                    *x as *const c_void,
+                    sys::cudaDataType_t::CUDA_R_16BF,
+                    k,
+                    plan.stride_x as i64,
+                    (&beta) as *const f32 as *const c_void,
+                    *out as *mut c_void,
+                    sys::cudaDataType_t::CUDA_R_16BF,
+                    m,
+                    plan.stride_out as i64,
+                    1,
+                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+            };
+            status
+                .result()
+                .map_err(|error| format!("CUDA cuBLAS BF16 GEMM failed: {error}"))?;
+        }
+        Ok(())
     }
 }
 

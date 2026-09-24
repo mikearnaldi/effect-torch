@@ -61,7 +61,7 @@ fn lower_with(
     let mut builder =
         CudaProgramBuilder::new(&prepared.index, layout, driver.legalization()).unwrap();
     driver
-        .lower(|unit, index, _, plan| {
+        .lower(|unit, index, optimization, plan| {
             let LoweringUnit::Node(id) = unit else {
                 return Err("unexpected CUDA region".into());
             };
@@ -111,12 +111,19 @@ fn lower_with(
                     a: child(a),
                     b: child(b),
                 },
+                NodeKind::RmsNorm { x, weight, eps } => Instruction::RmsNorm {
+                    x: child(x),
+                    weight: weight.as_ref().map(child),
+                    eps: *eps,
+                },
                 NodeKind::Gather { a, indexes, dim } => Instruction::Index {
                     op: 4,
                     a: child(a),
                     indexes: Some(child(indexes)),
                     src: None,
                     dim: *dim as u32,
+                    width: a.shape[*dim],
+                    trailing: *dim + 1 == a.shape.len(),
                 },
                 NodeKind::QuantizedLinear { x, weight, bias } => {
                     let StorageRepresentation::Packed(PackedFormat::GgmlKQuant(codec)) =
@@ -196,7 +203,7 @@ fn lower_with(
                 },
                 _ => return Err("unsupported host-test instruction".into()),
             };
-            builder.add(id, node, index, instruction, plan)
+            builder.add(id, node, index, optimization, instruction, plan)
         })
         .unwrap();
     let count = builder.conversion_count;
@@ -290,6 +297,42 @@ fn grouped_experts_plan_bounded_scratch_borrow_banks_and_report_host_completion(
 }
 
 #[test]
+fn grouped_experts_reuse_unchanged_routing_control_and_row_map() {
+    let (rows, experts, inner, middle, columns) = (64, 128, 2816, 704, 2816);
+    let indexes = input(2, &[rows], DType::U32);
+    let first = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: input(0, &[rows, inner], DType::BF16),
+        weight: input(1, &[experts, middle, inner], DType::BF16),
+        indexes: indexes.clone(),
+    })
+    .unwrap();
+    let second = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: first,
+        weight: input(3, &[experts, columns, middle], DType::BF16),
+        indexes,
+    })
+    .unwrap();
+    let (_, commands, _, _, _) = lower(vec![second], true, None);
+    let groups = commands
+        .iter()
+        .filter_map(|command| match &command.kind {
+            CommandKind::GroupedExpert {
+                control,
+                row_map,
+                reuse_routing,
+                ..
+            } => Some((*control, *row_map, *reuse_routing)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(groups.len(), 2);
+    assert!(!groups[0].2);
+    assert!(groups[1].2);
+    assert_eq!(groups[0].0, groups[1].0);
+    assert_eq!(groups[0].1, groups[1].1);
+}
+
+#[test]
 fn expert_rows_keep_native_banks_and_u64_geometry_without_tensor_scratch() {
     for optimize in [false, true] {
         for dtype in [DType::F32, DType::BF16] {
@@ -367,7 +410,7 @@ fn expert_rows_keep_native_banks_and_u64_geometry_without_tensor_scratch() {
                     .filter(|value| value.decl.name.starts_with("status"))
                     .collect();
                 assert_eq!(statuses.len(), 1);
-                assert_eq!(statuses[0].decl.bytes, 4);
+                assert_eq!(statuses[0].decl.bytes, 8);
                 assert_eq!(
                     crate::executable::physical_counts(&program, &commands).0,
                     2 + usize::from(rows != 0)
@@ -827,18 +870,48 @@ fn zero_dimensions_have_an_explicit_materialized_legalization() {
 }
 
 #[test]
-fn physical_diagnostics_include_status_transfers_and_host_waits() {
+fn infallible_physical_diagnostics_omit_status_transfers_and_host_waits() {
     for elements in [0, 6] {
         let x = input(0, &[elements], DType::F32);
         let root = Node::new(NodeKind::Mul { a: x.clone(), b: x }).unwrap();
         let (program, commands, _, _, _) = lower(vec![root], false, None);
-        // Reset status, launch only for nonempty outputs, read status, then
-        // complete the stream before publishing results.
+        // Infallible arithmetic only launches for nonempty outputs. The final
+        // stream completion still precedes result publication.
         assert_eq!(
             crate::executable::physical_counts(&program, &commands),
-            (2 + usize::from(elements != 0), 2)
+            (usize::from(elements != 0), 1)
         );
     }
+}
+
+#[test]
+fn checked_kernels_share_one_deferred_status_and_final_completion() {
+    let values = input(0, &[4], DType::F32);
+    let indexes = input(1, &[2], DType::U32);
+    let first = Node::new(NodeKind::Gather {
+        a: values.clone(),
+        indexes: indexes.clone(),
+        dim: 0,
+    })
+    .unwrap();
+    let second = Node::new(NodeKind::Gather {
+        a: values,
+        indexes,
+        dim: 0,
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![first, second], false, None);
+    let statuses = program
+        .values
+        .iter()
+        .filter(|value| value.decl.name.starts_with("status"))
+        .collect::<Vec<_>>();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].decl.bytes, 8);
+    assert_eq!(
+        crate::executable::physical_counts(&program, &commands),
+        (4, 1)
+    );
 }
 
 #[test]
@@ -860,7 +933,35 @@ fn bf16_matmul_partial_broadcast_falls_back_to_f32() {
 }
 
 #[test]
-fn scalar_coercion_rounds_to_half_before_widening() {
+fn rms_norm_converts_half_storage_inside_the_kernel() {
+    let x = input(0, &[3, 2816], DType::BF16);
+    let weight = input(1, &[2816], DType::BF16);
+    let root = Node::new(NodeKind::RmsNorm {
+        x,
+        weight: Some(weight),
+        eps: 1e-6,
+    })
+    .unwrap();
+    let (_, commands, _, count, _) = lower(vec![root], false, None);
+    assert_eq!(count, 0);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(command.kind, CommandKind::Kernel { .. }))
+            .count(),
+        1
+    );
+    assert!(commands.iter().any(|command| matches!(
+        command.kind,
+        CommandKind::Kernel {
+            name: "et_rms_norm_f32",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn scalar_coercion_rounds_to_half_before_inline_opmath() {
     let tensor = input(0, &[1], DType::BF16);
     let scalar = input(1, &[], DType::F32);
     let root = Node::new(NodeKind::Mul {
@@ -869,7 +970,7 @@ fn scalar_coercion_rounds_to_half_before_widening() {
     })
     .unwrap();
     let (program, commands, _, count, _) = lower(vec![root], false, None);
-    assert_eq!(count, 4);
+    assert_eq!(count, 1);
     let scalar_conversions = commands
         .iter()
         .filter_map(|command| match &command.kind {
@@ -888,10 +989,7 @@ fn scalar_coercion_rounds_to_half_before_widening() {
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        scalar_conversions,
-        [(DType::F32, DType::BF16), (DType::BF16, DType::F32)]
-    );
+    assert_eq!(scalar_conversions, [(DType::F32, DType::BF16)]);
 }
 
 #[test]

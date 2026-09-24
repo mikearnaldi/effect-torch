@@ -74,11 +74,35 @@ template<class T> __device__ T et_kv_warp_max(T value) {
 extern "C" __global__ void et_kv_store(CudaKernelArgs a) {
     unsigned int rank = et_meta(a)[1];
     const et_u64 *qs = et_shape(a, 0), *ks = et_shape(a, 1);
-    et_u64 tokens = qs[rank - 2], lane = et_thread() / tokens, token = et_thread() % tokens;
+    et_u64 tokens = qs[rank - 2], heads = ks[rank - 3], dim = qs[rank - 1];
+    if (a.integers[1] != 6) {
+        et_u64 lane = blockIdx.x / tokens, token = blockIdx.x % tokens;
+        if (lane >= a.integers[5] * a.integers[2]) return;
+        unsigned int count = ((const unsigned int *)a.scratch[0])[lane];
+        if (count > tokens) { et_error(a, 1); return; }
+        if (token >= count) return;
+        const unsigned int *cursors = (const unsigned int *)a.inputs[7];
+        et_u64 sequence = lane / a.integers[2], position = cursors[lane] + token;
+        const et_u64 *header = (const et_u64 *)a.inputs[3] + sequence * 4;
+        if (position < header[1] || position >= header[2]) { et_error(a, 1); return; }
+        const et_u64 *pointers = et_cache_row(a, sequence, position);
+        for (et_u64 hd = threadIdx.x; hd < heads * dim; hd += blockDim.x) {
+            et_u64 head = hd / dim, d = hd % dim;
+            et_u64 source = ((lane * heads + head) * tokens + token) * dim + d;
+            for (int role = 0; role < 2; ++role) {
+                if (a.input_dtypes[role + 1] == 0)
+                    et_store(pointers[role], a.integers[1], hd, et_load<double>(a.inputs[role + 1], 0, source));
+                else
+                    et_store(pointers[role], a.integers[1], hd, et_load<float>(a.inputs[role + 1], a.input_dtypes[role + 1], source));
+            }
+        }
+        return;
+    }
+    et_u64 lane = et_thread() / tokens, token = et_thread() % tokens;
     if (lane >= a.integers[5] * a.integers[2]) return;
     unsigned int count = ((const unsigned int *)a.scratch[0])[lane];
     if (count > tokens) { et_error(a, 1); return; }
-    if (token < count) et_cache_append(a, lane, token, ks[rank - 3], tokens, qs[rank - 1]);
+    if (token < count) et_cache_append(a, lane, token, heads, tokens, dim);
 }
 
 template<class T> __device__ void et_kv_attention_impl(const CudaKernelArgs &a) {

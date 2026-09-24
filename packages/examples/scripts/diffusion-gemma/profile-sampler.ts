@@ -23,25 +23,27 @@ const statistics = (logits: Tensor.Any, temperature: Tensor.Any) =>
     return [yield* Tensor.cast(processed, "bf16"), sampled, argmax, entropy, order, mean]
   })
 
-const main = Effect.scoped(Effect.gen(function*() {
-  if (!(yield* BackendCuda.isAvailable)) throw new Error("CUDA is required")
+const main = Effect.scoped(
+  Effect.gen(function*() {
+    if (!(yield* BackendCuda.isAvailable)) throw new Error("CUDA is required")
 
-  const sampler = yield* Tensor.compile(([logits, temperature]) => statistics(logits!, temperature!))
-  const inputs = yield* Effect.acquireRelease(
-    Effect.gen(function*() {
-      const logits = yield* Tensor.zeros(shape)
-      const temperature = yield* Tensor.full([], 0.5)
+    const sampler = yield* Tensor.compile(([logits, temperature]) => statistics(logits!, temperature!))
+    const inputs = yield* Effect.acquireRelease(
+      Effect.gen(function*() {
+        const logits = yield* Tensor.zeros(shape)
+        const temperature = yield* Tensor.full([], 0.5)
 
-      return yield* Tensor.compute([logits, temperature])
-    }),
-    Tensor.clearAll
-  )
-  const started = performance.now()
-  const outputs = yield* Effect.acquireRelease(sampler.call(inputs), Tensor.clearAll)
-  const elapsedMilliseconds = performance.now() - started
-  const reduced = yield* Effect.forEach(outputs.slice(1), Tensor.toNumberArray)
+        return yield* Tensor.compute([logits, temperature])
+      }),
+      Tensor.clearAll
+    )
+    const started = performance.now()
+    const outputs = yield* Effect.acquireRelease(sampler.call(inputs), Tensor.clearAll)
+    const elapsedMilliseconds = performance.now() - started
+    const reduced = yield* Effect.forEach(outputs.slice(1), Tensor.toNumberArray)
 
-  console.log(JSON.stringify({ elapsedMilliseconds, reduced: reduced.map((values) => values.length) }))
-}).pipe(Effect.provide(BackendCuda.layer())))
+    console.log(JSON.stringify({ elapsedMilliseconds, reduced: reduced.map((values) => values.length) }))
+  }).pipe(Effect.provide(BackendCuda.layer()))
+)
 
 NodeRuntime.runMain(main)

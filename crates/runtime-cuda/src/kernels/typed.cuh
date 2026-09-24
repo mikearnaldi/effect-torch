@@ -14,7 +14,7 @@ struct CudaKernelArgs {
     unsigned int output_dtype;
     unsigned int compute_dtype;
     unsigned int operation;
-    unsigned int reserved;
+    unsigned int error_context;
 };
 static_assert(sizeof(CudaKernelArgs) == 360, "CUDA descriptor ABI size");
 
@@ -45,7 +45,10 @@ __device__ et_u64 et_broadcast(const CudaKernelArgs &a, et_u64 index, int role) 
     return result;
 }
 __device__ void et_error(const CudaKernelArgs &a, unsigned int code) {
-    if (a.scratch[3]) atomicCAS((unsigned int *)a.scratch[3], 0U, code);
+    if (a.scratch[3]) {
+        et_u64 failure = ((et_u64)a.error_context << 32) | code;
+        atomicCAS((unsigned long long *)a.scratch[3], 0ULL, failure);
+    }
 }
 __device__ unsigned int et_bytes(unsigned int dtype) {
     return dtype == 0 || dtype == 4 ? 8 : dtype == 1 || dtype == 5 ? 4 : dtype == 6 ? 1 : 2;
