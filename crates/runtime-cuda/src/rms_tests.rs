@@ -62,6 +62,69 @@ fn rms_fixed_independent_bf16_rounding_regression() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn rms_outer_row_permute_matches_materialized_order() {
+    let (batch, first, second, width) = (2, 3, 4, 256);
+    let source = seeded(batch * first * second * width, 41);
+    let weight = seeded(width, 73);
+    let mut materialized = vec![0.0; source.len()];
+    for b in 0..batch {
+        for i in 0..first {
+            for j in 0..second {
+                let source_row = (b * first + i) * second + j;
+                let destination_row = (b * second + j) * first + i;
+                materialized[destination_row * width..(destination_row + 1) * width]
+                    .copy_from_slice(&source[source_row * width..(source_row + 1) * width]);
+            }
+        }
+    }
+    let weight_node = || input(1, &[width], DType::BF16);
+    let view_root = Node::new(NodeKind::RmsNorm {
+        x: Node::new(NodeKind::Permute {
+            a: input(0, &[batch, first, second, width], DType::BF16),
+            dims: vec![0, 2, 1, 3],
+        })
+        .unwrap(),
+        weight: Some(weight_node()),
+        eps: 1e-6,
+    })
+    .unwrap();
+    let dense_root = Node::new(NodeKind::RmsNorm {
+        x: input(0, &[batch, second, first, width], DType::BF16),
+        weight: Some(weight_node()),
+        eps: 1e-6,
+    })
+    .unwrap();
+    let view = crate::compile(vec![view_root], 0)
+        .unwrap()
+        .execute(
+            &[
+                host(&[batch, first, second, width], DType::BF16, &source),
+                host(&[width], DType::BF16, &weight),
+            ],
+            &[],
+            &CancellationFlag::new(),
+        )
+        .unwrap()[0]
+        .read_storage_bytes()
+        .unwrap();
+    let dense = crate::compile(vec![dense_root], 0)
+        .unwrap()
+        .execute(
+            &[
+                host(&[batch, second, first, width], DType::BF16, &materialized),
+                host(&[width], DType::BF16, &weight),
+            ],
+            &[],
+            &CancellationFlag::new(),
+        )
+        .unwrap()[0]
+        .read_storage_bytes()
+        .unwrap();
+    assert_eq!(view, dense);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn rms_widths_tails_views_and_dtype_contract() {
     for dtype in [DType::F32, DType::BF16, DType::F16, DType::F64] {
         for (rows, width) in [

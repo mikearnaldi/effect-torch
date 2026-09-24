@@ -448,6 +448,68 @@ fn grouped_experts_materialize_general_broadcast_inputs() {
 }
 
 #[test]
+fn rms_norm_reads_outer_permutation_as_a_row_view() {
+    let source = input(0, &[1, 2, 3, 5], DType::BF16);
+    let permuted = Node::new(NodeKind::Permute {
+        a: source,
+        dims: vec![0, 2, 1, 3],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::RmsNorm {
+        x: permuted,
+        weight: Some(input(1, &[5], DType::BF16)),
+        eps: 1e-6,
+    })
+    .unwrap();
+    let (_, commands, _, _, _) = lower(vec![root], true, None);
+    assert!(!commands.iter().any(|command| matches!(
+        command.kind,
+        CommandKind::Kernel {
+            name: "et_reindex",
+            ..
+        }
+    )));
+    let CommandKind::Kernel { args, .. } = &commands
+        .iter()
+        .find(|command| {
+            matches!(
+                command.kind,
+                CommandKind::Kernel {
+                    name: "et_rms_norm_f32",
+                    ..
+                }
+            )
+        })
+        .expect("RMS command")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(&args.integers[..9], &[5, 3, 0, 1, 3, 2, 6, 1, 3]);
+
+    let f64_source = input(0, &[1, 2, 3, 5], DType::F64);
+    let f64_permuted = Node::new(NodeKind::Permute {
+        a: f64_source,
+        dims: vec![0, 2, 1, 3],
+    })
+    .unwrap();
+    let f64_root = Node::new(NodeKind::RmsNorm {
+        x: f64_permuted,
+        weight: None,
+        eps: 1e-6,
+    })
+    .unwrap();
+    let (_, f64_commands, _, _, _) = lower(vec![f64_root], true, None);
+    assert!(f64_commands.iter().any(|command| matches!(
+        command.kind,
+        CommandKind::Kernel {
+            name: "et_reindex",
+            ..
+        }
+    )));
+}
+
+#[test]
 fn scatter_add_uses_compact_indexes_for_an_inner_broadcast() {
     let compact = input(1, &[2, 3], DType::U32);
     let columns = Node::new(NodeKind::Reshape {

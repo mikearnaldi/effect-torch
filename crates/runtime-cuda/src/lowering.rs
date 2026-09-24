@@ -310,6 +310,7 @@ pub(super) struct CudaProgramBuilder {
     semantic_values: Vec<Option<ValueId>>,
     semantic_results: Vec<Vec<ValueId>>,
     elementwise_views: Vec<Option<ElementwiseView>>,
+    rms_row_views: Vec<Option<ElementwiseView>>,
     routed_row_views: Vec<Option<RoutedRowsView>>,
     grouped_routing: std::collections::HashMap<(usize, usize, usize), (ValueId, ValueId)>,
     state_layout: Option<CudaStateLayout>,
@@ -321,7 +322,7 @@ pub(super) struct CudaProgramBuilder {
     bf16_kv_matmul: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ElementwiseView {
     source: ValueId,
     shape: Vec<usize>,
@@ -434,6 +435,7 @@ impl CudaProgramBuilder {
             semantic_values: vec![None; index.order.len()],
             semantic_results: vec![Vec::new(); index.order.len()],
             elementwise_views: vec![None; index.order.len()],
+            rms_row_views: vec![None; index.order.len()],
             routed_row_views: vec![None; index.order.len()],
             grouped_routing: std::collections::HashMap::new(),
             state_layout,
@@ -560,6 +562,25 @@ impl CudaProgramBuilder {
                     NodeKind::Reshape { .. } => Self::feeds_only_grouped_input(index, consumer),
                     _ => false,
                 }
+            })
+    }
+
+    fn feeds_only_rms_input(index: &GraphIndex, dense: DenseNodeId) -> bool {
+        if index.roots.iter().any(|root| root.index() == dense.index()) {
+            return false;
+        }
+        let Some(producer) = index.node(dense) else {
+            return false;
+        };
+        let Some(consumers) = index.consumers_of(dense) else {
+            return false;
+        };
+        !consumers.is_empty()
+            && consumers.iter().all(|&consumer| {
+                matches!(
+                    index.node(consumer).map(|node| &node.kind),
+                    Some(NodeKind::RmsNorm { x, .. }) if x.id == producer.id
+                )
             })
     }
 
@@ -1009,9 +1030,10 @@ impl CudaProgramBuilder {
                 .all(|result| result.completion == ResultCompletion::Direct);
         let fused_consumer = Self::feeds_only_fused_consumer(index, optimization, dense);
         let grouped_input = Self::feeds_only_grouped_input(index, dense);
+        let rms_input = Self::feeds_only_rms_input(index, dense);
         if direct_boundary
             && boundary_storage.representation == StorageRepresentation::Dense
-            && (fused_consumer || grouped_input)
+            && (fused_consumer || grouped_input || rms_input)
         {
             if let NodeKind::BroadcastTo { a, .. } = &node.kind {
                 if grouped_input
@@ -1137,7 +1159,11 @@ impl CudaProgramBuilder {
                 }
             }
             if let NodeKind::Permute { a, dims } = &node.kind {
-                if fused_consumer
+                if (fused_consumer
+                    || (rms_input
+                        && node.dtype != DType::F64
+                        && a.shape.len() <= 7
+                        && dims.last() == Some(&(a.shape.len() - 1))))
                     && node.dtype == a.dtype
                     && dims.len() == a.shape.len()
                     && dims.iter().all(|&dimension| dimension < a.shape.len())
@@ -1167,6 +1193,11 @@ impl CudaProgramBuilder {
                     };
                     self.semantic_values[dense.index()] = Some(base.source);
                     self.semantic_results[dense.index()] = vec![base.source];
+                    if rms_input {
+                        for &consumer in index.consumers_of(dense).into_iter().flatten() {
+                            self.rms_row_views[consumer.index()] = Some(view.clone());
+                        }
+                    }
                     self.elementwise_views[dense.index()] = Some(view);
                     return Ok(());
                 }
@@ -1394,6 +1425,31 @@ impl CudaProgramBuilder {
                     for (slot, input) in spec.inputs.iter().enumerate() {
                         if *input == Some(semantic) {
                             inputs[slot] = Some(source);
+                        }
+                    }
+                }
+                if spec.name == "et_rms_norm" {
+                    if let Some(view) = &self.rms_row_views[dense.index()] {
+                        let width = *view
+                            .shape
+                            .last()
+                            .ok_or("compile: CUDA RMS view rank is zero")?;
+                        let outer_rank = view.shape.len() - 1;
+                        if width == 0
+                            || view.strides.last() != Some(&1)
+                            || view.offset % width != 0
+                            || view.strides[..outer_rank]
+                                .iter()
+                                .any(|stride| stride % width != 0)
+                        {
+                            return Err("compile: CUDA RMS row view is invalid".into());
+                        }
+                        spec.args.integers[1] = outer_rank as u64;
+                        spec.args.integers[2] = (view.offset / width) as u64;
+                        for dimension in 0..outer_rank {
+                            spec.args.integers[3 + dimension] = view.shape[dimension] as u64;
+                            spec.args.integers[3 + outer_rank + dimension] =
+                                (view.strides[dimension] / width) as u64;
                         }
                     }
                 }

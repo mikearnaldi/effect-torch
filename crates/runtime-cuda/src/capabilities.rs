@@ -26,6 +26,7 @@ impl CudaCapabilities {
         features.push("grouped-expert-compact-routed-input-v1".into());
         features.push("rms-f32-warp-four-partials-mean-factor-rsqrt-v1".into());
         features.push("rms-f32-wide-block-output-v1".into());
+        features.push("rms-f32-row-permute-view-v1".into());
         features.push("sum-f32-warp-or-block1024-vector4-v2".into());
         features.push("fused-elementwise-nvrtc-v1".into());
         features.push("fused-elementwise-strided-views-v2".into());

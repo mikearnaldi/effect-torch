@@ -122,21 +122,35 @@ extern "C" __global__ void et_matmul(CudaKernelArgs a) {
     }
     matmul_f64(ET_INPUT(0), ET_INPUT(1), ET_OUTPUT, a.elements, rank, shapes, a.compute_dtype);
 }
+#ifdef ET_COMPUTE_F32
+__device__ et_u64 et_rms_source_row(const CudaKernelArgs &a, et_u64 row) {
+    et_u64 rank = a.integers[1];
+    if (!rank) return row;
+    et_u64 source = a.integers[2];
+    for (int dimension = (int)rank - 1; dimension >= 0; --dimension) {
+        et_u64 size = a.integers[3 + dimension];
+        source += (row % size) * a.integers[3 + rank + dimension];
+        row /= size;
+    }
+    return source;
+}
+#endif
 extern "C" __global__ void et_rms_norm(CudaKernelArgs a) {
 #ifdef ET_COMPUTE_F32
     // One warp per row, four independently rounded F32 partials per lane.
     // fmad=false keeps square and accumulation boundaries distinct. Inputs
     // are materialized opmath values; narrowing remains in the output plan.
-    et_u64 width = et_shape(a, 0)[et_meta(a)[1] - 1];
+    et_u64 width = a.integers[0];
     if (!width) return;
     et_u64 rows = a.elements / width;
     unsigned int lane = threadIdx.x & 31U;
     for (et_u64 row = et_thread() / 32; row < rows; row += (et_u64)gridDim.x * (blockDim.x / 32)) {
+        et_u64 source_row = et_rms_source_row(a, row);
         float partial[4] = {0, 0, 0, 0};
         for (et_u64 k = lane * 4; k < width; k += 128) {
             #pragma unroll
             for (int j = 0; j < 4; ++j) if (k + j < width) {
-                float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k + j);
+                float value = et_load<float>(a.inputs[0], a.input_dtypes[0], source_row * width + k + j);
                 partial[j] += value * value;
             }
         }
@@ -146,7 +160,7 @@ extern "C" __global__ void et_rms_norm(CudaKernelArgs a) {
         float mean = sum * (1.0f / (float)width);
         float inverse = rsqrtf(mean + (float)a.scalars[0]);
         for (et_u64 k = lane; k < width; k += 32) {
-            float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k) * inverse;
+            float value = et_load<float>(a.inputs[0], a.input_dtypes[0], source_row * width + k) * inverse;
             if (a.inputs[1]) value *= et_load<float>(a.inputs[1], a.input_dtypes[1], k);
             et_store(a.output, a.output_dtype, row * width + k, value);
         }
@@ -164,18 +178,19 @@ extern "C" __global__ void et_rms_norm(CudaKernelArgs a) {
 // Preserve et_rms_norm's exact 32-lane reduction tree while giving wide rows
 // a full block for the output pass. One block owns one row at a time.
 extern "C" __global__ void et_rms_norm_wide(CudaKernelArgs a) {
-    et_u64 width = et_shape(a, 0)[et_meta(a)[1] - 1];
+    et_u64 width = a.integers[0];
     if (!width) return;
     et_u64 rows = a.elements / width;
     unsigned int lane = threadIdx.x & 31U;
     __shared__ float inverse;
     for (et_u64 row = blockIdx.x; row < rows; row += gridDim.x) {
+        et_u64 source_row = et_rms_source_row(a, row);
         if (threadIdx.x < 32) {
             float partial[4] = {0, 0, 0, 0};
             for (et_u64 k = lane * 4; k < width; k += 128) {
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) if (k + j < width) {
-                    float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k + j);
+                    float value = et_load<float>(a.inputs[0], a.input_dtypes[0], source_row * width + k + j);
                     partial[j] += value * value;
                 }
             }
@@ -188,7 +203,7 @@ extern "C" __global__ void et_rms_norm_wide(CudaKernelArgs a) {
         }
         __syncthreads();
         for (et_u64 k = threadIdx.x; k < width; k += blockDim.x) {
-            float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k) * inverse;
+            float value = et_load<float>(a.inputs[0], a.input_dtypes[0], source_row * width + k) * inverse;
             if (a.inputs[1]) value *= et_load<float>(a.inputs[1], a.input_dtypes[1], k);
             et_store(a.output, a.output_dtype, row * width + k, value);
         }
