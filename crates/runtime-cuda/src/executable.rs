@@ -3194,8 +3194,7 @@ impl CudaExecutable {
             }
             let rows = args.elements / group_elements;
             let blocks = rows
-                .checked_mul(routes)
-                .and_then(|groups| groups.checked_mul(inner.div_ceil(256)))
+                .checked_mul(inner.div_ceil(256))
                 .ok_or("scatterAdd: compact launch overflow")?;
             let function = self.device.kernel(name)?;
             let mut launch = self.device.stream.launch_builder(function);
