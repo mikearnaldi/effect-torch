@@ -38,6 +38,10 @@ impl CudaCapabilities {
             features.push("cublas-f32-output-no-reduced-precision-reduction".into());
             features.push("cublas-status-free-bias-epilogue-v1".into());
             features.push(format!(
+                "cublas-expert-streams-{}",
+                crate::cublas::EXPERT_BLAS_STREAMS
+            ));
+            features.push(format!(
                 "cublas-workspace-bytes-{}",
                 crate::cublas::CUBLAS_WORKSPACE_BYTES
             ));
@@ -677,6 +681,11 @@ mod tests {
             .features
             .iter()
             .any(|feature| feature == "cublas-bf16-row-major-f32-accum-v3"));
+        assert!(capabilities
+            .fingerprint()
+            .features
+            .iter()
+            .any(|feature| feature == "cublas-expert-streams-16"));
         assert_eq!(capabilities.fingerprint().architecture, "sm_120");
         let off = CudaCapabilities::new(0, 7, 0);
         assert!(capabilities
