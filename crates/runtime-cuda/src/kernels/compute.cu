@@ -160,6 +160,42 @@ extern "C" __global__ void et_rms_norm(CudaKernelArgs a) {
     et_store(a.output, a.output_dtype, i, value);
 #endif
 }
+#ifdef ET_COMPUTE_F32
+// Preserve et_rms_norm's exact 32-lane reduction tree while giving wide rows
+// a full block for the output pass. One block owns one row at a time.
+extern "C" __global__ void et_rms_norm_wide(CudaKernelArgs a) {
+    et_u64 width = et_shape(a, 0)[et_meta(a)[1] - 1];
+    if (!width) return;
+    et_u64 rows = a.elements / width;
+    unsigned int lane = threadIdx.x & 31U;
+    __shared__ float inverse;
+    for (et_u64 row = blockIdx.x; row < rows; row += gridDim.x) {
+        if (threadIdx.x < 32) {
+            float partial[4] = {0, 0, 0, 0};
+            for (et_u64 k = lane * 4; k < width; k += 128) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) if (k + j < width) {
+                    float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k + j);
+                    partial[j] += value * value;
+                }
+            }
+            float sum = ((partial[0] + partial[1]) + partial[2]) + partial[3];
+            for (unsigned int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
+            if (!lane) {
+                float mean = sum * (1.0f / (float)width);
+                inverse = rsqrtf(mean + (float)a.scalars[0]);
+            }
+        }
+        __syncthreads();
+        for (et_u64 k = threadIdx.x; k < width; k += blockDim.x) {
+            float value = et_load<float>(a.inputs[0], a.input_dtypes[0], row * width + k) * inverse;
+            if (a.inputs[1]) value *= et_load<float>(a.inputs[1], a.input_dtypes[1], k);
+            et_store(a.output, a.output_dtype, row * width + k, value);
+        }
+        __syncthreads();
+    }
+}
+#endif
 __device__ unsigned int et_ce_active(const CudaKernelArgs &a, int role, et_u64 rows, et_u64 classes) {
     unsigned int active = 0;
     for (et_u64 row = 0; row < rows; ++row) {

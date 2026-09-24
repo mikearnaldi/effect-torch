@@ -3183,6 +3183,53 @@ impl CudaExecutable {
         if args.elements == 0 {
             return Ok(());
         }
+        if name == "et_scatter_add_inner" {
+            let routes = args.integers[0];
+            let inner = args.integers[1];
+            let group_elements = routes
+                .checked_mul(inner)
+                .ok_or("scatterAdd: compact geometry overflow")?;
+            if group_elements == 0 || args.elements % group_elements != 0 {
+                return Err("scatterAdd: invalid compact geometry".into());
+            }
+            let rows = args.elements / group_elements;
+            let blocks = rows
+                .checked_mul(routes)
+                .and_then(|groups| groups.checked_mul(inner.div_ceil(256)))
+                .ok_or("scatterAdd: compact launch overflow")?;
+            let function = self.device.kernel(name)?;
+            let mut launch = self.device.stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (
+                        u32::try_from(blocks)
+                            .map_err(|_| "scatterAdd: compact grid exceeds u32")?,
+                        1,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_rms_norm_f32" && args.integers[0] >= 1024 {
+            let rows = args.elements / args.integers[0];
+            let function = self.device.kernel("et_rms_norm_wide_f32")?;
+            let mut launch = self.device.stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows.min(65535) as u32, 1, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         // Current rows must be stored before query/head warps read them,
         // including future rows in a bidirectional canvas. Both launches use
         // the same stream and invocation-owned transaction/scratch storage.

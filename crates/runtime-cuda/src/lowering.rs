@@ -366,6 +366,51 @@ fn reshape_view(view: &ElementwiseView, shape: &[usize]) -> Option<ElementwiseVi
     })
 }
 
+fn compact_inner_scatter_indexes(
+    node: &Node,
+    index: &GraphIndex,
+) -> Result<Option<(DenseNodeId, usize, usize)>, String> {
+    let NodeKind::ScatterAdd {
+        a,
+        dim,
+        indexes,
+        src,
+    } = &node.kind
+    else {
+        return Ok(None);
+    };
+    if *dim + 1 >= a.shape.len() || indexes.shape != src.shape || src.shape != a.shape {
+        return Ok(None);
+    }
+    let NodeKind::BroadcastTo { a: broadcast, .. } = &indexes.kind else {
+        return Ok(None);
+    };
+    let outer = product_checked(&a.shape[..*dim])?;
+    let routes = a.shape[*dim];
+    let inner = product_checked(&a.shape[*dim + 1..])?;
+    if routes == 0 || routes > 32 {
+        return Ok(None);
+    }
+    let compact_elements = outer
+        .checked_mul(routes)
+        .ok_or("compile: CUDA compact scatter geometry overflow")?;
+    if product_checked(&broadcast.shape)? != compact_elements {
+        return Ok(None);
+    }
+    let mut compact = broadcast;
+    while let NodeKind::Reshape { a, .. } = &compact.kind {
+        compact = a;
+    }
+    if product_checked(&compact.shape)? != compact_elements
+        || !matches!(compact.dtype, DType::I64 | DType::U32)
+    {
+        return Ok(None);
+    }
+    Ok(index
+        .dense_id(compact.id)
+        .map(|dense| (dense, routes, inner)))
+}
+
 impl CudaProgramBuilder {
     pub(super) fn new(
         index: &GraphIndex,
@@ -445,7 +490,7 @@ impl CudaProgramBuilder {
             .ok_or_else(|| format!("compile: missing CUDA semantic value {semantic}"))
     }
 
-    fn feeds_only_elementwise_region(
+    fn feeds_only_fused_consumer(
         index: &GraphIndex,
         optimization: &OptimizationPlan,
         dense: DenseNodeId,
@@ -456,6 +501,9 @@ impl CudaProgramBuilder {
         let Some(consumers) = index.consumers_of(dense) else {
             return false;
         };
+        let Some(producer) = index.node(dense) else {
+            return false;
+        };
         !consumers.is_empty()
             && consumers.iter().all(|&consumer| {
                 if let Some(region) = optimization.node_region[consumer.index()] {
@@ -464,12 +512,23 @@ impl CudaProgramBuilder {
                         Some(NativeRegion::Elementwise(_))
                     );
                 }
+                if let Some(node) = index.node(consumer) {
+                    if matches!(
+                        &node.kind,
+                        NodeKind::ScatterAdd { indexes, .. } if indexes.id == producer.id
+                    ) && compact_inner_scatter_indexes(node, index)
+                        .is_ok_and(|specialized| specialized.is_some())
+                    {
+                        return true;
+                    }
+                }
                 matches!(
                     index.node(consumer).map(|node| &node.kind),
                     Some(NodeKind::Reshape { .. })
-                ) && Self::feeds_only_elementwise_region(index, optimization, consumer)
+                ) && Self::feeds_only_fused_consumer(index, optimization, consumer)
             })
     }
+
     fn emit(
         &mut self,
         name: &'static str,
@@ -916,8 +975,55 @@ impl CudaProgramBuilder {
                 .all(|result| result.completion == ResultCompletion::Direct);
         if direct_boundary
             && boundary_storage.representation == StorageRepresentation::Dense
-            && Self::feeds_only_elementwise_region(index, optimization, dense)
+            && Self::feeds_only_fused_consumer(index, optimization, dense)
         {
+            if let NodeKind::BroadcastTo { a, .. } = &node.kind {
+                if node.dtype == a.dtype && a.shape.len() <= node.shape.len() {
+                    let parent = index
+                        .dense_id(a.id)
+                        .ok_or("compile: CUDA broadcast source is missing")?;
+                    let source = self.resolve(parent.index())?;
+                    let base =
+                        self.elementwise_views[parent.index()]
+                            .clone()
+                            .unwrap_or(ElementwiseView {
+                                source,
+                                shape: a.shape.clone(),
+                                strides: contiguous_strides(&a.shape)?,
+                                offset: 0,
+                            });
+                    let rank_offset = node.shape.len() - a.shape.len();
+                    let mut strides = Vec::with_capacity(node.shape.len());
+                    for (dimension, &size) in node.shape.iter().enumerate() {
+                        if dimension < rank_offset {
+                            strides.push(0);
+                            continue;
+                        }
+                        let source_dimension = dimension - rank_offset;
+                        let source_size = a.shape[source_dimension];
+                        if source_size != 1 && source_size != size {
+                            return Err(
+                                "compile: CUDA elementwise broadcast view is invalid".into()
+                            );
+                        }
+                        strides.push(if source_size == 1 {
+                            0
+                        } else {
+                            base.strides[source_dimension]
+                        });
+                    }
+                    let view = ElementwiseView {
+                        source: base.source,
+                        shape: node.shape.clone(),
+                        strides,
+                        offset: base.offset,
+                    };
+                    self.semantic_values[dense.index()] = Some(base.source);
+                    self.semantic_results[dense.index()] = vec![base.source];
+                    self.elementwise_views[dense.index()] = Some(view);
+                    return Ok(());
+                }
+            }
             if let NodeKind::Slice { a, ranges } = &node.kind {
                 if node.dtype == a.dtype && ranges.len() == a.shape.len() {
                     let parent = index
@@ -1145,7 +1251,7 @@ impl CudaProgramBuilder {
                 id
             }
             instruction => {
-                let spec = instruction.kernel()?;
+                let mut spec = instruction.kernel()?;
                 let mut inputs = [None; 8];
                 for (slot, semantic) in spec.inputs.iter().enumerate() {
                     if let Some(semantic) = semantic {
@@ -1183,6 +1289,13 @@ impl CudaProgramBuilder {
                             inputs[slot] = Some(source);
                         }
                     }
+                }
+                if let Some((compact, routes, inner)) = compact_inner_scatter_indexes(node, index)?
+                {
+                    spec.name = "et_scatter_add_inner";
+                    spec.args.integers[0] = routes as u64;
+                    spec.args.integers[1] = inner as u64;
+                    inputs[1] = Some(self.resolve(compact.index())?);
                 }
                 let semantic_spec = OperationDTypeSpec::new(index, dense)?;
                 let mut results = Vec::with_capacity(operation.results.len());

@@ -24,9 +24,11 @@ impl CudaCapabilities {
         features.push("grouped-expert-stable-exact-rows-host-control-v1".into());
         features.push("grouped-expert-routing-reuse-v1".into());
         features.push("rms-f32-warp-four-partials-mean-factor-rsqrt-v1".into());
+        features.push("rms-f32-wide-block-output-v1".into());
         features.push("sum-f32-warp-or-block1024-vector4-v2".into());
         features.push("fused-elementwise-nvrtc-v1".into());
-        features.push("fused-elementwise-strided-slice-views-v1".into());
+        features.push("fused-elementwise-strided-views-v2".into());
+        features.push("scatter-add-compact-inner-index-v1".into());
         if bf16_gemm {
             features.push("stepwise-bf16-kv-f32-gemm-active-rows-v1".into());
             features.push("cublas-bf16-row-major-f32-accum-v3".into());

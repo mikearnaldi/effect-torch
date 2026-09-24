@@ -55,6 +55,7 @@ const TYPED_KERNELS: &[&str] = &[
     "et_where",
     "et_concat",
     "et_index",
+    "et_scatter_add_inner",
     "et_arg_index_last_wide",
     "et_top_k_indices",
     "et_expert_linear_rows",
@@ -316,6 +317,10 @@ impl CudaDevice {
                     kernels.insert(format!("{name}_{suffix}"), load(&module, name)?);
                 }
                 if definition.name == "tensor" && suffix == "f32" {
+                    kernels.insert(
+                        "et_rms_norm_wide_f32".into(),
+                        load(&module, "et_rms_norm_wide")?,
+                    );
                     kernels.insert("et_sum_wide_f32".into(), load(&module, "et_sum_wide")?);
                     kernels.insert(
                         "et_reduce_last_wide_f32".into(),

@@ -301,6 +301,45 @@ extern "C" __global__ void et_index(CudaKernelArgs a) {
     else if (a.input_dtypes[0] == 0) et_index_impl<double>(a, i);
     else et_index_impl<float>(a, i);
 }
+template<class T> __device__ void et_scatter_add_inner_impl(
+    const CudaKernelArgs &a, et_u64 row, et_u64 coordinate, et_u64 d, const et_i64 *indexes
+) {
+    et_u64 routes = a.integers[0], inner = a.integers[1];
+    et_u64 i = (row * routes + coordinate) * inner + d;
+    T total = et_load<T>(a.inputs[0], a.input_dtypes[0], i);
+    for (et_u64 route = 0; route < routes; ++route) {
+        if ((et_u64)indexes[route] != coordinate) continue;
+        et_u64 source = (row * routes + route) * inner + d;
+        total = et_add(total, et_load<T>(a.inputs[2], a.input_dtypes[2], source));
+        if (a.output_dtype == 2) total = (T)et_half_float(et_to16(total, false));
+        else if (a.output_dtype == 3) total = (T)et_bfloat_float(et_to16(total, true));
+    }
+    et_store(a.output, a.output_dtype, i, total);
+}
+extern "C" __global__ void et_scatter_add_inner(CudaKernelArgs a) {
+    et_u64 routes = a.integers[0], inner = a.integers[1];
+    et_u64 tiles = (inner + blockDim.x - 1) / blockDim.x;
+    et_u64 tile = blockIdx.x % tiles, group = blockIdx.x / tiles;
+    et_u64 coordinate = group % routes, row = group / routes;
+    et_u64 d = tile * blockDim.x + threadIdx.x;
+    __shared__ et_i64 indexes[32];
+    __shared__ unsigned int valid;
+    if (!threadIdx.x) valid = 1;
+    __syncthreads();
+    if (threadIdx.x < routes) {
+        et_i64 selected = et_load<et_i64>(a.inputs[1], a.input_dtypes[1], row * routes + threadIdx.x);
+        if (selected < 0 || (et_u64)selected >= routes) {
+            et_error(a, 1);
+            atomicExch(&valid, 0U);
+        }
+        indexes[threadIdx.x] = selected;
+    }
+    __syncthreads();
+    if (!valid || d >= inner) return;
+    if (a.input_dtypes[0] >= 4) et_scatter_add_inner_impl<et_i64>(a, row, coordinate, d, indexes);
+    else if (a.input_dtypes[0] == 0) et_scatter_add_inner_impl<double>(a, row, coordinate, d, indexes);
+    else et_scatter_add_inner_impl<float>(a, row, coordinate, d, indexes);
+}
 extern "C" __global__ __launch_bounds__(1024) void et_arg_index_last_wide(CudaKernelArgs a) {
     et_u64 width = a.integers[1];
     __shared__ float values[32];

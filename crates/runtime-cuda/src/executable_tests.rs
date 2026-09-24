@@ -81,6 +81,12 @@ fn lower_with(
                     a: child(a),
                     parameters: dims.iter().map(|dim| *dim as u64).collect(),
                 },
+                NodeKind::Reshape { a, .. } => Instruction::Alias { a: child(a) },
+                NodeKind::BroadcastTo { a, .. } => Instruction::Reindex {
+                    op: 0,
+                    a: child(a),
+                    parameters: Vec::new(),
+                },
                 NodeKind::ExpertLinearRows { x, weight, indexes } => {
                     Instruction::ExpertLinearRows {
                         x: child(x),
@@ -121,6 +127,20 @@ fn lower_with(
                     a: child(a),
                     indexes: Some(child(indexes)),
                     src: None,
+                    dim: *dim as u32,
+                    width: a.shape[*dim],
+                    trailing: *dim + 1 == a.shape.len(),
+                },
+                NodeKind::ScatterAdd {
+                    a,
+                    dim,
+                    indexes,
+                    src,
+                } => Instruction::Index {
+                    op: 5,
+                    a: child(a),
+                    indexes: Some(child(indexes)),
+                    src: Some(child(src)),
                     dim: *dim as u32,
                     width: a.shape[*dim],
                     trailing: *dim + 1 == a.shape.len(),
@@ -330,6 +350,59 @@ fn grouped_experts_reuse_unchanged_routing_control_and_row_map() {
     assert!(groups[1].2);
     assert_eq!(groups[0].0, groups[1].0);
     assert_eq!(groups[0].1, groups[1].1);
+}
+
+#[test]
+fn scatter_add_uses_compact_indexes_for_an_inner_broadcast() {
+    let compact = input(1, &[2, 3], DType::U32);
+    let columns = Node::new(NodeKind::Reshape {
+        a: compact.clone(),
+        shape: vec![2, 3, 1],
+    })
+    .unwrap();
+    let indexes = Node::new(NodeKind::BroadcastTo {
+        a: columns,
+        shape: vec![2, 3, 5],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::ScatterAdd {
+        a: input(0, &[2, 3, 5], DType::BF16),
+        dim: 1,
+        indexes,
+        src: input(2, &[2, 3, 5], DType::BF16),
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let CommandKind::Kernel { name, inputs, .. } = &commands
+        .iter()
+        .find(|command| {
+            matches!(
+                command.kind,
+                CommandKind::Kernel {
+                    name: "et_scatter_add_inner",
+                    ..
+                }
+            )
+        })
+        .expect("compact scatter kernel")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(*name, "et_scatter_add_inner");
+    assert_eq!(program.values[inputs[1].unwrap().index()].shape, [2, 3]);
+    assert!(!commands.iter().any(|command| {
+        matches!(
+            command.kind,
+            CommandKind::Kernel {
+                name: "et_reindex",
+                ..
+            }
+        ) && command
+            .output
+            .is_some_and(|output| program.values[output.index()].shape == [2, 3, 5])
+    }));
+    assert_eq!(compact.shape, [2, 3]);
 }
 
 #[test]
