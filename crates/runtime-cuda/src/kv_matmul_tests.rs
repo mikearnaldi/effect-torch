@@ -157,6 +157,72 @@ fn encoded(data: &[f64]) -> Vec<u8> {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn kv_gemm_sequence_major_output_matches_materialized_permute() {
+    let (batch, heads, kv, tokens, dim) = (1, 4, 2, 3, 7);
+    let layout = layout(1, 8, kv, dim, None, StateAccessMode::Append);
+    let attention = || root(batch, heads, kv, tokens, dim, false, None, 1.0);
+    let permuted = Node::new(NodeKind::Permute {
+        a: attention(),
+        dims: vec![0, 2, 1, 3],
+    })
+    .unwrap();
+    let direct = compile(layout.clone(), attention());
+    let sequence_major = compile(layout.clone(), permuted);
+    let values = (0..batch * kv * tokens * dim)
+        .map(|index| (index % 13) as f64 - 6.0)
+        .collect::<Vec<_>>();
+    let bindings = [
+        host(
+            vec![batch, heads, tokens, dim],
+            &vec![0.0; batch * heads * tokens * dim],
+        ),
+        host(
+            vec![batch, kv, tokens, dim],
+            &vec![0.0; batch * kv * tokens * dim],
+        ),
+        host(vec![batch, kv, tokens, dim], &values),
+    ];
+    let make_state = || {
+        invocation(
+            &layout,
+            vec![sequence(0, snapshot(layout.kv_layers[0], 0, 0, &[], &[]))],
+            vec![0],
+            vec![tokens as u32],
+        )
+    };
+    let mut direct_state = make_state();
+    let direct = direct
+        .execute_stateful(&bindings, &[], &mut direct_state, &CancellationFlag::new())
+        .unwrap()[0]
+        .read_storage_bytes()
+        .unwrap();
+    let mut sequence_major_state = make_state();
+    let actual = sequence_major
+        .execute_stateful(
+            &bindings,
+            &[],
+            &mut sequence_major_state,
+            &CancellationFlag::new(),
+        )
+        .unwrap()[0]
+        .read_storage_bytes()
+        .unwrap();
+    let mut expected = vec![0; direct.len()];
+    let row_bytes = dim * 2;
+    for head in 0..heads {
+        for token in 0..tokens {
+            let source = (head * tokens + token) * row_bytes;
+            let destination = (token * heads + head) * row_bytes;
+            expected[destination..destination + row_bytes]
+                .copy_from_slice(&direct[source..source + row_bytes]);
+        }
+    }
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn kv_gemm_full_canvas_changing_lengths_and_capture_rejection() {
     // Independent closed-form uniform-score oracle. BF16 probabilities times
     // these small integers have exact F32 sums at all tested lengths.

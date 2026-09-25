@@ -589,6 +589,7 @@ impl Instruction {
                 window,
                 bidirectional,
                 rounding,
+                sequence_major,
                 ..
             } => {
                 let mut s = KernelSpec::new("et_kv_attention", &[Some(*q), Some(*k), Some(*v)]);
@@ -599,6 +600,7 @@ impl Instruction {
                 s.args.integers[7] = q_shape[2] as u64;
                 s.args.integers[10] = q_shape[3] as u64;
                 s.args.integers[11] = q_shape[1] as u64;
+                s.args.operation = u32::from(*sequence_major);
                 s.state = StateAccess::Kv {
                     layer: *layer,
                     heads: k_shape[1],
@@ -864,6 +866,7 @@ pub(super) enum Instruction {
         window: Option<usize>,
         bidirectional: bool,
         rounding: AttentionRounding,
+        sequence_major: bool,
     },
     Random {
         normal: bool,
@@ -1915,6 +1918,7 @@ fn semantic_instruction(
             window: *window,
             bidirectional: *mode == KvAttentionMode::BidirectionalBlock,
             rounding: *rounding,
+            sequence_major: false,
         },
         NodeKind::Inverse { a } => Instruction::Linalg {
             op: 0,

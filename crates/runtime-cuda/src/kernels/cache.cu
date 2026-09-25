@@ -117,10 +117,11 @@ template<class T> __device__ void et_kv_attention_impl(const CudaKernelArgs &a) 
     if (lane >= a.integers[5] * a.integers[2]) return;
     et_u64 head = (item / tokens) % qheads, t = item % tokens, sequence = lane / a.integers[2];
     et_u64 query = item * dim;
+    et_u64 output = a.operation ? ((lane * tokens + t) * qheads + head) * dim : query;
     const unsigned int *valid = (const unsigned int *)a.scratch[0], *cursors = (const unsigned int *)a.inputs[7];
     if (valid[lane] > tokens) { et_error(a, 1); return; }
     if (t >= valid[lane]) {
-        for (et_u64 d = warp_lane; d < dim; d += warp_width) et_store(a.output, a.output_dtype, query + d, 0.0f);
+        for (et_u64 d = warp_lane; d < dim; d += warp_width) et_store(a.output, a.output_dtype, output + d, 0.0f);
         return;
     }
     const et_u64 *header = (const et_u64 *)a.inputs[3] + sequence * 4;
@@ -161,7 +162,7 @@ template<class T> __device__ void et_kv_attention_impl(const CudaKernelArgs &a) 
         for (unsigned int j = 0; j < 4 && d + j < dim; ++j) {
             T value = et_kv_warp_sum(result[j]);
             if (a.integers[6]) value = T(et_kv_round(float(value), a.integers[8]));
-            if (warp_lane == 0) et_store(a.output, a.output_dtype, query + d + j, value);
+            if (warp_lane == 0) et_store(a.output, a.output_dtype, output + d + j, value);
         }
     }
 }
@@ -220,5 +221,6 @@ extern "C" __global__ void et_kv_gemm_softmax(CudaKernelArgs a) {
 extern "C" __global__ void et_kv_gemm_round(CudaKernelArgs a) {
     et_u64 i=et_thread(); if (i>=a.elements) return;
     et_u64 dim=a.integers[10], tokens=a.integers[15], head=i/(tokens*dim), t=(i/dim)%tokens;
-    ((float*)a.output)[(head*a.integers[7]+t)*dim+i%dim]=et_kv_round(((float*)a.inputs[2])[i],3);
+    et_u64 row=a.operation?t*a.integers[11]+head:head*a.integers[7]+t;
+    ((float*)a.output)[row*dim+i%dim]=et_kv_round(((float*)a.inputs[2])[i],3);
 }

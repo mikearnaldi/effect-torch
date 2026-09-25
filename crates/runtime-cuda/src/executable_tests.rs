@@ -238,6 +238,7 @@ fn lower_with(
                         mode,
                         effect_torch_graph::KvAttentionMode::BidirectionalBlock
                     ),
+                    sequence_major: false,
                 },
                 _ => return Err("unsupported host-test instruction".into()),
             };

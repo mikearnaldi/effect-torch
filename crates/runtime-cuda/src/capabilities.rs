@@ -33,6 +33,7 @@ impl CudaCapabilities {
         features.push("fused-elementwise-repeat-view-v1".into());
         features.push("fused-elementwise-strided-views-v2".into());
         features.push("scatter-add-compact-inner-index-v1".into());
+        features.push("kv-sequence-major-output-v1".into());
         if bf16_gemm {
             features.push("stepwise-bf16-kv-f32-gemm-active-rows-v1".into());
             features.push("cublas-bf16-row-major-f32-accum-v3".into());

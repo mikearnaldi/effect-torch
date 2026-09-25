@@ -311,6 +311,7 @@ pub(super) struct CudaProgramBuilder {
     semantic_results: Vec<Vec<ValueId>>,
     elementwise_views: Vec<Option<ElementwiseView>>,
     rms_row_views: Vec<Option<ElementwiseView>>,
+    sequence_major_attention: Vec<bool>,
     routed_row_views: Vec<Option<RoutedRowsView>>,
     grouped_routing: std::collections::HashMap<(usize, usize, usize), (ValueId, ValueId)>,
     state_layout: Option<CudaStateLayout>,
@@ -524,6 +525,7 @@ impl CudaProgramBuilder {
             semantic_results: vec![Vec::new(); index.order.len()],
             elementwise_views: vec![None; index.order.len()],
             rms_row_views: vec![None; index.order.len()],
+            sequence_major_attention: vec![false; index.order.len()],
             routed_row_views: vec![None; index.order.len()],
             grouped_routing: std::collections::HashMap::new(),
             state_layout,
@@ -698,6 +700,26 @@ impl CudaProgramBuilder {
                 };
                 a.id == producer.id && Self::feeds_only_rotary_reindex(index, consumer)
             })
+    }
+
+    fn feeds_only_sequence_major_permute(index: &GraphIndex, dense: DenseNodeId) -> bool {
+        let Some(producer) = index.node(dense) else {
+            return false;
+        };
+        if producer.shape.len() != 4 || index.roots.iter().any(|root| root.index() == dense.index())
+        {
+            return false;
+        }
+        index.consumers_of(dense).is_some_and(|consumers| {
+            !consumers.is_empty()
+                && consumers.iter().all(|consumer| {
+                    matches!(
+                        index.node(*consumer).map(|node| &node.kind),
+                        Some(NodeKind::Permute { a, dims })
+                            if a.id == producer.id && dims.as_slice() == [0, 2, 1, 3]
+                    )
+                })
+        })
     }
 
     fn feeds_only_rms_input(index: &GraphIndex, dense: DenseNodeId) -> bool {
@@ -1139,7 +1161,7 @@ impl CudaProgramBuilder {
         node: &Node,
         index: &GraphIndex,
         optimization: &OptimizationPlan,
-        instruction: Instruction,
+        mut instruction: Instruction,
         plan: &ExecutableDTypePlan,
     ) -> Result<(), String> {
         let execution = plan.execution();
@@ -1163,6 +1185,16 @@ impl CudaProgramBuilder {
                 .results
                 .iter()
                 .all(|result| result.completion == ResultCompletion::Direct);
+        if let Instruction::KvAttention { sequence_major, .. } = &mut instruction {
+            *sequence_major = Self::feeds_only_sequence_major_permute(index, dense);
+            self.sequence_major_attention[dense.index()] = *sequence_major;
+        }
+        let sequence_major_alias = match &node.kind {
+            NodeKind::Permute { a, dims } if dims.as_slice() == [0, 2, 1, 3] => index
+                .dense_id(a.id)
+                .is_some_and(|parent| self.sequence_major_attention[parent.index()]),
+            _ => false,
+        };
         let fused_consumer = Self::feeds_only_fused_consumer(index, optimization, dense);
         let grouped_input = Self::feeds_only_grouped_input(index, dense);
         let rotary_reindex = Self::feeds_only_rotary_reindex(index, dense);
@@ -1180,6 +1212,7 @@ impl CudaProgramBuilder {
         }
         if direct_boundary
             && boundary_storage.representation == StorageRepresentation::Dense
+            && !sequence_major_alias
             && (fused_consumer || grouped_input || rotary_reindex || rms_input)
         {
             if Self::feeds_direct_fused_consumer(index, optimization, dense) {
@@ -1482,6 +1515,19 @@ impl CudaProgramBuilder {
             return Ok(());
         }
         let native_gemm = self.gemms.operations[dense.index()];
+        let instruction = if sequence_major_alias {
+            let NodeKind::Permute { a, .. } = &node.kind else {
+                unreachable!()
+            };
+            Instruction::Alias {
+                a: index
+                    .dense_id(a.id)
+                    .ok_or("compile: CUDA sequence-major attention source is missing")?
+                    .index(),
+            }
+        } else {
+            instruction
+        };
         let instruction = match instruction {
             Instruction::Concat { a, b, dim } => {
                 if let Some((source, width)) = rotary_reindex_source(node, index) {
