@@ -687,7 +687,7 @@ mod tests {
             .fingerprint()
             .features
             .iter()
-            .any(|feature| feature == "cublas-expert-streams-16"));
+            .any(|feature| feature == "cublas-expert-streams-32"));
         assert_eq!(capabilities.fingerprint().architecture, "sm_120");
         let off = CudaCapabilities::new(0, 7, 0);
         assert!(capabilities

@@ -27,7 +27,7 @@ pub(crate) const BF16_GEMM_MIN_MAJOR: i32 = 8;
 /// default split-K algorithms at larger projection shapes and changes BF16
 /// results. 32 MiB matches the deterministic :4096:8 cuBLAS workspace.
 pub(crate) const CUBLAS_WORKSPACE_BYTES: usize = 32 << 20;
-pub(crate) const EXPERT_BLAS_STREAMS: usize = 16;
+pub(crate) const EXPERT_BLAS_STREAMS: usize = 32;
 
 /// Which semantic operation the row-major GEMM realizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
