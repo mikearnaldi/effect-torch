@@ -213,6 +213,22 @@ extern "C" __global__ void et_where(CudaKernelArgs a) {
     int role = c ? 1 : 2;
     et_copy(a.inputs[role], a.output, a.output_dtype, et_broadcast(a, i, role), i);
 }
+extern "C" __global__ void et_rotary_reindex(CudaKernelArgs a) {
+    et_u64 index = et_thread();
+    if (index >= a.elements) return;
+    et_u64 width = a.integers[0], half = width / 2, column = index % width;
+    if (column < half) {
+        et_u64 source = index + half;
+        if (a.output_dtype == 0)
+            ((et_u64 *)a.output)[index] = ((const et_u64 *)a.inputs[0])[source] ^ 0x8000000000000000ULL;
+        else if (a.output_dtype == 1)
+            ((unsigned int *)a.output)[index] = ((const unsigned int *)a.inputs[0])[source] ^ 0x80000000U;
+        else
+            ((unsigned short *)a.output)[index] = ((const unsigned short *)a.inputs[0])[source] ^ 0x8000U;
+    } else {
+        et_copy(a.inputs[0], a.output, a.output_dtype, index - half, index);
+    }
+}
 extern "C" __global__ void et_reindex(CudaKernelArgs a) {
     et_u64 i = et_thread(); if (i >= a.elements) return;
     if (a.operation == 0) { et_copy(a.inputs[0], a.output, a.output_dtype, et_broadcast(a, i, 0), i); return; }

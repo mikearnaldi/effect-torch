@@ -52,6 +52,7 @@ const TYPED_KERNELS: &[&str] = &[
     "et_binary",
     "et_unary",
     "et_reindex",
+    "et_rotary_reindex",
     "et_where",
     "et_concat",
     "et_index",

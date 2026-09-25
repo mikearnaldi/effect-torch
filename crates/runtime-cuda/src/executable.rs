@@ -158,6 +158,11 @@ impl Instruction {
                 s.tail = parameters.clone();
                 s
             }
+            Self::RotaryReindex { x, width } => {
+                let mut s = KernelSpec::new("et_rotary_reindex", &[Some(*x)]);
+                s.args.integers[0] = *width as u64;
+                s
+            }
             Self::Where { cond, a, b, .. } => {
                 KernelSpec::new("et_where", &[Some(*cond), Some(*a), Some(*b)])
             }
@@ -659,6 +664,10 @@ pub(super) enum Instruction {
         op: u32,
         a: usize,
         parameters: Vec<u64>,
+    },
+    RotaryReindex {
+        x: usize,
+        width: usize,
     },
     Where {
         cond: usize,

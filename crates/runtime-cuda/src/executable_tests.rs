@@ -87,6 +87,24 @@ fn lower_with(
                     a: child(a),
                     parameters: Vec::new(),
                 },
+                NodeKind::Slice { a, ranges } => Instruction::Reindex {
+                    op: 2,
+                    a: child(a),
+                    parameters: ranges
+                        .iter()
+                        .flat_map(|(start, end, step)| [*start as u64, *end as u64, *step as u64])
+                        .collect(),
+                },
+                NodeKind::Neg { a } => Instruction::Unary {
+                    op: 0,
+                    a: child(a),
+                    parameter: 0.0,
+                },
+                NodeKind::Concat { a, b, dim } => Instruction::Concat {
+                    a: child(a),
+                    b: child(b),
+                    dim: *dim as u32,
+                },
                 NodeKind::ExpertLinearRows { x, weight, indexes } => {
                     Instruction::ExpertLinearRows {
                         x: child(x),
@@ -507,6 +525,59 @@ fn rms_norm_reads_outer_permutation_as_a_row_view() {
             ..
         }
     )));
+}
+
+#[test]
+fn rotary_half_reindex_folds_slices_negation_and_concat() {
+    let source = input(0, &[2, 3, 8], DType::BF16);
+    let first = Node::new(NodeKind::Slice {
+        a: source.clone(),
+        ranges: vec![(0, 2, 1), (0, 3, 1), (0, 4, 1)],
+    })
+    .unwrap();
+    let second = Node::new(NodeKind::Slice {
+        a: source.clone(),
+        ranges: vec![(0, 2, 1), (0, 3, 1), (4, 8, 1)],
+    })
+    .unwrap();
+    let negative = Node::new(NodeKind::Neg { a: second }).unwrap();
+    let root = Node::new(NodeKind::Concat {
+        a: negative,
+        b: first,
+        dim: 2,
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let rotary = commands
+        .iter()
+        .find(|command| {
+            matches!(
+                command.kind,
+                CommandKind::Kernel {
+                    name: "et_rotary_reindex",
+                    ..
+                }
+            )
+        })
+        .expect("rotary reindex command");
+    let CommandKind::Kernel { args, inputs, .. } = &rotary.kind else {
+        unreachable!()
+    };
+    assert_eq!(args.integers[0], 8);
+    assert_eq!(program.values[inputs[0].unwrap().index()].shape, [2, 3, 8]);
+    let kernels = commands
+        .iter()
+        .filter_map(|command| match &command.kind {
+            CommandKind::Kernel { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !kernels
+            .iter()
+            .any(|name| matches!(*name, "et_reindex" | "et_unary" | "et_concat")),
+        "{kernels:?}"
+    );
 }
 
 #[test]

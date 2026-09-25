@@ -377,6 +377,65 @@ fn reshape_view(view: &ElementwiseView, shape: &[usize]) -> Option<ElementwiseVi
     })
 }
 
+fn rotary_reindex_source(node: &Node, index: &GraphIndex) -> Option<(DenseNodeId, usize)> {
+    if !node.dtype.is_float() {
+        return None;
+    }
+    let NodeKind::Concat { a, b, dim } = &node.kind else {
+        return None;
+    };
+    let NodeKind::Neg { a: negative } = &a.kind else {
+        return None;
+    };
+    let NodeKind::Slice {
+        a: negative_source,
+        ranges: negative_ranges,
+    } = &negative.kind
+    else {
+        return None;
+    };
+    let NodeKind::Slice {
+        a: positive_source,
+        ranges: positive_ranges,
+    } = &b.kind
+    else {
+        return None;
+    };
+    if negative_source.id != positive_source.id
+        || *dim + 1 != negative_source.shape.len()
+        || node.shape != negative_source.shape
+        || negative_ranges.len() != negative_source.shape.len()
+        || positive_ranges.len() != negative_source.shape.len()
+    {
+        return None;
+    }
+    let width = negative_source.shape[*dim];
+    if width == 0 || width % 2 != 0 {
+        return None;
+    }
+    let half = width / 2;
+    for (dimension, &size) in negative_source.shape.iter().enumerate() {
+        let negative_expected = if dimension == *dim {
+            (half, width, 1)
+        } else {
+            (0, size, 1)
+        };
+        let positive_expected = if dimension == *dim {
+            (0, half, 1)
+        } else {
+            (0, size, 1)
+        };
+        if negative_ranges[dimension] != negative_expected
+            || positive_ranges[dimension] != positive_expected
+        {
+            return None;
+        }
+    }
+    index
+        .dense_id(negative_source.id)
+        .map(|source| (source, width))
+}
+
 fn compact_inner_scatter_indexes(
     node: &Node,
     index: &GraphIndex,
@@ -562,6 +621,35 @@ impl CudaProgramBuilder {
                     NodeKind::Reshape { .. } => Self::feeds_only_grouped_input(index, consumer),
                     _ => false,
                 }
+            })
+    }
+
+    fn feeds_only_rotary_reindex(index: &GraphIndex, dense: DenseNodeId) -> bool {
+        if index.roots.iter().any(|root| root.index() == dense.index()) {
+            return false;
+        }
+        let Some(producer) = index.node(dense) else {
+            return false;
+        };
+        let Some(consumers) = index.consumers_of(dense) else {
+            return false;
+        };
+        !consumers.is_empty()
+            && consumers.iter().all(|&consumer| {
+                let Some(node) = index.node(consumer) else {
+                    return false;
+                };
+                if rotary_reindex_source(node, index).is_some() {
+                    return matches!(
+                        &node.kind,
+                        NodeKind::Concat { a, b, .. }
+                            if a.id == producer.id || b.id == producer.id
+                    );
+                }
+                let NodeKind::Neg { a } = &node.kind else {
+                    return false;
+                };
+                a.id == producer.id && Self::feeds_only_rotary_reindex(index, consumer)
             })
     }
 
@@ -1030,10 +1118,22 @@ impl CudaProgramBuilder {
                 .all(|result| result.completion == ResultCompletion::Direct);
         let fused_consumer = Self::feeds_only_fused_consumer(index, optimization, dense);
         let grouped_input = Self::feeds_only_grouped_input(index, dense);
+        let rotary_reindex = Self::feeds_only_rotary_reindex(index, dense);
         let rms_input = Self::feeds_only_rms_input(index, dense);
+        if let NodeKind::Neg { a } = &node.kind {
+            if rotary_reindex {
+                let parent = index
+                    .dense_id(a.id)
+                    .ok_or("compile: CUDA rotary negation source is missing")?;
+                let source = self.resolve(parent.index())?;
+                self.semantic_values[dense.index()] = Some(source);
+                self.semantic_results[dense.index()] = vec![source];
+                return Ok(());
+            }
+        }
         if direct_boundary
             && boundary_storage.representation == StorageRepresentation::Dense
-            && (fused_consumer || grouped_input || rms_input)
+            && (fused_consumer || grouped_input || rotary_reindex || rms_input)
         {
             if let NodeKind::BroadcastTo { a, .. } = &node.kind {
                 if grouped_input
@@ -1106,7 +1206,10 @@ impl CudaProgramBuilder {
                 }
             }
             if let NodeKind::Slice { a, ranges } = &node.kind {
-                if fused_consumer && node.dtype == a.dtype && ranges.len() == a.shape.len() {
+                if (fused_consumer || rotary_reindex)
+                    && node.dtype == a.dtype
+                    && ranges.len() == a.shape.len()
+                {
                     let parent = index
                         .dense_id(a.id)
                         .ok_or("compile: CUDA slice source is missing")?;
@@ -1279,6 +1382,19 @@ impl CudaProgramBuilder {
             return Ok(());
         }
         let native_gemm = self.gemms.operations[dense.index()];
+        let instruction = match instruction {
+            Instruction::Concat { a, b, dim } => {
+                if let Some((source, width)) = rotary_reindex_source(node, index) {
+                    Instruction::RotaryReindex {
+                        x: source.index(),
+                        width,
+                    }
+                } else {
+                    Instruction::Concat { a, b, dim }
+                }
+            }
+            instruction => instruction,
+        };
         let output = match instruction {
             Instruction::GroupedExpertLinearRows { x, weight, indexes } => {
                 self.grouped_expert(x, weight, indexes)?

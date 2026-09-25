@@ -21,6 +21,8 @@ mod grouped_expert_tests;
 #[cfg(test)]
 mod rms_tests;
 #[cfg(test)]
+mod rotary_tests;
+#[cfg(test)]
 mod sum_tests;
 
 #[cfg(feature = "napi-addon")]
