@@ -30,6 +30,7 @@ impl CudaCapabilities {
         features.push("rotary-half-reindex-v1".into());
         features.push("sum-f32-warp-or-block1024-vector4-v2".into());
         features.push("fused-elementwise-nvrtc-v1".into());
+        features.push("fused-elementwise-repeat-view-v1".into());
         features.push("fused-elementwise-strided-views-v2".into());
         features.push("scatter-add-compact-inner-index-v1".into());
         if bf16_gemm {

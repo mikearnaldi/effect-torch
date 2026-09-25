@@ -26,9 +26,9 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-fn lane_offset(strides: &[usize], shape: &[usize], base: usize) -> String {
+fn lane_offset(strides: &[usize], moduli: &[usize], shape: &[usize], base: usize) -> String {
     let contiguous = contiguous_strides(shape);
-    if strides == contiguous {
+    if strides == contiguous && moduli.iter().all(|&modulus| modulus == 0) {
         return if base == 0 {
             "i".into()
         } else {
@@ -40,7 +40,7 @@ fn lane_offset(strides: &[usize], shape: &[usize], base: usize) -> String {
         if shape[dimension] == 1 || strides[dimension] == 0 {
             continue;
         }
-        let coordinate = if dimension + 1 == shape.len() {
+        let mut coordinate = if dimension + 1 == shape.len() {
             format!("(i % {}ULL)", shape[dimension])
         } else {
             format!(
@@ -48,6 +48,9 @@ fn lane_offset(strides: &[usize], shape: &[usize], base: usize) -> String {
                 contiguous[dimension], shape[dimension]
             )
         };
+        if moduli[dimension] != 0 {
+            coordinate = format!("({coordinate} % {}ULL)", moduli[dimension]);
+        }
         if strides[dimension] == 1 {
             terms.push(coordinate);
         } else {
@@ -240,20 +243,48 @@ fn emit_expression(
 pub(crate) fn elementwise(
     expression: &KernelExpr,
     lane_strides: &[Box<[usize]>],
+    lane_moduli: &[Box<[usize]>],
     lane_offsets: &[usize],
     shape: &[usize],
 ) -> Result<String, String> {
-    if lane_strides.len() != lane_offsets.len() {
+    if lane_strides.len() != lane_moduli.len() || lane_strides.len() != lane_offsets.len() {
         return Err("CUDA fused expression lane metadata length mismatch".into());
+    }
+    if lane_strides
+        .iter()
+        .zip(lane_moduli)
+        .any(|(strides, moduli)| strides.len() != shape.len() || moduli.len() != shape.len())
+    {
+        return Err("CUDA fused expression lane rank mismatch".into());
     }
     let lanes = lane_strides
         .iter()
+        .zip(lane_moduli)
         .zip(lane_offsets)
-        .map(|(strides, &base)| lane_offset(strides, shape, base))
+        .map(|((strides, moduli), &base)| lane_offset(strides, moduli, shape, base))
         .collect::<Vec<_>>();
     let mut body = String::new();
     let result = emit_expression(expression, &lanes, &mut body)?;
     Ok(format!(
         "extern \"C\" __global__ void et_fused_elementwise(CudaKernelArgs a) {{\n    for (et_u64 i = et_thread(); i < a.elements; i += (et_u64)gridDim.x * blockDim.x) {{\n{body}        et_store(a.output, a.output_dtype, i, {result});\n    }}\n}}\n"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_trailing_lane_wraps_its_coordinate() {
+        let source = elementwise(
+            &KernelExpr::Input(0),
+            &[vec![12, 4, 1].into_boxed_slice()],
+            &[vec![0, 0, 4].into_boxed_slice()],
+            &[0],
+            &[2, 3, 8],
+        )
+        .unwrap();
+
+        assert!(source.contains("((i % 8ULL) % 4ULL)"), "{source}");
+    }
 }

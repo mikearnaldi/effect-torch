@@ -327,6 +327,7 @@ struct ElementwiseView {
     source: ValueId,
     shape: Vec<usize>,
     strides: Vec<usize>,
+    moduli: Vec<usize>,
     offset: usize,
 }
 
@@ -349,6 +350,9 @@ fn contiguous_strides(shape: &[usize]) -> Result<Vec<usize>, String> {
 }
 
 fn reshape_view(view: &ElementwiseView, shape: &[usize]) -> Option<ElementwiseView> {
+    if view.moduli.iter().any(|&modulus| modulus != 0) {
+        return None;
+    }
     let old = view
         .shape
         .iter()
@@ -373,6 +377,7 @@ fn reshape_view(view: &ElementwiseView, shape: &[usize]) -> Option<ElementwiseVi
         source: view.source,
         shape: shape.to_vec(),
         strides,
+        moduli: vec![0; shape.len()],
         offset: view.offset,
     })
 }
@@ -434,6 +439,30 @@ fn rotary_reindex_source(node: &Node, index: &GraphIndex) -> Option<(DenseNodeId
     index
         .dense_id(negative_source.id)
         .map(|source| (source, width))
+}
+
+fn repeated_trailing_concat_source(
+    node: &Node,
+    index: &GraphIndex,
+) -> Option<(DenseNodeId, usize)> {
+    let NodeKind::Concat { a, b, dim } = &node.kind else {
+        return None;
+    };
+    if a.id != b.id
+        || *dim + 1 != node.shape.len()
+        || a.shape.len() != node.shape.len()
+        || a.dtype != node.dtype
+        || a.shape[*dim] == 0
+        || a.shape[*dim].checked_mul(2) != Some(node.shape[*dim])
+        || a.shape
+            .iter()
+            .zip(&node.shape)
+            .enumerate()
+            .any(|(dimension, (source, output))| dimension != *dim && source != output)
+    {
+        return None;
+    }
+    index.dense_id(a.id).map(|source| (source, a.shape[*dim]))
 }
 
 fn compact_inner_scatter_indexes(
@@ -599,6 +628,24 @@ impl CudaProgramBuilder {
                     Some(NodeKind::Reshape { .. })
                 ) && Self::feeds_only_fused_consumer(index, optimization, consumer)
             })
+    }
+
+    fn feeds_direct_fused_consumer(
+        index: &GraphIndex,
+        optimization: &OptimizationPlan,
+        dense: DenseNodeId,
+    ) -> bool {
+        index.consumers_of(dense).is_some_and(|consumers| {
+            !consumers.is_empty()
+                && consumers.iter().all(|consumer| {
+                    optimization.node_region[consumer.index()].is_some_and(|region| {
+                        matches!(
+                            optimization.regions.get(region.index()),
+                            Some(NativeRegion::Elementwise(_))
+                        )
+                    })
+                })
+        })
     }
 
     fn feeds_only_grouped_input(index: &GraphIndex, dense: DenseNodeId) -> bool {
@@ -1135,6 +1182,42 @@ impl CudaProgramBuilder {
             && boundary_storage.representation == StorageRepresentation::Dense
             && (fused_consumer || grouped_input || rotary_reindex || rms_input)
         {
+            if Self::feeds_direct_fused_consumer(index, optimization, dense) {
+                if let Some((parent, modulus)) = repeated_trailing_concat_source(node, index) {
+                    let source = self.resolve(parent.index())?;
+                    let source_shape = &index
+                        .node(parent)
+                        .ok_or("compile: CUDA repeated concat source is missing")?
+                        .shape;
+                    let base =
+                        self.elementwise_views[parent.index()]
+                            .clone()
+                            .unwrap_or(ElementwiseView {
+                                source,
+                                shape: source_shape.clone(),
+                                strides: contiguous_strides(source_shape)?,
+                                moduli: vec![0; node.shape.len()],
+                                offset: 0,
+                            });
+                    if base.moduli.iter().all(|&value| value == 0) {
+                        let mut moduli = base.moduli.clone();
+                        *moduli
+                            .last_mut()
+                            .ok_or("compile: CUDA repeated concat rank is zero")? = modulus;
+                        let view = ElementwiseView {
+                            source: base.source,
+                            shape: node.shape.clone(),
+                            strides: base.strides,
+                            moduli,
+                            offset: base.offset,
+                        };
+                        self.semantic_values[dense.index()] = Some(base.source);
+                        self.semantic_results[dense.index()] = vec![base.source];
+                        self.elementwise_views[dense.index()] = Some(view);
+                        return Ok(());
+                    }
+                }
+            }
             if let NodeKind::BroadcastTo { a, .. } = &node.kind {
                 if grouped_input
                     && a.shape.len() == 3
@@ -1171,13 +1254,16 @@ impl CudaProgramBuilder {
                                 source,
                                 shape: a.shape.clone(),
                                 strides: contiguous_strides(&a.shape)?,
+                                moduli: vec![0; a.shape.len()],
                                 offset: 0,
                             });
                     let rank_offset = node.shape.len() - a.shape.len();
                     let mut strides = Vec::with_capacity(node.shape.len());
+                    let mut moduli = Vec::with_capacity(node.shape.len());
                     for (dimension, &size) in node.shape.iter().enumerate() {
                         if dimension < rank_offset {
                             strides.push(0);
+                            moduli.push(0);
                             continue;
                         }
                         let source_dimension = dimension - rank_offset;
@@ -1192,11 +1278,17 @@ impl CudaProgramBuilder {
                         } else {
                             base.strides[source_dimension]
                         });
+                        moduli.push(if source_size == 1 {
+                            0
+                        } else {
+                            base.moduli[source_dimension]
+                        });
                     }
                     let view = ElementwiseView {
                         source: base.source,
                         shape: node.shape.clone(),
                         strides,
+                        moduli,
                         offset: base.offset,
                     };
                     self.semantic_values[dense.index()] = Some(base.source);
@@ -1221,6 +1313,7 @@ impl CudaProgramBuilder {
                                 source,
                                 shape: a.shape.clone(),
                                 strides: contiguous_strides(&a.shape)?,
+                                moduli: vec![0; a.shape.len()],
                                 offset: 0,
                             });
                     let mut offset = base.offset;
@@ -1253,6 +1346,7 @@ impl CudaProgramBuilder {
                         source: base.source,
                         shape: node.shape.clone(),
                         strides,
+                        moduli: vec![0; node.shape.len()],
                         offset,
                     };
                     self.semantic_values[dense.index()] = Some(base.source);
@@ -1282,16 +1376,22 @@ impl CudaProgramBuilder {
                                 source,
                                 shape: a.shape.clone(),
                                 strides: contiguous_strides(&a.shape)?,
+                                moduli: vec![0; a.shape.len()],
                                 offset: 0,
                             });
                     let strides = dims
                         .iter()
                         .map(|&dimension| base.strides[dimension])
                         .collect::<Vec<_>>();
+                    let moduli = dims
+                        .iter()
+                        .map(|&dimension| base.moduli[dimension])
+                        .collect::<Vec<_>>();
                     let view = ElementwiseView {
                         source: base.source,
                         shape: node.shape.clone(),
                         strides,
+                        moduli,
                         offset: base.offset,
                     };
                     self.semantic_values[dense.index()] = Some(base.source);
@@ -1680,6 +1780,8 @@ impl CudaProgramBuilder {
             .ok_or("compile: CUDA fused region has no expression")?;
         let mut inputs = [None; 8];
         let mut lane_strides = region.lane_strides.to_vec();
+        let mut lane_moduli =
+            vec![vec![0; region.shape.len()].into_boxed_slice(); region.inputs.len()];
         let mut lane_offsets = vec![0; region.inputs.len()];
         for (slot, semantic) in region.inputs.iter().enumerate() {
             if let Some(view) = &self.elementwise_views[semantic.index()] {
@@ -1693,14 +1795,20 @@ impl CudaProgramBuilder {
                 }
                 inputs[slot] = Some(view.source);
                 lane_strides[slot] = view.strides.clone().into_boxed_slice();
+                lane_moduli[slot] = view.moduli.clone().into_boxed_slice();
                 lane_offsets[slot] = view.offset;
             } else {
                 inputs[slot] = Some(self.resolve(semantic.index())?);
             }
         }
         let output = self.planned(region.shape.to_vec(), region.dtype, "fused_elementwise")?;
-        let source =
-            crate::emit::elementwise(expression, &lane_strides, &lane_offsets, &region.shape)?;
+        let source = crate::emit::elementwise(
+            expression,
+            &lane_strides,
+            &lane_moduli,
+            &lane_offsets,
+            &region.shape,
+        )?;
         let function = device.fused_elementwise(&source)?;
         let mut args = CudaKernelArgs {
             elements: product_checked(&region.shape)? as u64,
