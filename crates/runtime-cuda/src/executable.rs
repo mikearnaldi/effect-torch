@@ -7,7 +7,7 @@ use crate::lowering::{
 use crate::value::element_count;
 use crate::workspace::{self, CudaMemorySpace, InvocationResources, CUDA_STORAGE_ALIGNMENT};
 use crate::{CudaDevice, CudaValue};
-use cudarc::driver::{sys, CudaGraph, DeviceRepr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{sys, CudaEvent, CudaGraph, DeviceRepr, LaunchConfig, PushKernelArg};
 use effect_torch_compiler::{
     build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport,
     DiagnosticsInput, GraphIndex, LoweringUnit, MemoryPlannerConfig, ProgramRequest,
@@ -18,7 +18,7 @@ use effect_torch_runtime::{
     CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, KvLayerDescriptor, MemoryPlan,
     StateAccessMode, ValueId,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -2476,6 +2476,23 @@ impl CudaExecutable {
             std::env::var("EFFECT_TORCH_CUDA_GRAPH_TRACE").is_ok_and(|value| value == "1");
         let graphs_requested =
             std::env::var("EFFECT_TORCH_CUDA_GRAPHS").is_ok_and(|value| value == "1");
+        let grouped_profile_path = std::env::var_os("EFFECT_TORCH_CUDA_GROUPED_PROFILE_PATH");
+        let mut grouped_profile = Vec::<(&'static str, CudaEvent, CudaEvent)>::new();
+        let mut gemm_profile =
+            Vec::<(usize, usize, usize, usize, bool, bool, CudaEvent, CudaEvent)>::new();
+        let mut grouped_activation_start = None::<CudaEvent>;
+        let mut grouped_control_wait_ms = Vec::<f64>::new();
+        let profile_event = || -> Result<Option<CudaEvent>, String> {
+            grouped_profile_path
+                .is_some()
+                .then(|| {
+                    self.device
+                        .stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()
+        };
         // Node may make stderr nonblocking. Use an explicit append-only file
         // rather than allowing diagnostic output to panic on EAGAIN.
         let mut trace_file = if trace {
@@ -2516,7 +2533,8 @@ impl CudaExecutable {
             && after_gemm.is_none()
             && after_kv.is_none();
         #[cfg(not(test))]
-        let graph_enabled = graph_candidate && graphs_requested && !trace;
+        let graph_enabled =
+            graph_candidate && graphs_requested && !trace && grouped_profile_path.is_none();
         let _graph_execution = graph_enabled
             .then(|| self.device.graph_execution.lock())
             .transpose()
@@ -2758,6 +2776,7 @@ impl CudaExecutable {
                     // SAFETY: lowering checked geometry and binding types. Values
                     // and the invocation fence retain these allocations until the
                     // device stream completes, including cancellation and errors.
+                    let profile_start = profile_event()?;
                     unsafe {
                         self.device.cublas.gemm_bf16(
                             *plan,
@@ -2768,6 +2787,19 @@ impl CudaExecutable {
                             *out_f32,
                             workspace.address(),
                         )?;
+                    }
+                    let profile_end = profile_event()?;
+                    if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                        gemm_profile.push((
+                            plan.m,
+                            plan.n,
+                            plan.k,
+                            plan.batch,
+                            *weight_transposed,
+                            *out_f32,
+                            start,
+                            end,
+                        ));
                     }
                     #[cfg(test)]
                     if let Some(after_gemm) = after_gemm {
@@ -2791,6 +2823,14 @@ impl CudaExecutable {
                     reuse_routing,
                     source_rows,
                 } => {
+                    if *reuse_routing {
+                        let activation_end = profile_event()?;
+                        if let (Some(start), Some(end)) =
+                            (grouped_activation_start.take(), activation_end)
+                        {
+                            grouped_profile.push(("activation", start, end));
+                        }
+                    }
                     let output = self.planned_value(&resources, output_id)?;
                     if *rows != 0 {
                         let address = |id: &ValueId| -> Result<u64, String> {
@@ -2820,21 +2860,33 @@ impl CudaExecutable {
                                 .cloned()
                                 .ok_or("execute: grouped expert routing cache is missing")?
                         } else {
+                            let profile_start = profile_event()?;
                             let control_started = trace.then(std::time::Instant::now);
                             self.launch("et_fill", &args)?;
                             args.elements = *rows as u64;
                             self.launch("et_grouped_counts", &args)?;
                             args.elements = 1;
                             self.launch("et_grouped_offsets", &args)?;
+                            let profile_end = profile_event()?;
+                            if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                grouped_profile.push(("control", start, end));
+                            }
                             // This is an explicit non-capturable host completion point.
                             // Only status and E+1 offsets cross the host. No padded
                             // groups, activations, weights, or row maps are read back.
                             let readback_started = trace.then(std::time::Instant::now);
+                            let control_wait_started = grouped_profile_path
+                                .as_ref()
+                                .map(|_| std::time::Instant::now());
                             let offsets = self
                                 .device
                                 .stream
                                 .clone_dtoh(&control)
                                 .map_err(|e| e.to_string())?;
+                            if let Some(started) = control_wait_started {
+                                grouped_control_wait_ms
+                                    .push(started.elapsed().as_secs_f64() * 1000.0);
+                            }
                             if let Some(started) = control_started {
                                 emit_trace(serde_json::json!({
                                     "event": "grouped_control", "program": format!("{self:p}"), "run": run,
@@ -2871,11 +2923,17 @@ impl CudaExecutable {
                             self.launch("et_fill", &args)?;
                         } else if *columns != 0 {
                             if !*reuse_routing {
+                                let profile_start = profile_event()?;
                                 args.elements = *rows as u64;
                                 args.inputs[1] = control.address();
                                 args.output = row_map.address();
                                 self.launch("et_grouped_rows", &args)?;
+                                let profile_end = profile_event()?;
+                                if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                    grouped_profile.push(("row_map", start, end));
+                                }
                             }
+                            let profile_start = profile_event()?;
                             args.inputs[0] = address(x)?;
                             args.inputs[1] = row_map.address();
                             args.output = gathered.address();
@@ -2884,6 +2942,18 @@ impl CudaExecutable {
                             args.integers[0] = *inner as u64;
                             args.integers[1] = *source_rows as u64;
                             self.launch("et_grouped_gather", &args)?;
+                            let profile_end = profile_event()?;
+                            if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                grouped_profile.push((
+                                    if *reuse_routing {
+                                        "second_gather"
+                                    } else {
+                                        "first_gather"
+                                    },
+                                    start,
+                                    end,
+                                ));
+                            }
                             let width = meta.dtype.size_in_bytes();
                             let weights = address(weight)?;
                             let workspace = workspace
@@ -2933,6 +3003,7 @@ impl CudaExecutable {
                                 // SAFETY: every group uses checked geometry and
                                 // invocation-planned allocations retained by the fence.
                                 unsafe {
+                                    let profile_start = profile_event()?;
                                     let events = self.device.grouped_gemm_bf16(
                                         &bf16_groups,
                                         workspace
@@ -2940,6 +3011,21 @@ impl CudaExecutable {
                                             .ok_or("grouped GEMM workspace missing")?
                                             .address(),
                                     )?;
+                                    let profile_end = profile_event()?;
+                                    if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                        grouped_profile.push((
+                                            if *reuse_routing {
+                                                "second_projection"
+                                            } else {
+                                                "first_projection"
+                                            },
+                                            start,
+                                            end,
+                                        ));
+                                        if !*reuse_routing {
+                                            grouped_activation_start = profile_event()?;
+                                        }
+                                    }
                                     fence.worker_events.extend(events);
                                 }
                             }
@@ -2951,7 +3037,20 @@ impl CudaExecutable {
                             args.output = output.storage_address();
                             args.elements = (*rows * *columns) as u64;
                             args.integers[0] = *columns as u64;
+                            let profile_start = profile_event()?;
                             self.launch("et_grouped_scatter", &args)?;
+                            let profile_end = profile_event()?;
+                            if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                grouped_profile.push((
+                                    if *reuse_routing {
+                                        "second_scatter"
+                                    } else {
+                                        "first_scatter"
+                                    },
+                                    start,
+                                    end,
+                                ));
+                            }
                         }
                     }
                     output
@@ -3168,6 +3267,61 @@ impl CudaExecutable {
         self.status_result(failure)?;
         if cancelled.is_cancelled() {
             return Err("operation aborted".into());
+        }
+        if let Some(path) = grouped_profile_path {
+            let mut phases = BTreeMap::<&str, (usize, f64)>::new();
+            for (phase, start, end) in grouped_profile {
+                let elapsed = start.elapsed_ms(&end).map_err(|error| error.to_string())? as f64;
+                let total = phases.entry(phase).or_default();
+                total.0 += 1;
+                total.1 += elapsed;
+            }
+            let mut gemms =
+                BTreeMap::<(usize, usize, usize, usize, bool, bool), (usize, f64)>::new();
+            for (m, n, k, batch, weight_transposed, out_f32, start, end) in gemm_profile {
+                let elapsed = start.elapsed_ms(&end).map_err(|error| error.to_string())? as f64;
+                let total = gemms
+                    .entry((m, n, k, batch, weight_transposed, out_f32))
+                    .or_default();
+                total.0 += 1;
+                total.1 += elapsed;
+            }
+            let record = serde_json::json!({
+                "program": format!("{self:p}"),
+                "run": run,
+                "phases": phases.into_iter().map(|(phase, (count, milliseconds))| {
+                    serde_json::json!({
+                        "phase": phase,
+                        "count": count,
+                        "milliseconds": milliseconds
+                    })
+                }).collect::<Vec<_>>(),
+                "gemms": gemms.into_iter().map(|
+                    ((m, n, k, batch, weight_transposed, out_f32), (count, milliseconds))
+                | {
+                    serde_json::json!({
+                        "m": m,
+                        "n": n,
+                        "k": k,
+                        "batch": batch,
+                        "weightTransposed": weight_transposed,
+                        "outF32": out_f32,
+                        "count": count,
+                        "milliseconds": milliseconds
+                    })
+                }).collect::<Vec<_>>(),
+                "controlReadbackAndWait": {
+                    "count": grouped_control_wait_ms.len(),
+                    "milliseconds": grouped_control_wait_ms.iter().sum::<f64>()
+                }
+            });
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| format!("execute: CUDA grouped profile file: {error}"))?;
+            std::io::Write::write_all(&mut file, format!("{record}\n").as_bytes())
+                .map_err(|error| format!("execute: CUDA grouped profile write: {error}"))?;
         }
         if graph_trace {
             if let Some(runtime) = graph_runtime.as_ref() {
