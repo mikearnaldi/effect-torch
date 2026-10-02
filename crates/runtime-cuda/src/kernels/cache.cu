@@ -222,5 +222,5 @@ extern "C" __global__ void et_kv_gemm_round(CudaKernelArgs a) {
     et_u64 i=et_thread(); if (i>=a.elements) return;
     et_u64 dim=a.integers[10], tokens=a.integers[15], head=i/(tokens*dim), t=(i/dim)%tokens;
     et_u64 row=a.operation?t*a.integers[11]+head:head*a.integers[7]+t;
-    ((float*)a.output)[row*dim+i%dim]=et_kv_round(((float*)a.inputs[2])[i],3);
+    et_store(a.output,a.output_dtype,row*dim+i%dim,et_kv_round(((float*)a.inputs[2])[i],3));
 }

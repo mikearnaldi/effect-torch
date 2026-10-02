@@ -2102,6 +2102,35 @@ export interface SamplingRuntime {
  */
 export interface DecodeRuntime {
   /**
+   * Optional read-only body, stateless readout, and stateless processor pipeline.
+   * Preparation performs no execution or random-number consumption. Undefined
+   * means unsupported; execution failures must never trigger fallback or retry.
+   * The first body binding is a U32 host input; remaining bindings are borrowed.
+   * Execution transfers one device output and an independent F32 host copy after
+   * transfer completion, reclaiming unpublished outputs on failure/interruption.
+   */
+  readonly prepareProcessedReadOnly?:
+    | ((request: {
+      readonly body: ExecutableHandle
+      readonly readout?: ExecutableHandle | undefined
+      readonly processor: ExecutableHandle
+      readonly hostShape: ReadonlyArray<number>
+    }) => Effect.Effect<
+      {
+        readonly execute: (request: {
+          readonly hostInput: Uint32Array
+          readonly bindings: ReadonlyArray<ConcreteTensorHandle>
+          readonly state: ReadOnlyStateInvocation
+          readonly scalar: number
+        }) => Effect.Effect<{
+          readonly device: ConcreteTensorHandle
+          readonly host: Float32Array
+        }, BackendError>
+      } | undefined,
+      BackendError
+    >)
+    | undefined
+  /**
    * Allocates a fixed-capacity decode-state pool. KV arenas and prefix-cache
    * content are shared by child sequences, while each sequence owns independent
    * mutable recurrent state. The returned pool belongs to this runtime and is

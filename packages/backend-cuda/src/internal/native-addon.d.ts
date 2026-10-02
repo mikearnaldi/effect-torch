@@ -17,6 +17,8 @@ export declare class CudaRuntime {
   fromBytes(data: Uint8Array, dimensions: Array<number>, dtype: string): LazyTensor
   uploadBytes(data: Uint8Array, dimensions: Array<number>, dtype: string): NativeTensor
   fromMaterialized(tensor: NativeTensor): LazyTensor
+  /** Materializes a bounded set of existing scalar F32/U32 byte literals. */
+  materializeLiterals89(roots: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   graphNode(operation: string, inputs: Array<LazyTensor>, encodedAttributes: string): LazyTensor
   add(a: LazyTensor, b: LazyTensor): LazyTensor
   compile(roots: Array<LazyTensor>, options?: NativeCompileOptions | undefined | null, state?: NativeKvStateSchema | undefined | null): Executable
@@ -40,7 +42,13 @@ export declare class Executable {
   get convKernel(): number
   get device(): string
   get instructionCount(): number
+  /** Private diagnostic fork: two immutable templates, one request RNG stream. */
+  forkRequestRng99(peer: Executable, seed: number): Array<Executable>
   executeReadOnly(bindings: Array<NativeTensor>, prefixes: Array<NativeKvPrefix>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+  executeChain96(head: Executable | undefined | null, sampler: Executable, bindings: Array<NativeTensor>, prefixes: Array<NativeKvPrefix>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, temperature: number, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+  /** Pure immutable admission for the host-input / processed-output pipeline. */
+  supportsChain97(head: Executable | undefined | null, sampler: Executable, width: number): boolean
+  executeChain97(head: Executable | undefined | null, sampler: Executable, canvas: Uint32Array, bindings: Array<NativeTensor>, prefixes: Array<NativeKvPrefix>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, temperature: number, token?: CancellationToken | undefined | null): Promise<NativeChain97Output>
   execute(bindings: Array<NativeTensor>, scalars: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   executeStateful(bindings: Array<NativeTensor>, sequences: Array<NativeKvSequence>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, advances: Array<number>, tokens: Array<Array<number>>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   executeSampled(bindings: Array<NativeTensor>, sequences: Array<NativeKvSequence>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, advances: Array<number>, tokens: Array<Array<number>>, sampling: Array<NativeSamplingOptions>, token?: CancellationToken | undefined | null): Promise<Array<number>>
@@ -133,6 +141,11 @@ export declare function isAvailable(): boolean
 export declare function loadGgufForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeGgufArchive>
 
 export declare function loadTensors(path: string, device: number, token?: CancellationToken | undefined | null, names?: Array<string> | undefined | null): Promise<NativeSafetensorsArchive>
+
+export interface NativeChain97Output {
+  feedback: NativeTensor
+  statistics: Buffer
+}
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined

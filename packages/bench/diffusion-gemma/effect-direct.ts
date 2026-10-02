@@ -15,6 +15,7 @@ const manifestPath = process.env.MANIFEST ?? path.join(directory, "manifest.json
 const manifest = loadManifest(manifestPath)
 const modelPath = process.env.MODEL_PATH
 const initializedStatePath = process.env.INITIALIZED_STATE_PATH
+const traceGeneration = process.env.GENERATION_TRACE === "1"
 
 const defaults = DiffusionGemma.generationDefaults
 if (
@@ -62,6 +63,11 @@ interface PreparedPrompt extends PromptCase {
 
 interface RequestMeasurement {
   readonly prompt: PreparedPrompt
+  readonly seed: number
+  readonly tokens: Uint32Array
+  readonly refinements: number
+  readonly blocks: number
+  readonly trace: ReadonlyArray<Diffusion.Progress>
   readonly generatedTokens: number
   readonly elapsedMilliseconds: number
   readonly firstPageMilliseconds: number
@@ -89,7 +95,8 @@ const runRequest = (
   Effect.gen(function*() {
     const started = performance.now()
     let firstPageMilliseconds: number | undefined
-    const result = yield* DiffusionGemma.generate(artifact, prompt.ids, {
+    const trace: Array<Diffusion.Progress> = []
+    let options: DiffusionGemma.GenerateOptions = {
       maxNewTokens: outputTokens,
       maxSteps: manifest.generation.maxSteps,
       entropyBound: manifest.generation.entropyBound,
@@ -105,11 +112,26 @@ const runRequest = (
         Effect.sync(() => {
           firstPageMilliseconds ??= performance.now() - started
         })
-    })
+    }
+    if (traceGeneration) {
+      options = {
+        ...options,
+        onProgress: (progress) =>
+          Effect.sync(() => {
+            trace.push(progress)
+          })
+      }
+    }
+    const result = yield* DiffusionGemma.generate(artifact, prompt.ids, options)
     const elapsedMilliseconds = performance.now() - started
 
     return {
       prompt,
+      seed,
+      tokens: result.tokens,
+      refinements: result.refinements,
+      blocks: result.blocks,
+      trace,
       generatedTokens: result.tokens.length,
       elapsedMilliseconds,
       firstPageMilliseconds: firstPageMilliseconds ?? elapsedMilliseconds,
@@ -179,6 +201,8 @@ const suite = Effect.scoped(Effect.gen(function*() {
   const compileStarted = performance.now()
   const model = DiffusionGemma.fromTensors(loaded, { ...loaded.tensors, ...initializedState })
   const artifact = yield* Diffusion.compile(model.definition, model.parameters, {
+    fuseFullReadout: process.env.DIFFUSION_FUSED_READOUT === "1",
+    cachePositions: process.env.DIFFUSION_CACHE_POSITIONS === "1",
     maxTokens: manifest.deployment.maxTokens,
     blockSize: 16,
     prefillChunks: [16, 64, 256, 512],
@@ -224,23 +248,29 @@ const suite = Effect.scoped(Effect.gen(function*() {
           const requestMilliseconds = measured.requests.map((request) => request.elapsedMilliseconds)
           const firstPageMilliseconds = measured.requests.map((request) => request.firstPageMilliseconds)
 
-          writeRecord(JSON.stringify({
+          const record = {
             schemaVersion: manifest.schemaVersion,
             timestamp: new Date().toISOString(),
             boundary: "direct",
             engine: "effect-torch",
+            measurementMode: traceGeneration ? "generation-diagnostic" : "timing",
             model: manifest.model,
             generation: manifest.generation,
             deployment: manifest.deployment,
             targetPromptTokens: target,
             actualPromptTokens: prompts.map((prompt) => prompt.ids.length),
             promptIds: prompts.map((prompt) => prompt.id),
+            promptTokenIds: prompts.map((prompt) => Array.from(prompt.ids)),
             promptContentSha256: prompts.map((prompt) => prompt.contentSha256),
             requestedOutputTokens: outputTokens,
             concurrency,
             run,
             generatedTokens,
             generatedTokensPerRequest: measured.requests.map((request) => request.generatedTokens),
+            requestSeeds: measured.requests.map((request) => request.seed),
+            generatedTokenIds: measured.requests.map((request) => Array.from(request.tokens)),
+            refinementsPerRequest: measured.requests.map((request) => request.refinements),
+            blocksPerRequest: measured.requests.map((request) => request.blocks),
             elapsedMilliseconds: measured.elapsedMilliseconds,
             requestMilliseconds,
             firstPageMilliseconds,
@@ -266,7 +296,21 @@ const suite = Effect.scoped(Effect.gen(function*() {
             compileMilliseconds,
             warmupMilliseconds,
             rssBytes: process.memoryUsage().rss
-          }))
+          }
+          if (traceGeneration) {
+            Object.assign(record, {
+              generationTrace: measured.requests.map((request) =>
+                request.trace.map((progress) => ({
+                  block: progress.block.index,
+                  step: progress.step.index,
+                  remaining: progress.step.remaining,
+                  done: progress.done,
+                  argmaxTokens: Array.from(progress.draft)
+                }))
+              )
+            })
+          }
+          writeRecord(JSON.stringify(record))
         }
 
         if (manifest.matrix.cooldownMilliseconds > 0) {

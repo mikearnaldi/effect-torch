@@ -228,7 +228,24 @@ impl TargetDTypeCapabilities for CpuDTypeCapabilities {
                     );
                 }
             }
-            NativeRegion::LinearResidual(_) | NativeRegion::LinearGelu(_) => {
+            NativeRegion::DualArgmax(_)
+            | NativeRegion::RouterTail(_)
+            | NativeRegion::AttentionFfnEntrance(_)
+            | NativeRegion::RmsResidual(_)
+            | NativeRegion::FfnNextNorm(_)
+            | NativeRegion::FfnTail(_)
+            | NativeRegion::VNormKvAttention(_)
+            | NativeRegion::NormRope(_)
+            | NativeRegion::GroupedExpertGated(_)
+            | NativeRegion::SmallSoftmax(_)
+            | NativeRegion::Entropy(_)
+            | NativeRegion::Bf16Softmax(_)
+            | NativeRegion::SharedRmsNorm(_)
+            | NativeRegion::ExpertRouteRank(_)
+            | NativeRegion::OrderedScatterReduce(_)
+            | NativeRegion::ElementwiseArgReduce(_)
+            | NativeRegion::LinearResidual(_)
+            | NativeRegion::LinearGelu(_) => {
                 return unsupported(
                     DTypeRequirement::Region,
                     "CPU linear epilogue regions are not implemented by this policy",

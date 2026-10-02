@@ -105,7 +105,19 @@ __device__ unsigned short et_to16(et_i64 x, bool bf) {
 }
 __device__ unsigned short et_to16(unsigned int x, bool bf) { return et_pack16(x, 0, 0, bf); }
 __device__ unsigned short et_to16(unsigned char x, bool bf) { return et_pack16(x, 0, 0, bf); }
-__device__ unsigned short et_to16(float x, bool bf) { return et_to16((double)x, bf); }
+__device__ unsigned short et_to16(float x, bool bf) {
+#ifdef ET_CUDA_F32_BF16_BITS
+    if (bf) {
+        unsigned int bits = __float_as_uint(x);
+        // Match the generic packer's signed canonical quiet NaN. Integer
+        // rounding retains subnormals and signed zeros without FP32 FTZ.
+        if ((bits & 0x7fffffffU) > 0x7f800000U)
+            return (unsigned short)((bits >> 16 & 0x8000U) | 0x7fc0U);
+        return (unsigned short)((bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
+    }
+#endif
+    return et_to16((double)x, bf);
+}
 
 template<class T> __device__ T et_load(et_u64 p, unsigned int dtype, et_u64 i) {
     switch (dtype) {

@@ -5112,6 +5112,7 @@ export const runReadOnlyDecodeProgram = (
 
     const runtime = yield* Runtime.Runtime
 
+    let acquired: ReadonlyArray<Concrete> = []
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       executeProgram(runtime, "readOnlyDecode", program, {
         bindings: concrete,
@@ -5124,7 +5125,87 @@ export const runReadOnlyDecodeProgram = (
           activeMask: [true],
           validLengths: [validLength]
         }
-      }))
+      }).pipe(Effect.onExit((exit) =>
+        Effect.sync(() => {
+          if (Exit.isSuccess(exit)) {
+            acquired = exit.value
+          }
+        })
+      ))).pipe(Effect.onExit((exit) =>
+        // Input release can be interrupted after execution has already
+        // produced outputs, before this helper transfers them to its caller.
+        Exit.isFailure(exit) ? releaseTensors(runtime, acquired) : Effect.void
+      ))
+  })
+
+/**
+ * Attempts a prepared read-only pipeline with a U32 host first binding and a
+ * stateless processor producing one device output and one F32 host output.
+ * Unsupported pipelines return undefined before execution; failures never retry.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const runProcessedReadOnlyDecodeProgram = (
+  program: DecodeProgram,
+  readout: CompiledProgram | undefined,
+  processor: CompiledProgram,
+  hostInput: Uint32Array,
+  hostShape: ReadonlyArray<number>,
+  inputs: ReadonlyArray<Any>,
+  prefix: KvSnapshot,
+  validLength: number,
+  scalar: number
+): Effect.Effect<
+  {
+    readonly device: Concrete
+    readonly host: Float32Array
+  } | undefined,
+  TensorError,
+  Runtime.Runtime
+> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    const prepare = runtime.extensions.decode.prepareProcessedReadOnly
+    if (prepare === undefined) return undefined
+    if (program.batch !== 1 || program.access !== "ReadOnly") {
+      return yield* new TensorError({ op: "processedReadOnly", message: "requires a batch-one read-only program" })
+    }
+    const snapshot = new Uint32Array(hostInput)
+    const prepared = yield* fromBackend(
+      "processedReadOnly",
+      prepare({
+        body: program.handle,
+        readout: readout?.handle,
+        processor: processor.handle,
+        hostShape
+      })
+    )
+    if (prepared === undefined) return undefined
+    let acquired: ReadonlyArray<Concrete> = []
+    return yield* withMaterializedInputs(runtime, inputs, (bindings) =>
+      fromBackend(
+        "processedReadOnly",
+        prepared.execute({
+          hostInput: snapshot,
+          bindings,
+          state: {
+            access: "ReadOnly",
+            prefixes: [prefix.handle],
+            slots: [0],
+            activeMask: [true],
+            validLengths: [validLength]
+          },
+          scalar
+        })
+      ).pipe(Effect.onExit((exit) =>
+        Effect.sync(() => {
+          if (Exit.isSuccess(exit)) {
+            acquired = [exit.value.device]
+          }
+        })
+      )))
+      .pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? releaseTensors(runtime, acquired) : Effect.void))
   })
 
 /**

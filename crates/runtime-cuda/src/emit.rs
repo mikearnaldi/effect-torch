@@ -120,7 +120,7 @@ fn emit_expression(
                     continue;
                 }
                 KernelExpr::Scalar(_) => {
-                    return Err("CUDA fused scalar packs are unsupported".into())
+                    return Err("CUDA fused scalar packs are unsupported".into());
                 }
                 KernelExpr::Const(bits) => {
                     values.push(f32_literal(f64::from_bits(*bits)));
@@ -184,7 +184,7 @@ fn emit_expression(
                 *dtype,
             )?,
             KernelExpr::Semantic(..) => {
-                return Err("CUDA fused semantic marker was not legalized".into())
+                return Err("CUDA fused semantic marker was not legalized".into());
             }
             KernelExpr::Add(..) => binary!(values, "({} + {})"),
             KernelExpr::Sub(..) => binary!(values, "({} - {})"),
@@ -226,7 +226,9 @@ fn emit_expression(
             }
             KernelExpr::GeluTanh(..) => {
                 let value = values.pop().ok_or("CUDA fused GELU operand missing")?;
-                format!("(0.5f * {value} * (1.0f + tanhf(0.7978845608028653559f * ({value} + 0.044715f * {value} * {value} * {value}))))")
+                format!(
+                    "(0.5f * {value} * (1.0f + tanhf(0.7978845608028653559f * ({value} + 0.044715f * {value} * {value} * {value}))))"
+                )
             }
         };
         let temporary = format!("t{temporaries}");
@@ -240,7 +242,28 @@ fn emit_expression(
     Ok(values.pop().unwrap())
 }
 
+#[cfg(test)]
 pub(crate) fn elementwise(
+    expression: &KernelExpr,
+    lane_strides: &[Box<[usize]>],
+    lane_moduli: &[Box<[usize]>],
+    lane_offsets: &[usize],
+    shape: &[usize],
+) -> Result<String, String> {
+    elementwise_with_sum(
+        false,
+        false,
+        expression,
+        lane_strides,
+        lane_moduli,
+        lane_offsets,
+        shape,
+    )
+}
+
+pub(crate) fn elementwise_with_sum(
+    wide_sum: bool,
+    wide_arg: bool,
     expression: &KernelExpr,
     lane_strides: &[Box<[usize]>],
     lane_moduli: &[Box<[usize]>],
@@ -265,14 +288,146 @@ pub(crate) fn elementwise(
         .collect::<Vec<_>>();
     let mut body = String::new();
     let result = emit_expression(expression, &lanes, &mut body)?;
+    if wide_arg {
+        return Ok(format!(
+            r#"
+extern "C" __global__ __launch_bounds__(1024) void et_fused_elementwise(CudaKernelArgs a) {{
+    et_u64 width = a.integers[1];
+    __shared__ float values[32];
+    __shared__ unsigned int indexes[32];
+    unsigned int lane = threadIdx.x & 31U, warp = threadIdx.x / 32;
+    for (et_u64 row = blockIdx.x; row < a.elements; row += gridDim.x) {{
+        float best = a.operation == 0 ? -1.0f / 0.0f : 1.0f / 0.0f;
+        unsigned int best_index = 0xffffffffU;
+        for (et_u64 column = threadIdx.x; column < width; column += 1024) {{
+            et_u64 i = row * width + column;
+{body}
+            float value = {result};
+            bool better = !isnan(value) && (
+                (a.operation == 0 && value > best) ||
+                (a.operation == 1 && value < best) ||
+                (value == best && column < best_index)
+            );
+            if (better) {{ best = value; best_index = (unsigned int)column; }}
+        }}
+        for (unsigned int offset = 16; offset; offset >>= 1) {{
+            float other = __shfl_down_sync(0xffffffffU, best, offset);
+            unsigned int other_index = __shfl_down_sync(0xffffffffU, best_index, offset);
+            bool better = (a.operation == 0 && other > best) ||
+                (a.operation == 1 && other < best) ||
+                (other == best && other_index < best_index);
+            if (better) {{ best = other; best_index = other_index; }}
+        }}
+        if (!lane) {{ values[warp] = best; indexes[warp] = best_index; }}
+        __syncthreads();
+        if (!warp) {{
+            best = values[lane]; best_index = indexes[lane];
+            for (unsigned int offset = 16; offset; offset >>= 1) {{
+                float other = __shfl_down_sync(0xffffffffU, best, offset);
+                unsigned int other_index = __shfl_down_sync(0xffffffffU, best_index, offset);
+                bool better = (a.operation == 0 && other > best) ||
+                    (a.operation == 1 && other < best) ||
+                    (other == best && other_index < best_index);
+                if (better) {{ best = other; best_index = other_index; }}
+            }}
+            if (!lane) {{
+                et_u64 i = row * width;
+{body}
+                if (isnan({result})) best_index = 0;
+                et_store(a.output, a.output_dtype, row, (et_i64)best_index);
+            }}
+        }}
+        __syncthreads();
+    }}
+}}
+"#
+        ));
+    }
+    if wide_sum {
+        return Ok(format!(
+            r#"
+extern "C" __global__ __launch_bounds__(1024) void et_fused_elementwise(CudaKernelArgs a) {{
+    __shared__ float partials[32];
+    unsigned int lane = threadIdx.x & 31U, warp = threadIdx.x / 32;
+    et_u64 count = a.integers[1], complete = count - count % 4096;
+    for (et_u64 row = blockIdx.x; row < a.elements; row += gridDim.x) {{
+        float sum = 0.0f;
+        for (et_u64 r = threadIdx.x * 4; r < complete; r += 4096) {{
+            #pragma unroll
+            for (unsigned int j = 0; j < 4; ++j) {{
+                et_u64 i = row * count + r + j;
+{body}
+                sum += {result};
+            }}
+        }}
+        for (et_u64 r = complete + threadIdx.x; r < count; r += 1024) {{
+            et_u64 i = row * count + r;
+{body}
+            sum += {result};
+        }}
+        for (unsigned int offset = 16; offset; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        if (!lane) partials[warp] = sum;
+        __syncthreads();
+        if (!warp) {{
+            sum = partials[lane];
+            for (unsigned int offset = 16; offset; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffffU, sum, offset);
+            if (!lane) et_store(a.output, a.output_dtype, row, sum);
+        }}
+        __syncthreads();
+    }}
+}}
+"#
+        ));
+    }
     Ok(format!(
         "extern \"C\" __global__ void et_fused_elementwise(CudaKernelArgs a) {{\n    for (et_u64 i = et_thread(); i < a.elements; i += (et_u64)gridDim.x * blockDim.x) {{\n{body}        et_store(a.output, a.output_dtype, i, {result});\n    }}\n}}\n"
     ))
 }
 
+/// Keep the canonical conversion helpers and expression intact, but make each
+/// physical storage tag constant so NVRTC can remove unused switch branches.
+/// Call only after lowering has resolved views and legalized storage values.
+pub(crate) fn specialize_storage_dtypes(
+    mut source: String,
+    input_dtypes: &[u32],
+    output_dtype: u32,
+) -> Result<String, String> {
+    if input_dtypes.len() > 8 || output_dtype > 6 || input_dtypes.iter().any(|&dtype| dtype > 6) {
+        return Err("CUDA fused storage specialization has invalid dtype metadata".into());
+    }
+    for (lane, dtype) in input_dtypes.iter().enumerate() {
+        source = source.replace(&format!("a.input_dtypes[{lane}]"), &format!("{dtype}U"));
+    }
+    if source.contains("a.input_dtypes[") {
+        return Err("CUDA fused storage specialization is missing an input lane".into());
+    }
+    Ok(source.replace("a.output_dtype", &format!("{output_dtype}U")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_lane_loads_element_zero() {
+        let source = elementwise(
+            &KernelExpr::Div(
+                Box::new(KernelExpr::Input(0)),
+                Box::new(KernelExpr::Input(1)),
+            ),
+            &[
+                vec![17, 1].into_boxed_slice(),
+                vec![0, 0].into_boxed_slice(),
+            ],
+            &[vec![0, 0].into_boxed_slice(), vec![0, 0].into_boxed_slice()],
+            &[0, 0],
+            &[2, 17],
+        )
+        .unwrap();
+        assert!(source.contains("a.input_dtypes[1], 0ULL)"), "{source}");
+    }
 
     #[test]
     fn repeated_trailing_lane_wraps_its_coordinate() {
@@ -287,4 +442,62 @@ mod tests {
 
         assert!(source.contains("((i % 8ULL) % 4ULL)"), "{source}");
     }
+    #[test]
+    fn static_storage_tags_preserve_mixed_conversion_helpers_and_view_coordinates() {
+        let generic = elementwise(
+            &KernelExpr::Add(
+                Box::new(KernelExpr::Input(0)),
+                Box::new(KernelExpr::Input(1)),
+            ),
+            &[
+                vec![12, 4, 1].into_boxed_slice(),
+                vec![0, 0, 0].into_boxed_slice(),
+            ],
+            &[
+                vec![0, 0, 4].into_boxed_slice(),
+                vec![0, 0, 0].into_boxed_slice(),
+            ],
+            &[7, 0],
+            &[2, 3, 8],
+        )
+        .unwrap();
+        let typed = specialize_storage_dtypes(generic.clone(), &[3, 2], 1).unwrap();
+        assert!(typed.contains("et_load<float>(a.inputs[0], 3U,"));
+        assert!(typed.contains("et_load<float>(a.inputs[1], 2U, 0ULL)"));
+        assert!(typed.contains("((i % 8ULL) % 4ULL)"));
+        assert!(typed.contains("7ULL"));
+        assert!(typed.contains("et_store(a.output, 1U, i,"));
+        assert_eq!(
+            typed,
+            generic
+                .replace("a.input_dtypes[0]", "3U")
+                .replace("a.input_dtypes[1]", "2U")
+                .replace("a.output_dtype", "1U")
+        );
+    }
+
+    #[test]
+    fn static_storage_tags_preserve_integer_argmax_store_and_reject_missing_lanes() {
+        let generic = elementwise_with_sum(
+            false,
+            true,
+            &KernelExpr::Input(0),
+            &[vec![4096, 1].into_boxed_slice()],
+            &[vec![0, 0].into_boxed_slice()],
+            &[0],
+            &[2, 4096],
+        )
+        .unwrap();
+        let typed = specialize_storage_dtypes(generic.clone(), &[1], 4).unwrap();
+        assert!(typed.contains("et_store(a.output, 4U, row, (et_i64)best_index)"));
+        assert!(!typed.contains("a.input_dtypes"));
+        assert!(!typed.contains("a.output_dtype"));
+        assert!(specialize_storage_dtypes(generic.clone(), &[], 4).is_err());
+        assert!(specialize_storage_dtypes(generic.clone(), &[7], 4).is_err());
+        assert!(specialize_storage_dtypes(generic, &[1], 7).is_err());
+    }
 }
+
+#[cfg(test)]
+#[path = "emit_storage_tests.rs"]
+mod storage_tests;

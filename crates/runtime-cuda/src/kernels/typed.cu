@@ -17,14 +17,57 @@ __device__ unsigned int et_top_k_order(float value) {
     if ((bits & 0x7fffffffU) == 0) bits = 0; // Signed zeros tie.
     return (bits & 0x80000000U) ? ~bits : bits ^ 0x80000000U;
 }
+// Shared compare/exchange also exercised stage-by-stage by the host tests.
+__device__ void et_top_k_pair(unsigned int *orders, unsigned int *indices,
+                             unsigned int index, unsigned int other, bool descending) {
+    unsigned int left_order = orders[index], right_order = orders[other];
+    unsigned int left_index = indices[index], right_index = indices[other];
+    bool left_first = left_order > right_order ||
+        (left_order == right_order && left_index < right_index);
+    if (left_first != descending) {
+        orders[index] = right_order; orders[other] = left_order;
+        indices[index] = right_index; indices[other] = left_index;
+    }
+}
 // Stable O(width*k) insertion. The planned output is also the workspace.
 // No sampled tokens, host scores, or dynamically allocated device storage.
 extern "C" __global__ void et_top_k_indices(CudaKernelArgs a) {
-    if (threadIdx.x != 0) return;
     et_u64 row = blockIdx.x, k = a.integers[0], width = a.integers[1];
     if (row >= a.elements / k) return;
     const float *x = (const float *)a.inputs[0] + row * width;
     unsigned int *out = (unsigned int *)a.output + row * k;
+    // Full canvas sorting and the opt-in 128-expert router use one element
+    // per active thread; all 256 block threads participate in the barriers.
+    // Compare the same ordered float keys as insertion and break every tie
+    // by the original index, preserving stable output without arithmetic.
+    if ((k == 256 && width == 256) || (a.integers[2] && width == 128 && k <= 128)) {
+        __shared__ unsigned int orders[256];
+        __shared__ unsigned int indices[256];
+        __shared__ unsigned int invalid;
+        unsigned int index = threadIdx.x;
+        if (!index) invalid = 0;
+        __syncthreads();
+        if (index < width) {
+            float value = x[index];
+            if ((__float_as_uint(value) & 0x7fffffffU) > 0x7f800000U)
+                atomicExch(&invalid, 1U);
+            orders[index] = et_top_k_order(value);
+            indices[index] = index;
+        }
+        __syncthreads();
+        if (invalid) { if (!index) et_error(a, 5); return; }
+        for (unsigned int size = 2; size <= width; size <<= 1) {
+            for (unsigned int stride = size >> 1; stride; stride >>= 1) {
+                unsigned int other = index ^ stride;
+                if (index < width && index < other)
+                    et_top_k_pair(orders, indices, index, other, (index & size) == 0);
+                __syncthreads();
+            }
+        }
+        if (index < k) out[index] = indices[index];
+        return;
+    }
+    if (threadIdx.x != 0) return;
     for (et_u64 i = 0; i < width; ++i) {
         float value = x[i];
         if ((__float_as_uint(value) & 0x7fffffffU) > 0x7f800000U) { et_error(a, 5); return; }
@@ -36,6 +79,26 @@ extern "C" __global__ void et_top_k_indices(CudaKernelArgs a) {
             out[position] = (unsigned int)i;
         }
     }
+}
+// The launch parameter payload lives until CUDA has copied it; GPU pointer
+// banks are written directly into the invocation's planned header storage.
+struct EtGroupedPointerBanks {
+    unsigned long long values[3][128];
+    unsigned long long output;
+    unsigned int count;
+};
+static_assert(sizeof(EtGroupedPointerBanks) == 3088, "grouped pointer launch ABI");
+extern "C" __global__ void et_grouped_pointer_banks(EtGroupedPointerBanks a) {
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= 3 * a.count) return;
+    unsigned int role = index / a.count, lane = index % a.count;
+    ((et_u64 *)a.output)[role * 128 + lane] = a.values[role][lane];
+}
+extern "C" __global__ void et_expert_partial_pointer_banks(EtGroupedPointerBanks a, unsigned int first) {
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= 3 * a.count) return;
+    unsigned int role = index / a.count, lane = index % a.count;
+    ((et_u64 *)a.output)[role * 1024 + first + lane] = a.values[role][lane];
 }
 // One warp cooperates on a dot, with adjacent lanes reading adjacent weights.
 // Only native F32/BF16 elements of the selected expert are loaded.
@@ -85,10 +148,15 @@ extern "C" __global__ void et_grouped_offsets(CudaKernelArgs a) {
         control[e + 1] = total; total += count;
     }
     control[a.integers[0] + 1] = total;
+    // The reserved control word already carries invalid-expert status. Mirror
+    // only whether an earlier checked primary-stream kernel failed; retain the
+    // full u64 error/context record and its original host error precedence.
+    if (a.scratch[3] && *(const et_u64 *)a.scratch[3]) control[0] |= 0x80000000U;
 }
 // One warp per expert, scanning input rows in ascending order. Ballot prefix
 // ranks make the permutation stable independently of warp/block scheduling.
 extern "C" __global__ void et_grouped_rows(CudaKernelArgs a) {
+    if (a.scratch[3] && *((const et_u64*)a.scratch[3]) != 0) return;
     const unsigned int lane = threadIdx.x & 31U;
     for (et_u64 e = et_thread() / 32; e < a.integers[0]; e += (et_u64)gridDim.x * (blockDim.x / 32)) {
         unsigned int offset = ((const unsigned int *)a.inputs[1])[e + 1];
@@ -152,7 +220,14 @@ template<> __device__ float et_min(float x, float y) { return fminf(x, y); }
 template<> __device__ double et_max(double x, double y) { return fmax(x, y); }
 template<> __device__ double et_min(double x, double y) { return fmin(x, y); }
 template<class T> __device__ T et_binary_operand(const CudaKernelArgs &a, et_u64 i, int role) {
-    et_u64 source_index = et_broadcast(a, i, role);
+    et_u64 source_index;
+    switch (a.integers[2 + role]) {
+        case 1: source_index = i; break;
+        case 2: source_index = 0; break;
+        case 3: source_index = i / a.integers[4 + role]; break;
+        case 4: source_index = i >> a.integers[4 + role]; break;
+        default: source_index = et_broadcast(a, i, role); break;
+    }
     if (!a.integers[role]) return et_load<T>(a.inputs[role], a.input_dtypes[role], source_index);
     // Optional planned semantic scalar coercion precedes arithmetic promotion.
     if (a.integers[role] > 7 || et_meta(a)[role + 1] != 0) { et_error(a, 4); return 0; }
@@ -178,6 +253,15 @@ extern "C" __global__ void et_binary(CudaKernelArgs a) {
     if (a.compute_dtype >= 4) et_binary_impl<et_i64>(a, i);
     else if (a.compute_dtype == 0) et_binary_impl<double>(a, i);
     else et_binary_impl<float>(a, i);
+}
+// Separate output buffers retain the original F32 and BF16 storage boundaries.
+extern "C" __global__ void et_div_feedback(CudaKernelArgs a) {
+    et_u64 i = et_thread(); if (i >= a.elements) return;
+    float x = et_binary_operand<float>(a, i, 0);
+    float y = et_binary_operand<float>(a, i, 1);
+    float value = et_div(x, y, a);
+    et_store(a.output, 1, i, value);
+    et_store(a.scratch[0], 3, i, value);
 }
 template<class T> __device__ void et_unary_float(const CudaKernelArgs &a, et_u64 i) {
     T x = et_load<T>(a.inputs[0], a.input_dtypes[0], i), z = x, p = a.scalars[0];
@@ -469,4 +553,100 @@ extern "C" __global__ void et_reduce_integer(CudaKernelArgs a) {
     }
     if (a.operation == 4) result = et_div(result, (et_i64)count, a);
     et_store(a.output, a.output_dtype, i, result);
+}
+
+// Exact nested scatter and ordered reduction: do not combine these rounds.
+// Indexes are compact [rows,routes], source is [rows,routes,width].
+__device__ float et_ordered_scatter_source(const CudaKernelArgs &a,
+    et_u64 row, et_u64 route, et_u64 feature, et_u64 routes, et_u64 width) {
+    if (a.integers[8]) {
+        float projected = et_load<float>(a.inputs[0], a.input_dtypes[0],
+            (route * a.integers[9] + row) * width + feature);
+        float weight = et_load<float>(a.inputs[2], a.input_dtypes[2], row * routes + route);
+        // Materialized graph semantics: widen BF16, multiply in F32, narrow
+        // to BF16 before the scatter's first positive-zero addition.
+        return et_bfloat_float(et_to16(projected * weight, true));
+    }
+    return et_load<float>(a.inputs[0], a.input_dtypes[0], (row * routes + route) * width + feature);
+}
+extern "C" __global__ void et_ordered_scatter_reduce(CudaKernelArgs a) {
+    et_u64 i = et_thread();
+    if (i >= a.elements) return;
+    et_u64 routes = a.integers[0], width = a.integers[1];
+    et_u64 row = i / width, feature = i % width;
+    if (a.integers[7]) {
+        // Dispatch guarantees complete 256-thread tiles belonging to one row.
+        // Build its inverse permutation once, instead of searching every rank
+        // for every output feature. Duplicates retain the general ordered path.
+        __shared__ et_i64 shared_indexes[32];
+        __shared__ unsigned int source_routes[32];
+        __shared__ unsigned int mapping_state;
+        if (threadIdx.x < routes)
+            shared_indexes[threadIdx.x] = et_load<et_i64>(
+                a.inputs[1], a.input_dtypes[1], row * routes + threadIdx.x);
+        __syncthreads();
+        if (!threadIdx.x) {
+            unsigned int seen = 0;
+            mapping_state = 1;
+            for (unsigned int route = 0; route < routes; ++route) {
+                et_i64 destination = shared_indexes[route];
+                if (destination < 0 || (et_u64)destination >= routes) {
+                    mapping_state = 2;
+                    et_error(a, 1);
+                    break;
+                }
+                unsigned int bit = 1U << (unsigned int)destination;
+                if (seen & bit) mapping_state = 0;
+                seen |= bit;
+                source_routes[destination] = route;
+            }
+        }
+        __syncthreads();
+        if (mapping_state == 2) return;
+        if (mapping_state == 1) {
+            float total = 0.0f;
+            for (et_u64 destination = 0; destination < routes; ++destination) {
+                float value = et_ordered_scatter_source(a, row,
+                    source_routes[destination], feature, routes, width);
+                // Keep the scatter's positive-zero addition and both BF16
+                // narrowing boundaries, including the first destination.
+                float selected = et_bfloat_float(et_to16(0.0f + value, true));
+                total = et_bfloat_float(et_to16(total + selected, true));
+            }
+            et_store(a.output, a.output_dtype, i, total);
+            return;
+        }
+    }
+    et_i64 indexes[32];
+    for (et_u64 route = 0; route < routes; ++route) {
+        indexes[route] = et_load<et_i64>(a.inputs[1], a.input_dtypes[1], row * routes + route);
+        if (indexes[route] < 0 || (et_u64)indexes[route] >= routes) {
+            et_error(a, 1);
+            return;
+        }
+    }
+    float total = 0.0f;
+    for (et_u64 destination = 0; destination < routes; ++destination) {
+        float selected = 0.0f;
+        for (et_u64 route = 0; route < routes; ++route) {
+            if ((et_u64)indexes[route] != destination) continue;
+            float value = et_ordered_scatter_source(a, row, route, feature, routes, width);
+            selected = et_bfloat_float(et_to16(selected + value, true));
+        }
+        total = et_bfloat_float(et_to16(total + selected, true));
+    }
+    et_store(a.output, a.output_dtype, i, total);
+}
+
+// Bit-preserving contiguous output materialization after one packed BF16 GEMM.
+extern "C" __global__ void et_packed_projection77_split(CudaKernelArgs a) {
+    et_u64 i = et_thread();
+    if (i >= a.elements) return;
+    et_u64 row = i / a.integers[0], col = i % a.integers[0];
+    unsigned short value = ((const unsigned short*)a.inputs[0])[i];
+    for (int role = 1; role <= 3; ++role) {
+        et_u64 width = a.integers[role];
+        if (col < width) { ((unsigned short*)a.inputs[role])[row * width + col] = value; return; }
+        col -= width;
+    }
 }

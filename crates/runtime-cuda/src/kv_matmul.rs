@@ -1,11 +1,12 @@
 //! Stepwise BF16 KV attention with F32-only cuBLAS dot accumulation.
 //! Storage is worst-case planned; GEMM dimensions use actual retained rows.
-use crate::cublas::{Bf16GemmPlan, CUBLAS_WORKSPACE_BYTES};
+use crate::cublas::{Bf16GemmPlan, CudaBlas, CUBLAS_WORKSPACE_BYTES};
 use crate::executable::CudaKernelArgs;
 use crate::CudaDevice;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KvMatmulWorkspace {
+    pub(crate) vnorm_store: Option<crate::vnorm_store::VNormStorePlan>,
     q: usize,
     k: usize,
     v: usize,
@@ -52,6 +53,7 @@ impl KvMatmulWorkspace {
         let output = reserve(query.checked_mul(2)?)?;
         let blas = reserve(CUBLAS_WORKSPACE_BYTES)?;
         Some(Self {
+            vnorm_store: None,
             q,
             k,
             v,
@@ -70,15 +72,38 @@ pub(crate) fn execute(
     args: &CudaKernelArgs,
     workspace: KvMatmulWorkspace,
     ranges: &[(usize, usize, usize)],
+    launch: impl FnMut(&str, &CudaKernelArgs) -> Result<(), String>,
+) -> Result<(), String> {
+    execute_with_blas(&device.cublas, args, workspace, ranges, launch)
+}
+
+/// Executes the unchanged exact QK/PV sequence with an explicitly owned cuBLAS
+/// handle. The launch closure must use that handle's stream, and the caller
+/// retains the handle, planned buffers and state transaction through completion.
+pub(crate) fn execute_with_blas(
+    blas: &CudaBlas,
+    args: &CudaKernelArgs,
+    workspace: KvMatmulWorkspace,
+    ranges: &[(usize, usize, usize)],
     mut launch: impl FnMut(&str, &CudaKernelArgs) -> Result<(), String>,
 ) -> Result<(), String> {
+    let output_width = output_bytes(args.output_dtype)?;
     let mut zero = *args;
     zero.scalars[0] = 0.;
     launch("et_fill", &zero)?;
     if args.elements == 0 {
         return Ok(());
     }
-    launch("et_kv_store", args)?;
+    if let Some(plan) = workspace.vnorm_store {
+        let mut store = *args;
+        store.integers[12] = plan.tokens as u64;
+        store.integers[13] = plan.heads as u64;
+        store.integers[14] = plan.dim as u64;
+        store.scalars[1] = plan.eps;
+        launch("et_vnorm_store56", &store)?;
+    } else {
+        launch("et_kv_store", args)?;
+    }
     let (heads, declared_tokens, dim) = (
         args.integers[11] as usize,
         args.integers[7] as usize,
@@ -93,6 +118,12 @@ pub(crate) fn execute(
         {
             return Err("execute: invalid KV GEMM range".into());
         }
+        if let Some(fused) = blas.attention75().filter(|fused| fused.supports(args)) {
+            // The original fill/store above and invocation fence remain in
+            // force. Only the readonly attention contraction is replaced.
+            unsafe { fused.launch(blas.stream(), args, lane, positions, tokens)? };
+            continue;
+        }
         let mut a = *args;
         a.inputs[5] = base + workspace.q as u64;
         a.inputs[6] = base + workspace.k as u64;
@@ -102,7 +133,7 @@ pub(crate) fn execute(
         a.integers[13] = positions as u64;
         a.integers[14] = lane as u64;
         a.integers[15] = tokens as u64;
-        a.output += (lane * heads * declared_tokens * dim * 4) as u64;
+        a.output += (lane * heads * declared_tokens * dim * output_width) as u64;
         a.elements = (heads * dim * positions.max(tokens)) as u64;
         launch("et_kv_gemm_gather", &a)?;
         let qk = Bf16GemmPlan {
@@ -117,7 +148,7 @@ pub(crate) fn execute(
         // F32 outputs select DISALLOW_REDUCED_PRECISION_REDUCTION under the
         // existing handle lock. Only the explicit score/probability/PV boundaries narrow.
         unsafe {
-            device.cublas.gemm_bf16(
+            blas.gemm_bf16(
                 qk,
                 true,
                 a.inputs[5],
@@ -139,7 +170,7 @@ pub(crate) fn execute(
             stride_out: tokens * dim,
         };
         unsafe {
-            device.cublas.gemm_bf16(
+            blas.gemm_bf16(
                 pv,
                 false,
                 a.inputs[1],
@@ -153,6 +184,26 @@ pub(crate) fn execute(
         launch("et_kv_gemm_round", &a)?;
     }
     Ok(())
+}
+
+fn output_bytes(dtype: u32) -> Result<usize, String> {
+    match dtype {
+        1 => Ok(4),
+        3 => Ok(2),
+        _ => Err("KV GEMM output must be F32 or BF16".into()),
+    }
+}
+
+#[cfg(test)]
+mod output82_tests {
+    #[test]
+    fn fallback_uses_actual_output_storage_width() {
+        assert_eq!(super::output_bytes(1).unwrap(), 4);
+        assert_eq!(super::output_bytes(3).unwrap(), 2);
+        for dtype in [0, 2, 4, 5, 6] {
+            assert!(super::output_bytes(dtype).is_err());
+        }
+    }
 }
 
 #[cfg(test)]

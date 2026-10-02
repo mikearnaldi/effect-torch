@@ -18,7 +18,7 @@ use effect_torch_runtime::{
     DType, KvLayerDescriptor, PackedFormat, SamplingOptions, SamplingPurpose, StateAccessMode,
     StorageMetadata, StorageRepresentation, ValueSpec,
 };
-use napi::bindgen_prelude::{Buffer, Uint8Array};
+use napi::bindgen_prelude::{Buffer, Uint32Array, Uint8Array};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use serde_json::Value as JsonValue;
@@ -28,8 +28,14 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+#[path = "napi/chain96.rs"]
+mod chain96;
+#[path = "napi/chain97.rs"]
+mod chain97;
 #[path = "napi/gguf.rs"]
 mod gguf;
+#[path = "napi/literal89.rs"]
+mod literal89;
 #[path = "napi/safetensors.rs"]
 mod safetensors_io;
 #[allow(unused_imports)]
@@ -439,6 +445,12 @@ impl NativeTargetMatchingOutput {
     pub fn outputs(&self) -> Vec<NativeTensor> {
         self.outputs.clone()
     }
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeChain97Output {
+    pub feedback: NativeTensor,
+    pub statistics: Buffer,
 }
 
 #[derive(Clone)]
@@ -955,7 +967,7 @@ impl NativeKvPrefix {
                                         _ => {
                                             return Err(failure(
                                                 "kv inspect: unsupported storage dtype",
-                                            ))
+                                            ));
                                         }
                                     };
                                     result.push(value);
@@ -1578,6 +1590,7 @@ impl NativeTensor {
 pub struct Executable {
     inner: Arc<CudaExecutable>,
     state: Option<CudaStateSchema>,
+    request_rng99: Option<Arc<crate::executable::RequestRng99>>,
 }
 
 impl PoolInner {
@@ -2066,6 +2079,36 @@ impl Executable {
         self.inner.instruction_count() as u32
     }
 
+    /// Private diagnostic fork: two immutable templates, one request RNG stream.
+    #[napi]
+    pub fn fork_request_rng99(&self, peer: &Executable, seed: u32) -> Result<Vec<Executable>> {
+        if self.request_rng99.is_some()
+            || peer.request_rng99.is_some()
+            || self.inner.ordinal() != peer.inner.ordinal()
+            || !crate::executable::RequestRng99::graphs_disabled()
+            || [self, peer].iter().any(|program| {
+                !program.inner.request_rng99_admitted()
+                    || !program
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.access == StateAccessMode::ReadOnly)
+            })
+        {
+            return Err(invalid(
+                "forkRequestRng99: unforked read-only seed0 single-source same-device templates and graphs disabled required",
+            ));
+        }
+        let rng = Arc::new(crate::executable::RequestRng99::new(seed));
+        Ok([self, peer]
+            .into_iter()
+            .map(|program| Executable {
+                inner: program.inner.clone(),
+                state: program.state.clone(),
+                request_rng99: Some(rng.clone()),
+            })
+            .collect())
+    }
+
     #[napi]
     pub async fn execute_read_only(
         &self,
@@ -2127,6 +2170,7 @@ impl Executable {
             .collect::<Result<Vec<_>>>()?;
         let schema = schema.clone();
         let executable = self.inner.clone();
+        let request_rng99 = self.request_rng99.clone();
         let state = token
             .map(|token| token.state.clone())
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
@@ -2153,16 +2197,399 @@ impl Executable {
                 access: StateAccessMode::ReadOnly,
                 cache: None,
             };
-            executable
-                .execute_stateful(&bindings, &[], &mut invocation, cancelled)
-                .map(|outputs| outputs.into_iter().map(NativeTensor::wrap).collect())
-                .map_err(|message| {
-                    if cancelled.is_cancelled() {
-                        Error::new(Status::Cancelled, "operation aborted")
-                    } else {
-                        failure(message)
-                    }
-                })
+            match request_rng99.as_deref() {
+                Some(rng) => executable.execute_stateful_request99(
+                    &bindings,
+                    &mut invocation,
+                    cancelled,
+                    rng,
+                ),
+                None => executable.execute_stateful(&bindings, &[], &mut invocation, cancelled),
+            }
+            .map(|outputs| outputs.into_iter().map(NativeTensor::wrap).collect())
+            .map_err(|message| {
+                if cancelled.is_cancelled() {
+                    Error::new(Status::Cancelled, "operation aborted")
+                } else {
+                    failure(message)
+                }
+            })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn execute_chain96(
+        &self,
+        head: Option<&Executable>,
+        sampler: &Executable,
+        bindings: Vec<&NativeTensor>,
+        prefixes: Vec<&NativeKvPrefix>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        temperature: f64,
+        token: Option<&CancellationToken>,
+    ) -> Result<Vec<NativeTensor>> {
+        if self.request_rng99.is_some()
+            || sampler.request_rng99.is_some()
+            || head.is_some_and(|head| head.request_rng99.is_some())
+        {
+            return Err(invalid("requestRng99 forks must use executeReadOnly"));
+        }
+        if head.is_some_and(|head| {
+            head.state.is_some() || head.inner.ordinal() != self.inner.ordinal()
+        }) || sampler.state.is_some()
+            || sampler.inner.ordinal() != self.inner.ordinal()
+            || !temperature.is_finite()
+        {
+            return Err(invalid(
+                "executeChain96: stateless same-device successors and finite temperature required",
+            ));
+        }
+        if !self.inner.chain96_dense_outputs()
+            || head.is_some_and(|head| !head.inner.chain96_successor(&[]))
+            || !sampler.inner.chain96_successor(&[DType::F32])
+        {
+            return Err(invalid(
+                "executeChain96: dense successors require zero head scalars and one F32 sampler scalar",
+            ));
+        }
+        let body_outputs = self.inner.outputs();
+        let sampler_input = head.map_or(body_outputs, |head| head.inner.outputs());
+        if body_outputs.len() != 1
+            || sampler_input.len() != 1
+            || sampler.inner.outputs().is_empty()
+            || sampler.inner.outputs().len() > 8
+            || head.is_some_and(|head| {
+                head.inner.tensor_input(0).as_ref() != body_outputs.first()
+                    || head.inner.tensor_input(1).is_some()
+            })
+            || sampler.inner.tensor_input(0).as_ref() != sampler_input.first()
+            || sampler.inner.tensor_input(1).is_some()
+        {
+            return Err(invalid(
+                "executeChain96: incompatible bounded one-output stage metadata",
+            ));
+        }
+        let head = head.map(|head| head.inner.clone());
+        let sampler = sampler.inner.clone();
+        let schema = self
+            .state
+            .as_ref()
+            .ok_or_else(|| invalid("executeChain96: state schema required"))?;
+        if schema.access != StateAccessMode::ReadOnly
+            || schema.geometry.kda.layers != 0
+            || schema.geometry.conv.layers != 0
+            || schema.packed_rows_per_sequence.is_some()
+        {
+            return Err(invalid(
+                "executeChain96: requires a dense read-only KV executable",
+            ));
+        }
+        let batch = schema.batch as usize;
+        if prefixes.is_empty()
+            || prefixes.len() > batch
+            || slots.len() != prefixes.len()
+            || active_mask.len() != batch
+            || valid_lengths.len() != batch
+        {
+            return Err(invalid("executeChain96: invalid fixed-lane metadata"));
+        }
+        let prefixes = prefixes
+            .iter()
+            .map(|prefix| prefix.borrowed())
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = vec![false; batch];
+        for (prefix, &slot) in prefixes.iter().zip(&slots) {
+            let slot = slot as usize;
+            if slot >= batch || seen[slot] || valid_lengths[slot] == 0 {
+                return Err(invalid("executeChain96: invalid or duplicate active slot"));
+            }
+            seen[slot] = true;
+            if !Arc::ptr_eq(&prefixes[0].pool, &prefix.pool) {
+                return Err(invalid("executeChain96: prefixes must share a pool"));
+            }
+            schema.validate_pool(&prefix.pool, self.inner.ordinal())?;
+        }
+        if (0..batch).any(|slot| {
+            active_mask[slot] != seen[slot] || (!seen[slot] && valid_lengths[slot] != 0)
+        }) {
+            return Err(invalid(
+                "executeChain96: inconsistent inactive lane metadata",
+            ));
+        }
+        let bindings = bindings
+            .into_iter()
+            .map(NativeTensor::value)
+            .collect::<Result<Vec<_>>>()?;
+        let schema = schema.clone();
+        let executable = self.inner.clone();
+        let state = token
+            .map(|token| token.state.clone())
+            .unwrap_or_else(|| Arc::new(CancellationState::new()));
+        let notify = token.map(|token| token.notify.clone());
+        run_compute(state, notify, move |cancelled, _| {
+            let mut invocation = CudaStateInvocation {
+                sequences: prefixes
+                    .iter()
+                    .map(|prefix| CudaSequenceState {
+                        cursor: prefix.state.cursor,
+                        keys: Vec::new(),
+                        values: Vec::new(),
+                        kda_states: Vec::new(),
+                        conv_states: Vec::new(),
+                        kv_storage: prefix.state.kv_storage.clone(),
+                    })
+                    .collect(),
+                slots,
+                valid_lengths,
+                capacity: schema.max_tokens,
+                cache_dtype: schema.kv_dtype,
+                packed_rows_per_sequence: None,
+                kv_layers: schema.geometry.kv_layers,
+                access: StateAccessMode::ReadOnly,
+                cache: None,
+            };
+            chain96::execute(
+                || executable.execute_stateful(&bindings, &[], &mut invocation, cancelled),
+                head.as_deref(),
+                &sampler,
+                temperature,
+                cancelled,
+            )
+            .map(|outputs| outputs.into_iter().map(NativeTensor::wrap).collect())
+            .map_err(|message| {
+                if cancelled.is_cancelled() {
+                    Error::new(Status::Cancelled, "operation aborted")
+                } else {
+                    failure(message)
+                }
+            })
+        })
+        .await
+    }
+
+    /// Pure immutable admission for the host-input / processed-output pipeline.
+    #[napi]
+    pub fn supports_chain97(
+        &self,
+        head: Option<&Executable>,
+        sampler: &Executable,
+        width: u32,
+    ) -> bool {
+        let width = width as usize;
+        let Some(schema) = self.state.as_ref() else {
+            return false;
+        };
+        let body_outputs = self.inner.outputs();
+        let sampler_input = head.map_or(body_outputs, |head| head.inner.outputs());
+        self.request_rng99.is_none()
+            && sampler.request_rng99.is_none()
+            && head.is_none_or(|head| head.request_rng99.is_none())
+            && schema.access == StateAccessMode::ReadOnly
+            && schema.batch == 1
+            && schema.geometry.kda.layers == 0
+            && schema.geometry.conv.layers == 0
+            && schema.packed_rows_per_sequence.is_none()
+            && (1..=256).contains(&width)
+            && self.inner.tensor_input(0) == Some((vec![1, width], DType::U32))
+            && self.inner.chain96_dense_outputs()
+            && body_outputs.len() == 1
+            && sampler_input.len() == 1
+            && head.is_none_or(|head| {
+                head.state.is_none()
+                    && head.inner.ordinal() == self.inner.ordinal()
+                    && head.inner.chain96_successor(&[])
+                    && head.inner.tensor_input(0).as_ref() == body_outputs.first()
+                    && head.inner.tensor_input(1).is_none()
+            })
+            && sampler.state.is_none()
+            && sampler.inner.ordinal() == self.inner.ordinal()
+            && sampler.inner.chain96_successor(&[DType::F32])
+            && sampler.inner.tensor_input(0).as_ref() == sampler_input.first()
+            && sampler.inner.tensor_input(1).is_none()
+            && sampler.inner.outputs().len() == 2
+            && sampler.inner.outputs()[1] == (vec![width * 4 + 1], DType::F32)
+    }
+
+    #[napi]
+    pub async fn execute_chain97(
+        &self,
+        head: Option<&Executable>,
+        sampler: &Executable,
+        canvas: Uint32Array,
+        bindings: Vec<&NativeTensor>,
+        prefixes: Vec<&NativeKvPrefix>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        temperature: f64,
+        token: Option<&CancellationToken>,
+    ) -> Result<NativeChain97Output> {
+        if self.request_rng99.is_some()
+            || sampler.request_rng99.is_some()
+            || head.is_some_and(|head| head.request_rng99.is_some())
+        {
+            return Err(invalid("requestRng99 forks must use executeReadOnly"));
+        }
+        if head.is_some_and(|head| {
+            head.state.is_some() || head.inner.ordinal() != self.inner.ordinal()
+        }) || sampler.state.is_some()
+            || sampler.inner.ordinal() != self.inner.ordinal()
+            || !temperature.is_finite()
+        {
+            return Err(invalid(
+                "executeChain97: stateless same-device successors and finite temperature required",
+            ));
+        }
+        if !self.inner.chain96_dense_outputs()
+            || head.is_some_and(|head| !head.inner.chain96_successor(&[]))
+            || !sampler.inner.chain96_successor(&[DType::F32])
+        {
+            return Err(invalid(
+                "executeChain97: dense successors require zero head scalars and one F32 sampler scalar",
+            ));
+        }
+        let body_outputs = self.inner.outputs();
+        let sampler_input = head.map_or(body_outputs, |head| head.inner.outputs());
+        if body_outputs.len() != 1
+            || sampler_input.len() != 1
+            || sampler.inner.outputs().is_empty()
+            || sampler.inner.outputs().len() > 8
+            || head.is_some_and(|head| {
+                head.inner.tensor_input(0).as_ref() != body_outputs.first()
+                    || head.inner.tensor_input(1).is_some()
+            })
+            || sampler.inner.tensor_input(0).as_ref() != sampler_input.first()
+            || sampler.inner.tensor_input(1).is_some()
+        {
+            return Err(invalid(
+                "executeChain97: incompatible bounded one-output stage metadata",
+            ));
+        }
+        let canvas = canvas.to_vec();
+        if canvas.is_empty()
+            || canvas.len() > 256
+            || self.inner.tensor_input(0) != Some((vec![1, canvas.len()], DType::U32))
+            || sampler.inner.outputs().len() != 2
+            || sampler.inner.outputs()[1] != (vec![canvas.len() * 4 + 1], DType::F32)
+        {
+            return Err(invalid(
+                "executeChain97: expected bounded U32 canvas and packed F32 statistics output",
+            ));
+        }
+        let upload = Node::new(NodeKind::FromBytes {
+            data: canvas
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            shape: vec![1, canvas.len()],
+            dtype: DType::U32,
+            device: Device::Cuda(self.inner.ordinal()),
+        })
+        .map_err(invalid)?;
+        let device = CudaDevice::get(self.inner.ordinal()).map_err(failure)?;
+        let head = head.map(|head| head.inner.clone());
+        let sampler = sampler.inner.clone();
+        let schema = self
+            .state
+            .as_ref()
+            .ok_or_else(|| invalid("executeChain97: state schema required"))?;
+        if schema.access != StateAccessMode::ReadOnly
+            || schema.geometry.kda.layers != 0
+            || schema.geometry.conv.layers != 0
+            || schema.packed_rows_per_sequence.is_some()
+        {
+            return Err(invalid(
+                "executeChain97: requires a dense read-only KV executable",
+            ));
+        }
+        let batch = schema.batch as usize;
+        if prefixes.is_empty()
+            || prefixes.len() > batch
+            || slots.len() != prefixes.len()
+            || active_mask.len() != batch
+            || valid_lengths.len() != batch
+        {
+            return Err(invalid("executeChain97: invalid fixed-lane metadata"));
+        }
+        let prefixes = prefixes
+            .iter()
+            .map(|prefix| prefix.borrowed())
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = vec![false; batch];
+        for (prefix, &slot) in prefixes.iter().zip(&slots) {
+            let slot = slot as usize;
+            if slot >= batch || seen[slot] || valid_lengths[slot] == 0 {
+                return Err(invalid("executeChain97: invalid or duplicate active slot"));
+            }
+            seen[slot] = true;
+            if !Arc::ptr_eq(&prefixes[0].pool, &prefix.pool) {
+                return Err(invalid("executeChain97: prefixes must share a pool"));
+            }
+            schema.validate_pool(&prefix.pool, self.inner.ordinal())?;
+        }
+        if (0..batch).any(|slot| {
+            active_mask[slot] != seen[slot] || (!seen[slot] && valid_lengths[slot] != 0)
+        }) {
+            return Err(invalid(
+                "executeChain97: inconsistent inactive lane metadata",
+            ));
+        }
+        let bindings = bindings
+            .into_iter()
+            .map(NativeTensor::value)
+            .collect::<Result<Vec<_>>>()?;
+        let schema = schema.clone();
+        let executable = self.inner.clone();
+        let state = token
+            .map(|token| token.state.clone())
+            .unwrap_or_else(|| Arc::new(CancellationState::new()));
+        let notify = token.map(|token| token.notify.clone());
+        run_compute(state, notify, move |cancelled, _| {
+            let mut invocation = CudaStateInvocation {
+                sequences: prefixes
+                    .iter()
+                    .map(|prefix| CudaSequenceState {
+                        cursor: prefix.state.cursor,
+                        keys: Vec::new(),
+                        values: Vec::new(),
+                        kda_states: Vec::new(),
+                        conv_states: Vec::new(),
+                        kv_storage: prefix.state.kv_storage.clone(),
+                    })
+                    .collect(),
+                slots,
+                valid_lengths,
+                capacity: schema.max_tokens,
+                cache_dtype: schema.kv_dtype,
+                packed_rows_per_sequence: None,
+                kv_layers: schema.geometry.kv_layers,
+                access: StateAccessMode::ReadOnly,
+                cache: None,
+            };
+            chain97::execute(
+                device,
+                upload,
+                bindings,
+                |bindings| executable.execute_stateful(bindings, &[], &mut invocation, cancelled),
+                head.as_deref(),
+                &sampler,
+                temperature,
+                cancelled,
+            )
+            .map(|(feedback, statistics)| NativeChain97Output {
+                feedback: NativeTensor::wrap(feedback),
+                statistics: Buffer::from(statistics),
+            })
+            .map_err(|message| {
+                if cancelled.is_cancelled() {
+                    Error::new(Status::Cancelled, "operation aborted")
+                } else {
+                    failure(message)
+                }
+            })
         })
         .await
     }
@@ -3027,6 +3454,21 @@ impl CudaRuntime {
         lazy(Node::new(NodeKind::Leaf(tensor.slot.clone())))
     }
 
+    /// Materializes a bounded set of existing scalar F32/U32 byte literals.
+    #[napi]
+    pub async fn materialize_literals89(
+        &self,
+        roots: Vec<&LazyTensor>,
+        token: Option<&CancellationToken>,
+    ) -> Result<Vec<NativeTensor>> {
+        literal89::execute(
+            self._device.clone(),
+            roots.into_iter().map(|root| root.node.clone()).collect(),
+            token,
+        )
+        .await
+    }
+
     #[napi]
     pub fn graph_node(
         &self,
@@ -3441,7 +3883,7 @@ impl CudaRuntime {
             _ => {
                 return Err(invalid(format!(
                     "unsupported CUDA graph operation {operation}"
-                )))
+                )));
             }
         };
         lazy(Node::new(kind))
@@ -3573,6 +4015,7 @@ impl CudaRuntime {
             .map(|inner| Executable {
                 inner: Arc::new(inner),
                 state,
+                request_rng99: None,
             })
             .map_err(failure)
     }

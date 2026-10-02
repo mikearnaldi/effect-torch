@@ -203,6 +203,37 @@ describe("pinned DiffusionGemma sampler", () => {
     expect(Gemma.stopGeneration({ history: [] }, { ...base, meanEntropy: 0.124 }, 0, 0.125).done).toBe(true)
   })
 
+  it("compares the current argmax with previous steps before appending it to stability history", () => {
+    // Captured from pinned Transformers StableAndConfidentStoppingCriteria on CPU.
+    // A threshold of one still requires a matching previous prediction.
+    const canvases = [[0, 0], [0, 0], [1, 1], [1, 1], [1, 1], [1, 1], [0, 0]]
+    const traces = [
+      [true, true, true, true, true, true, true],
+      [false, true, false, true, true, true, false],
+      [false, false, false, false, true, true, false],
+      [false, false, false, false, false, true, false]
+    ]
+    const base = prediction(fixture.runs[0].blocks[0].steps[0])
+
+    for (let stabilityThreshold = 0; stabilityThreshold < traces.length; stabilityThreshold++) {
+      let state: Gemma.GenerationSamplerState = { history: [] }
+      const observed: Array<boolean> = []
+
+      for (const canvas of canvases) {
+        const result = Gemma.stopGeneration(
+          state,
+          { ...base, argmaxTokens: Uint32Array.from(canvas), meanEntropy: 0 },
+          stabilityThreshold,
+          0.005
+        )
+        observed.push(result.done)
+        state = result.state
+      }
+
+      expect(observed).toEqual(traces[stabilityThreshold])
+    }
+  })
+
   it("keeps the first EOS and follows the reference padding rule", () => {
     const draft = new Uint32Array([4, 9, 3, 8])
     expect(Gemma.finishGenerationCanvas(draft, [8, 9], 0)).toEqual({

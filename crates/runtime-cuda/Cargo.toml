@@ -34,7 +34,9 @@ napi = { version = "3", features = ["async", "napi6"], optional = true }
 napi-derive = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
 half = "2"
+libloading = "0.9"
 serde_json = "1"
+sha2 = "0.10"
 safetensors = { version = "0.6", optional = true }
 
 [build-dependencies]

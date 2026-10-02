@@ -335,3 +335,168 @@ fn grouped_captured_expert_projections_match_official_bf16_bytes() {
         eprintln!("captured grouped exact: {name} [{n},{k},{o}]");
     }
 }
+
+#[test]
+#[ignore = "requires CUDA and EFFECT_TORCH_CUDA_GROUPED_STATUS_SUMMARY=1"]
+fn grouped_status_summary_preserves_error_precedence_recovery_and_cancellation() {
+    assert_eq!(
+        std::env::var("EFFECT_TORCH_CUDA_GROUPED_STATUS_SUMMARY").as_deref(),
+        Ok("1")
+    );
+    for dtype in [DType::F32, DType::BF16] {
+        let checked = Node::new(NodeKind::Gather {
+            a: input(0, &[2, 3], dtype),
+            indexes: input(3, &[2, 3], DType::U32),
+            dim: 1,
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::GroupedExpertLinearRows {
+            x: checked,
+            weight: input(1, &[2, 4, 3], dtype),
+            indexes: input(2, &[2], DType::U32),
+        })
+        .unwrap();
+        let executable = crate::compile(vec![root.clone()], 0).unwrap();
+        let bindings = || {
+            vec![
+                host(&[2, 3], dtype, &[1., 2., 3., 4., 5., 6.]),
+                host(&[2, 4, 3], dtype, &[1.; 24]),
+                host(&[2], DType::U32, &[0., 1.]),
+                host(&[2, 3], DType::U32, &[0., 1., 2., 0., 1., 2.]),
+            ]
+        };
+        let valid = bindings();
+        let retained = executable
+            .execute(&valid, &[], &CancellationFlag::new())
+            .unwrap();
+        let expected = vec![6., 6., 6., 6., 15., 15., 15., 15.];
+        assert_eq!(retained[0].readback().unwrap(), expected);
+        for invalid_expert in [false, true] {
+            let mut invalid = bindings();
+            invalid[3] = host(&[2, 3], DType::U32, &[99., 1., 2., 0., 1., 2.]);
+            if invalid_expert {
+                invalid[2] = host(&[2], DType::U32, &[0., 2.]);
+            }
+            let error = executable
+                .execute(&invalid, &[], &CancellationFlag::new())
+                .err()
+                .unwrap();
+            // Full prior error context takes precedence over invalid routing.
+            assert_eq!(error, "et_index: index is out of range");
+        }
+        let mut invalid = bindings();
+        invalid[2] = host(&[2], DType::U32, &[0., 2.]);
+        assert_eq!(
+            executable
+                .execute(&invalid, &[], &CancellationFlag::new())
+                .err()
+                .unwrap(),
+            "groupedExpertLinearRows: expert index is out of range"
+        );
+        // The final deferred-status read must still detect errors after routing.
+        let late = Node::new(NodeKind::Gather {
+            a: root,
+            indexes: input(4, &[2, 1], DType::U32),
+            dim: 1,
+        })
+        .unwrap();
+        let late = crate::compile(vec![late], 0).unwrap();
+        let mut late_bindings = bindings();
+        late_bindings.push(host(&[2, 1], DType::U32, &[99., 0.]));
+        assert_eq!(
+            late.execute(&late_bindings, &[], &CancellationFlag::new())
+                .err()
+                .unwrap(),
+            "et_index: index is out of range"
+        );
+        let cancelled = CancellationFlag::new();
+        assert_eq!(
+            executable
+                .execute_with_gemm_hook(&valid, &cancelled, &|| cancelled.cancel())
+                .err()
+                .unwrap(),
+            "operation aborted"
+        );
+        assert_eq!(
+            executable.execute(&valid, &[], &cancelled).err().unwrap(),
+            "operation aborted"
+        );
+        let recovered = executable
+            .execute(&valid, &[], &CancellationFlag::new())
+            .unwrap();
+        assert_eq!(recovered[0].readback().unwrap(), expected);
+        drop(recovered);
+        assert_eq!(retained[0].readback().unwrap(), expected);
+    }
+}
+
+#[test]
+#[ignore = "requires pinned CUDA, merged PTX and EFFECT_TORCH_CUDA_EXPERT_GEMV_OVERLAP=1"]
+fn gemv_overlap_compiled_mixed_routes_cancel_errors_concurrent_and_retained() {
+    assert!(crate::device::expert_gemv_overlap::enabled());
+    let device = CudaDevice::get(0).unwrap();
+    let (rows, n, k, experts) = (6, 2816, 704, 3);
+    let root = grouped(rows, experts, n, k, DType::BF16);
+    let executable = Arc::new(crate::compile(vec![root, input(3, &[1], DType::BF16)], 0).unwrap());
+    let bindings = vec![
+        host(&[rows, k], DType::BF16, &vec![1.; rows * k]),
+        host(&[experts, n, k], DType::BF16, &vec![1.; experts * n * k]),
+        host(&[rows], DType::U32, &[0., 1., 1., 2., 2., 2.]),
+        host(&[1], DType::BF16, &[0.]),
+    ];
+    let retained = executable
+        .execute(&bindings, &[], &CancellationFlag::new())
+        .unwrap();
+    let expected = retained[0].read_storage_bytes().unwrap();
+    assert_eq!(retained[0].readback().unwrap(), vec![704.; rows * n]);
+    let mut invalid = bindings.clone();
+    invalid[3] = host(&[2], DType::BF16, &[0., 0.]);
+    assert!(executable
+        .execute(&invalid, &[], &CancellationFlag::new())
+        .is_err());
+    invalid[3] = bindings[3].clone();
+    invalid[2] = host(&[rows], DType::U32, &[0., 1., 1., 2., 2., 3.]);
+    assert!(executable
+        .execute(&invalid, &[], &CancellationFlag::new())
+        .is_err());
+    let cancelled = CancellationFlag::new();
+    let submissions = std::cell::Cell::new(0);
+    let error = executable.execute_with_gemm_hook(&bindings, &cancelled, &|| {
+        submissions.set(submissions.get() + 1);
+        cancelled.cancel();
+    });
+    assert!(submissions.get() > 0);
+    assert!(matches!(error,Err(ref e) if e=="operation aborted"));
+    let workers = (1..=3)
+        .map(|factor| {
+            let executable = executable.clone();
+            let mut bindings = bindings.clone();
+            bindings[0] = host(&[rows, k], DType::BF16, &vec![factor as f64; rows * k]);
+            std::thread::spawn(move || {
+                let output = executable
+                    .execute(&bindings, &[], &CancellationFlag::new())
+                    .unwrap();
+                assert_eq!(
+                    output[0].readback().unwrap(),
+                    vec![704. * factor as f64; rows * n]
+                );
+                output
+            })
+        })
+        .collect::<Vec<_>>();
+    let outputs = workers
+        .into_iter()
+        .map(|w| w.join().unwrap())
+        .collect::<Vec<_>>();
+    drop(executable);
+    drop(bindings);
+    drop(invalid);
+    drop(device);
+    assert_eq!(retained[0].read_storage_bytes().unwrap(), expected);
+    for (index, output) in outputs.into_iter().enumerate() {
+        assert_eq!(
+            output[0].readback().unwrap(),
+            vec![704. * (index + 1) as f64; rows * n]
+        );
+    }
+}

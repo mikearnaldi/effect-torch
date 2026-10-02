@@ -30,8 +30,9 @@ template<class T> T __shfl_sync(unsigned int, T value, unsigned int) { return va
 static unsigned int __ballot_sync(unsigned int, bool selected) { return selected ? 1U : 0U; }
 static unsigned int __popc(unsigned int value) { return __builtin_popcount(value); }
 static unsigned int atomicAdd(unsigned int *p, unsigned int value) { unsigned int old = *p; *p += value; return old; }
-static unsigned int atomicCAS(unsigned int *p, unsigned int expected, unsigned int value) {
-    unsigned int old = *p; if (old == expected) *p = value; return old;
+static unsigned int atomicExch(unsigned int *p, unsigned int value) { unsigned int old = *p; *p = value; return old; }
+template<class T> T atomicCAS(T *p, T expected, T value) {
+    T old = *p; if (old == expected) *p = value; return old;
 }
 static unsigned int __float_as_uint(float value) { unsigned int bits; memcpy(&bits, &value, 4); return bits; }
 static float __uint_as_float(unsigned int bits) { float value; memcpy(&value, &bits, 4); return value; }
@@ -142,7 +143,7 @@ static void casts() {
 }
 static void integers_and_roles() {
     et_i64 x[] = {(1LL << 53) + 1, (1LL << 53) + 2}, y[] = {1}, result[2]; unsigned char masks[2];
-    auto m = metadata({2}, {{2}, {1}}); unsigned int status = 0;
+    auto m = metadata({2}, {{2}, {1}}); et_u64 status = 0;
     CudaKernelArgs a{}; a.elements = 2; a.metadata = address(m.data()); a.scratch[3] = address(&status);
     a.inputs[0] = address(x); a.inputs[1] = address(y); a.input_dtypes[0] = a.input_dtypes[1] = a.output_dtype = a.compute_dtype = 4; a.output = address(result);
     run(et_binary, a); assert(result[0] == x[0] + 1 && result[1] == x[1] + 1);
@@ -177,7 +178,7 @@ static void half_scatter_updates() {
         float base = dtype == 2 ? 2048.0f : 256.0f;
         unsigned short input[] = {et_to16(base, dtype == 3), et_to16(-base, dtype == 3), et_to16(7.0f, dtype == 3)};
         unsigned short source[] = {et_to16(1.0f, dtype == 3), et_to16(-1.0f, dtype == 3), et_to16(1.0f, dtype == 3), et_to16(-1.0f, dtype == 3)};
-        unsigned int indices[] = {0, 1, 0, 1}, status = 0;
+        unsigned int indices[] = {0, 1, 0, 1}; et_u64 status = 0;
         unsigned short guarded[] = {0xdead, 0, 0, 0, 0xbeef};
         auto m = metadata({3}, {{3}, {4}, {4}});
         CudaKernelArgs a{}; a.elements = 3; a.operation = 5;
@@ -201,7 +202,7 @@ static void scalar_coercion() {
         float scalar = 1.0f + ldexpf(1.0f, dtype == 2 ? -11 : -8), tensor = 3, output = 0;
         unsigned short half_tensor = et_to16(tensor, dtype == 3);
         std::vector<std::vector<et_u64>> shapes(2); shapes[1 - scalar_role] = {1};
-        auto m = metadata({1}, shapes); unsigned int status = 0;
+        auto m = metadata({1}, shapes); et_u64 status = 0;
         CudaKernelArgs a{}; a.elements = 1; a.operation = 2; a.compute_dtype = 1;
         a.metadata = address(m.data()); a.scratch[3] = address(&status);
         a.inputs[scalar_role] = address(&scalar); a.input_dtypes[scalar_role] = 1; a.integers[scalar_role] = dtype + 1;
@@ -210,9 +211,40 @@ static void scalar_coercion() {
         run(et_binary, a); assert(output == 3 && status == 0);
     }
 }
+static void binary_broadcast_indexing() {
+    for (et_u64 width : {7ULL, 8ULL}) {
+        std::vector<float> x(6 * width), y(6), baseline(x.size()), optimized(x.size());
+        for (et_u64 i = 0; i < x.size(); ++i) x[i] = (int(i) - 17) * 0.03125f;
+        for (et_u64 i = 0; i < y.size(); ++i) y[i] = (i + 1) * 0.125f;
+        auto m = metadata({2, 3, width}, {{2, 3, width}, {2, 3, 1}});
+        CudaKernelArgs a{}; a.elements = x.size(); a.operation = 3;
+        a.metadata = address(m.data()); a.input_dtypes[0] = a.input_dtypes[1] = 1;
+        a.output_dtype = a.compute_dtype = 1;
+        a.inputs[0] = address(x.data()); a.inputs[1] = address(y.data());
+        a.output = address(baseline.data()); run(et_binary, a);
+        a.integers[2] = 1; a.integers[3] = width == 8 ? 4 : 3;
+        a.integers[5] = width == 8 ? 3 : width;
+        a.output = address(optimized.data()); run(et_binary, a);
+        assert(memcmp(baseline.data(), optimized.data(), x.size() * sizeof(float)) == 0);
+        for (et_u64 i = 0; i < x.size(); ++i) assert(optimized[i] == x[i] / y[i / width]);
+    }
+    for (unsigned int dtype : {2U, 3U}) for (int scalar_role = 0; scalar_role < 2; ++scalar_role) {
+        float scalar = 1.0f + ldexpf(1.0f, dtype == 2 ? -11 : -8), output[2];
+        unsigned short tensor[] = {et_to16(3.0f, dtype == 3), et_to16(-5.0f, dtype == 3)};
+        std::vector<std::vector<et_u64>> shapes(2); shapes[1 - scalar_role] = {2};
+        auto m = metadata({2}, shapes); CudaKernelArgs a{};
+        a.elements = 2; a.operation = 2; a.compute_dtype = a.output_dtype = 1;
+        a.metadata = address(m.data()); a.output = address(output);
+        a.inputs[scalar_role] = address(&scalar); a.input_dtypes[scalar_role] = 1;
+        a.integers[scalar_role] = dtype + 1; a.integers[2 + scalar_role] = 2;
+        a.inputs[1 - scalar_role] = address(tensor); a.input_dtypes[1 - scalar_role] = dtype;
+        a.integers[3 - scalar_role] = 1; run(et_binary, a);
+        assert(output[0] == 3.0f && output[1] == -5.0f);
+    }
+}
 static void compute_roles() {
     Compute logits[] = {1, 2, 3, 3, 2, 1}, output[6]{};
-    unsigned int targets[] = {2, 0}, status = 0;
+    unsigned int targets[] = {2, 0}; et_u64 status = 0;
     auto m = metadata({}, {{2, 3}, {2}}); CudaKernelArgs a{};
     a.elements = 1; a.inputs[0] = address(logits); a.inputs[1] = address(targets); a.input_dtypes[1] = 5;
     a.output = address(output); a.metadata = address(m.data()); a.scratch[3] = address(&status); a.integers[0] = (et_u64)-1;
@@ -266,7 +298,7 @@ static void packed_fixtures(const char *path) {
 }
 static void cache_storage() {
     float q[] = {0, 0}, k[] = {1, -2}, v[] = {3, -4}, output[2]{};
-    unsigned int valid = 1, cursor = 0, status = 0;
+    unsigned int valid = 1, cursor = 0; et_u64 status = 0;
     auto m = metadata({1, 1, 1, 2}, {{1, 1, 1, 2}, {1, 1, 1, 2}, {1, 1, 1, 2}});
     for (unsigned int dtype : {1U, 2U, 3U, 6U}) {
         alignas(8) unsigned char keys[16], values[16]; memset(keys, 0xcd, sizeof(keys)); memset(values, 0xcd, sizeof(values));
@@ -293,7 +325,7 @@ static void cache_storage() {
 static void cache_prefix_canvas() {
     for (unsigned int dtype : {1U, 2U, 3U}) for (bool causal : {false, true}) for (unsigned int retained : {0U, 2U}) {
         const unsigned int heads = 2, dim = 3, tokens = 3, count = 2, cursor = 44;
-        unsigned int valid = count, status = 0;
+        unsigned int valid = count; et_u64 status = 0;
         auto m = metadata({1, heads, tokens, dim}, {{1, heads, tokens, dim}, {1, 1, tokens, dim}, {1, 1, tokens, dim}});
         alignas(8) unsigned char q[72]{}, k[36]{}, v[36]{}, prefix_k[24]{}, prefix_v[24]{}, tail_k[24]{}, tail_v[24]{};
         float out[heads * tokens * dim]{};
@@ -366,6 +398,35 @@ static void linear_bias_rounding() {
     assert(output[0] == 0xabcd && output[3] == 0xabcd);
     assert(output[1] == 0x4381 && output[2] == 0x3f80); // 258, 1.
 }
+// CUDA barriers cannot execute on the host. Run each disjoint network stage
+// using the production comparator, then compare with an independent stable sort.
+static void top_k_bitonic_network() {
+    unsigned int state = 0x71ac4935U;
+    for (unsigned int width : {128U, 256U}) for (unsigned int trial = 0; trial < 128; ++trial) {
+        std::vector<float> values(width);
+        std::vector<unsigned int> orders(width), indices(width), expected(width);
+        for (unsigned int index = 0; index < width; ++index) {
+            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+            unsigned int bits = state;
+            if ((bits & 0x7f800000U) == 0x7f800000U) bits ^= 0x00800000U;
+            values[index] = trial % 3 == 0 ? float(int(state % 9) - 4) : __uint_as_float(bits);
+            indices[index] = expected[index] = index;
+        }
+        values[0] = -0.0f; values[1] = 0.0f;
+        values[2] = INFINITY; values[3] = -INFINITY; values[4] = INFINITY;
+        values[5] = std::numeric_limits<float>::denorm_min(); values[6] = -values[5];
+        if (trial == 0) std::fill(values.begin(), values.end(), 0.0f);
+        for (unsigned int index = 0; index < width; ++index) orders[index] = et_top_k_order(values[index]);
+        for (unsigned int size = 2; size <= width; size <<= 1)
+            for (unsigned int stride = size >> 1; stride; stride >>= 1)
+                for (unsigned int index = 0; index < width; ++index) {
+                    unsigned int other = index ^ stride;
+                    if (index < other) et_top_k_pair(orders.data(), indices.data(), index, other, (index & size) == 0);
+                }
+        std::stable_sort(expected.begin(), expected.end(), [&](unsigned int a, unsigned int b) { return values[a] > values[b]; });
+        assert(indices == expected);
+    }
+}
 static void top_k_indices() {
     constexpr unsigned int width = 128, rows = 6;
     std::vector<float> scores(width * rows);
@@ -376,7 +437,7 @@ static void top_k_indices() {
     scores[4] = INFINITY; scores[5] = -INFINITY; scores[6] = INFINITY;
     for (unsigned int k : {1U, 8U, width}) {
         std::vector<unsigned int> output(rows * k + 2, 0xdeadbeefU);
-        unsigned int status = 0;
+        et_u64 status = 0;
         CudaKernelArgs a{}; a.elements = rows * k;
         a.inputs[0] = address(scores.data()); a.output = address(output.data() + 1);
         a.scratch[3] = address(&status); a.integers[0] = k; a.integers[1] = width;
@@ -395,9 +456,47 @@ static void top_k_indices() {
     }
     blockIdx.x = threadIdx.x = 0;
 }
+// Checks the actual fallback store, both layouts, inactive-row holes and
+// redzones. Compare direct BF16 to the original F32 result plus boundary cast.
+static void attention82_round() {
+    constexpr unsigned int heads=2, tokens=3, declared=5, dim=8, active=heads*tokens*dim, extent=heads*declared*dim;
+    for (unsigned int layout=0; layout<2; ++layout) for (unsigned int base=0; base<65536; base+=active) {
+        float source[active]; float reference[extent+2]{};
+        unsigned short direct[extent+2]{};
+        for (unsigned int i=0; i<active; ++i) source[i]=__uint_as_float(((base+i)&65535U)<<16 | 0x8000U);
+        direct[0]=direct[extent+1]=0xdead;
+        reference[0]=reference[extent+1]=17.0f;
+        CudaKernelArgs a{}; a.inputs[2]=address(source); a.elements=active;
+        a.integers[7]=declared; a.integers[10]=dim; a.integers[11]=heads; a.integers[15]=tokens;
+        a.operation=layout;
+        for (unsigned int i=0; i<active; ++i) {
+            blockIdx.x=i/256; threadIdx.x=i%256;
+            a.output=address(reference+1); a.output_dtype=1; et_kv_gemm_round(a);
+            a.output=address(direct+1); a.output_dtype=3; et_kv_gemm_round(a);
+        }
+        for (unsigned int i=0; i<extent; ++i) assert(direct[i+1]==et_to16(reference[i+1],true));
+        assert(direct[0]==0xdead && direct[extent+1]==0xdead);
+        assert(reference[0]==17.0f && reference[extent+1]==17.0f);
+    }
+    blockIdx.x=threadIdx.x=0;
+}
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--attention82-round") == 0) { attention82_round(); puts("attention82 fallback round passed"); return 0; }
+    if (argc > 1 && strcmp(argv[1], "--top-k") == 0) {
+        top_k_indices();
+        top_k_bitonic_network();
+        puts("CUDA host stable top-k tests passed");
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--binary-broadcast") == 0) {
+        binary_broadcast_indexing();
+        scalar_coercion();
+        puts("CUDA host binary broadcasting tests passed");
+        return 0;
+    }
     top_k_indices();
     half_scatter_updates();
+    binary_broadcast_indexing();
     casts(); integers_and_roles(); scalar_coercion(); compute_roles(); cache_storage(); cache_prefix_canvas(); linear_bias_rounding(); packed_fixtures(argc > 1 ? argv[1] : nullptr);
     puts("CUDA host scalar/ABI tests passed");
 }

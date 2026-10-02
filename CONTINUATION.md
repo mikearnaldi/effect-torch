@@ -1,72 +1,139 @@
-# DiffusionGemma exact-BF16 CUDA performance handoff — 2026-09-26
+# DiffusionGemma CUDA optimization — measured goal achieved
 
-## Read this first
+## Current result
 
-The user explicitly asked to destroy the CUDA devbox and save a detailed handoff. RunPod pod `3osuz1y6r3bf3w` was deleted on 2026-09-26: `runpodctl pod delete` returned `{"deleted": true, "id": "3osuz1y6r3bf3w"}`. `nix develop --command ./scripts/cuda-devbox.sh show` subsequently showed empty `pod_id` and `address`. Its `/root` model copy, compiled addons, vLLM environment, benchmark JSONL, and Nsight reports were **not copied locally before deletion** and must be recreated if GPU work resumes. No GPU job is running. Never run `cuda-devbox.sh create` or `destroy` without a new explicit user request; see repository `AGENTS.md`.
+Both requested matched end-to-end median targets have been measured below vLLM.
+Final combined receipt validation passed. Goal achieved for this benchmark scope;
+do not resume optimization without a new user request.
 
-The objective remains **beat 514 ms median** for vLLM 0.24.0 exact-BF16 DiffusionGemma inference on one RTX PRO 6000 Blackwell. The result is **not achieved**. On the last pod, the accepted Effect Torch baseline was 1,078.343 ms at 32 prompt / 64 output / concurrency 1 and 1,209.563 ms at 128 / 64 / 1. Matched vLLM medians were 600.074 ms and 511.45 ms. These are warmed five-run medians on the same pod, but noisy. The archived 514 ms goal is still the bar, rather than the new 600 ms 32/64/1 vLLM median.
+| Prompt / output / concurrency | Effect median | Fresh matched vLLM | Reduction |
+| ----------------------------- | ------------: | -----------------: | --------: |
+| 32 / 64 / 1                   | 552.562360 ms |      554.558223 ms |   0.3599% |
+| 128 / 64 / 1                  | 530.969076 ms |      532.181951 ms |   0.2279% |
 
-The handoff was committed on branch `perf/diffusion-gemma-cuda-expert-profiling`, based on `aece436` (`Skip gitlink directories in CUDA devbox sync`), with all work kept local and unpushed. It includes an **opt-in diagnostic GPU-event profiler** in `crates/runtime-cuda/src/executable.rs`. There is no accepted pending speed optimization. The rejected warp top-k implementation was removed. Do not mistake stale descriptions in older session summaries for current code.
+Small measured margins, not a statistical performance guarantee. Effect was
+faster in 5/5 individual 32-token cases and 2/5 individual 128-token cases.
+The goal is both medians, not every individual case.
 
-## Contract and exactness gates
+Same sealed seven-case bank, two warmups and five measured cases per target.
+Both backends perform actual model and sampler computations along identical
+canonical generation trajectories. Timing includes prefill and the full
+256-token terminal commit; tokenization and initialization are excluded.
+Natural generation quality is checked separately.
 
-- Model: `google/diffusiongemma-26B-A4B-it`, revision `f7f5b7f5fa82ffc52addd066915886d497f5517b`, all 11 BF16 checkpoint shards (51.7 GB) verified against official hashes. The pinned benchmark manifest is `packages/bench/diffusion-gemma/manifest.json`; it contains model, tokenizer, chat-template, generation, vLLM wheel/image, and hardware pins.
-- Preserve checkpoint, tokenizer, chat template, answer order, initialized RoPE state, entropy-bound diffusion, probability averaging, independent reads, prefix sharing, cancellation, deterministic cleanup, and shutdown ordering. No quantization, alternate precision, CPU offload, or approximate numerical substitute.
-- Initialized RoPE safetensors SHA-256: `69c413815d1e62b529c88cc1d393b1242a2910a8237cce73f60290206fee9c60`. Local source: `../inference/decision-model/history/benchmarks/20260920-initialized-rope-state-55/result/initialized-rope.safetensors` with adjacent manifest.
-- Four-read gate: `packages/examples/scripts/diffusion-gemma/verify-full.ts`. The final generic CUDA addon passed four independent read/replay pairs; each read had **262144/262144 exact logits**, maximum absolute error zero.
-- Generation gate: `packages/examples/scripts/diffusion-gemma/verify-generation.ts`. The final generic addon passed exact final tokens and all six step argmax canvases, with **31 readbacks** and `externalBytesAfterCleanup: 0`. The copied generation input JSON initially omitted `prefillChunks`; set it to `[256,278]` for the 278-token prompt, or cuBLAS uses a different GEMM geometry and replay diverges. The saved generation reference has eight random canvases and six exponential draw files; all were reconstructed and hash checked on the now-deleted pod with PyTorch 2.11.0+cu130. Reconstruct again from `../inference/decision-model/tools/reference/full_generation.py`; the pod-only script `/root/rebuild-diffusion-draws.py` is gone.
-- Likely local oracle source for the full four-read plus generation record: `../inference/decision-model/history/benchmarks/20260920-full-reference-generation-02/result/` (contains `manifest.json`, `inputs.json`, four read safetensors, and `generation/generation.json`). Confirm hashes against the intended reference before reuse. The older `20260919-cuda-reference-choice26-fixed` and `20260920-full-reference-generation-01` records also exist and have different generation scope. The generation-02 summary says four saved oracle logits exact and 512 generated tokens. Oracle seed noted in prior work: `20260919`.
-- Re-run both exact gates after **every accepted performance change**. Test failure, resource release, and interruption for TS/native boundary changes. Build host addons first. The full 32/128/512/2048 × 64/128/256 × 1/2/4 matrix is deferred until representative latency beats 514 ms.
+## Validated candidate
 
-## Latest matched performance on deleted pod
+Use the **release build with 97, 98, 100 and 101 enabled**, plus the inherited
+BF16, packed projection, sampler, attention and rotary reuse flags in the pinned
+entry. User explicitly permits vLLM-style BF16 arithmetic; original bitwise
+oracle and historical 502/473 ms thresholds are superseded by matched work.
 
-The reduced manifest had prompt targets 32 and 128, output length 64, concurrency 1, one warmup, five measured runs. Each engine ran on the same pod; comparisons remain noisy. Effect Torch used the accepted generic top-k binary, not the rejected warp candidate.
+- Native source archive: `54979d50b5cb2e5ae68ece16540d26150957210dc42c4cbfb74508067a3e337e`.
+- Release addon: `fab05c99fb5158489345af782f1fdbc53f8630e0ad723dda6e86b399e91a8be4`.
+- Release runner archive: `b0f8bbfec8176d2aafe18bcbebf3cccb4908e5146246daa8cd1ee5fb6f660c7d`.
+- Release entry archive: `69809aa47b5bdf6361e8e0c33821a3b4040ac483c3b2be4e1a3b891df69ab599`.
+- Release profile: opt-level3, LTO, codegen-units1, debug/assertions/overflow checks
+  off, panic unwind, incremental off. Explicit profile receipts required.
+- Corrected101 helper PTX: `c3984b2208ee1cdeb4094fb975be3136b2cbe604dafbb744f6fad0bd0a9f5e33`.
 
-| Case         | Effect median, ms | vLLM measured runs, ms                      | vLLM median, ms |
-| ------------ | ----------------: | ------------------------------------------- | --------------: |
-| 32 / 64 / 1  |          1078.343 | 537.867, 839.145, 668.625, 600.074, 568.123 |         600.074 |
-| 128 / 64 / 1 |          1209.563 | 546.113, 511.432, 575.938, 480.495, 511.450 |         511.450 |
+Remote build: `/root/combined97-100-101-release-build-v1`.
+Remote entry: `/root/combined97-100-101-release-entry-v1`.
+Entry archives are flat: extract inside a newly created destination directory.
 
-The Effect Torch individual series was not preserved locally. Pod-only paths were `/root/bench-vllm-resumed-20260926.jsonl` and a matching Effect Torch generic JSONL; both were deleted with the pod. A previous pod gave 570.987 ms vLLM median on a representative case, but it is a different session and should not be mixed with this comparison. Earlier accepted Effect Torch historical results included 980.104 ms direct and 979.950 ms localhost HTTP; hardware/session conditions differ.
+## Correctness and evidence
 
-The provisional warp top-k kernel passed focused CUDA tests, the exact four-read gate, and generation replay, but made latency worse in matched controls: 32/64/1 warp 1098.549 ms versus generic 1078.343 ms; 128/64/1 warp 1264.365 ms versus generic 1209.563 ms. It was removed from `device.rs`, `typed.cu`, `executable.rs`, and its focused tests. No warp top-k code should be revived on those measurements alone.
+- 230 native host tests passed in release mode.
+- Seven combined GPU gates passed: native97 parity; native101 loader, compiled
+  lifecycle, lazy KV schedule and actual-model table schedule; native100 loader
+  and compiled lifecycle.
+- Three supplemental native98 release gates passed: loader, paired lifecycle
+  and stateful instruction mapping.
+- Natural quality: 12/12 tasks; exact outputs and refinement traces versus the
+  corresponding debug candidate. This is bounded smoke coverage.
+- Native97 executed all31 natural refinements;12 request-private samplers.
+- Native101:25 groups/50 aliases at T256, zero at other widths.
+- Native100: exactly one self-conditioning refinement graph.
+- Native98:29 pairs in Append,30 in ReadOnly, no norm63 fallback.
+- Benchmark runners restored all8 installed files and removed private imports.
+  The installed baseline remains intact; the release candidate is reproducibly
+  selected by the guarded runner, not permanently installed over it.
 
-## Last profiling evidence and interpretation
+Remote final runs:
 
-An opt-in GPU-event profiler is the lone tracked local modification in `crates/runtime-cuda/src/executable.rs`. `EFFECT_TORCH_CUDA_GROUPED_PROFILE_PATH` writes per-program JSONL phase and GEMM aggregates; it disables CUDA graphs while active. On one 32/64/1 warmup plus one measured request, **first expert projections totaled 556.6 ms and second projections 365.0 ms across both requests**. Do not treat those aggregates as one-request wall time: multiple streams overlap, and instrumentation adds overhead. The pod-only output was `/root/effect-grouped-profile-20260926.jsonl`.
+- `/root/combined97-98-100-101-release-natural-v1`
+- `/root/combined97-98-100-101-release-timing32-v1`
+- `/root/combined97-98-100-101-release-timing128-v1`
+- `/root/combined97-100-101-release-build-v1/hardware/assessment.json`
+- `/root/combined97-100-101-release-build-v1/hardware-norm98-v1/assessment.json`
 
-Nsight Systems 2025.1.3 traces were captured for one warmed 32/64/1 request per engine. Pod-only paths were `/root/nsys-vllm-20260926.nsys-rep` and `/root/nsys-effect-noevent-20260926.nsys-rep`, with corresponding `.sqlite` exports. The raw files are gone. Nsight needs `--sample=none --cpuctxsw=none` on this pod type; Effect Torch additionally needed `--cuda-event-trace=false`, because the default capture stalled with an idle GPU and was killed. Profiled Effect Torch request time was 1389.972 ms, and profiled vLLM request time was 505.175 ms; **do not compare those to unprofiled benchmark latency**.
+Local final evidence:
+`bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/`.
+Shared build receipts are in the parent `build/` directory. Preserve raw records,
+comparison receipts, provenance and restoration receipts, including failures.
 
-For the measured request only, the benchmark JSONL `timestamp` and `elapsedMilliseconds` were aligned to Nsight's `TARGET_INFO_SESSION_START_TIME.utcEpochNs`, then `CUPTI_ACTIVITY_KIND_KERNEL.start/end` were grouped via `StringIds.demangledName`. The window included ~50 ms before request start and ~100 ms after completion to tolerate timestamp alignment. Overall Nsight summaries include JIT/startup/autotuning and are not evidence for request kernel mix.
+Final receipt: `accepted-norm98/measured-goal.json`, SHA256
+`ef7c08a0c72af2dc5a694c08296f2e5f7467985f5221ee6b3c6d3a65a13622a3`.
+`ACCEPTANCE-README.txt` contains exact run commands and the independent validator.
+Final workspace TypeScript typecheck and lint passed; touched native files passed
+formatting checks and release native tests as listed above.
 
-| Measured-window observation |                                                                                                vLLM |                                                                                                                              Effect Torch |
-| --------------------------- | --------------------------------------------------------------------------------------------------: | ----------------------------------------------------------------------------------------------------------------------------------------: |
-| CUDA kernel launches        |                                                                                               1,268 |                                                                                                                                   130,895 |
-| Dominant BF16 GEMMs         | two large CUTLASS tensorop families, 18 instances each, ~21.3 and ~21.1 ms accumulated GPU duration |   small CUTLASS WMMA 16×16 and 32×32 families: 25,064 instances / 545.2 ms, 21,762 / 286.6 ms, 18,580 / 143.3 ms accumulated GPU duration |
-| Other prominent kernels     |                       Triton sampler/reduction families, ~10.5 and ~6.3 ms accumulated GPU duration | 14,613 split-K reductions / 35.3 ms; 8,036 `et_fused_elementwise` / 93.3 ms; 4,032 `et_binary` / 81.3 ms; 16 `et_top_k_indices` / 31.2 ms |
+## Reproduction
 
-This establishes a **roughly 103× launch-count gap** in the selected request windows. It does not establish a 103× runtime gap: streams overlap, GPU durations summed across kernels can double-count, and the request-window selection was approximate. The trace strongly implicates many small exact-BF16 cuBLAS expert GEMMs, but the exact fraction of wall time attributable to launch overhead versus compute is not isolated. FlashInfer fused-MoE kernels appeared in vLLM's overall trace but not in the selected measured window, so do not assert they implement the measured inference path without further tracing.
+Use the pinned Nix shell on a fresh matching GPU machine after restoring the
+verified external backup. See `packages/bench/diffusion-gemma/reproduction/README.txt`
+for restoration and CPU evidence verification. Choose fresh output directories.
+The entry checks source, addon, helper images, quality, release profile and
+installed baseline before changing anything; it restores installed files after
+execution. Root schedules remote workloads sequentially.
 
-Current grouped path: `crates/runtime-cuda/src/executable.rs` compacts rows per expert, invokes `CudaDevice::grouped_gemm_bf16`, and scatters results. `crates/runtime-cuda/src/device.rs` distributes sorted groups across 32 streams. `crates/runtime-cuda/src/cublas.rs` calls `cublasGemmStridedBatchedEx` once per active expert with batch 1, default BF16 math, a 32 MiB workspace per stream, and 32 expert streams. This is why a single grouped operation still submits many small GEMMs. The kernel families use small WMMA tiles and split-K reduction. The profiler's 556.6/365.0 ms aggregate supports making expert projection the next target, but profiling overhead and overlap require a controlled candidate benchmark.
+```bash
+nix develop --command ./scripts/cuda-devbox.sh run python3 \
+  /root/combined97-100-101-release-entry-v1/run.py timing32 \
+  --norm98 --refresh-vllm \
+  --quality /root/combined97-98-100-101-release-natural-v1 \
+  --baseline-effect /root/combined97-98-100-101-release-timing32-v1/prompt-32/effect-combined97-100-101-release-v1.jsonl \
+  --output /root/combined101-recheck32
+```
 
-## Exact-BF16 numerical constraint and rejected approaches
+For128 change `timing32` to `timing128`, use the corresponding timing128/prompt-128
+baseline, and a fresh output directory. Do not compare unmatched stopping policies
+or omit the actual terminal commit.
 
-Read `docs/rfcs/0027-implementation.md` around the expert rounding discussion and `docs/rfcs/0027-model-families-and-decision-inference.md` before changing grouped expert semantics. Official expert capture 19 and component capture 20 live in `../inference/decision-model/history/benchmarks/20260920-full-reference-experts-19/` and `20260920-effect-expert-components-20/`; the former has `result/experts.safetensors`. `20260920-cuda-expert-rounding-proof-22/` contains inputs, outputs, and an exact-rational proof.
+## Important corrections and parked work
 
-Default BF16 cuBLAS with the 32 MiB workspace reproduces all ten captured expert projections exactly. For 28 of 96 examined encoder gate/up values, the reference BF16 result lies outside a conservative bound for **any** F32 reduction order followed by one BF16 rounding. That proves the reference involves intermediate BF16 reduction behavior; a conventional custom F32-accumulating grouped WMMA kernel cannot meet the gate merely by tuning arithmetic order. The exact internal cuBLAS split partition is still unknown. A prior custom grouped WMMA projection matched only 1,388–2,920 of 262,144 logits and had errors above 2.6. cuBLAS 13 replacement matched only 2,837–3,192 logits and had max errors 2.91–4.98. cuBLAS algorithm IDs 0–23 and 99–115 dispatched apparently the same kernel and took ~0.726–0.731 ms on a representative projection.
+Recent isolated build runners accidentally omitted the package debug script's
+`CARGO_PROFILE_DEV_OPT_LEVEL=2` and produced unoptimized Rust addons. Correcting
+this with the identical-source release build reduced the 32-token median from
+569.548225 to557.205200ms before enabling98. Earlier release68 experiments were
+release versus optimized dev level2, so did not cover this regression.
 
-Other attempted directions already rejected or exhausted: prior grouped/batched cuBLAS variants, compact routed indices, persistent host workers, 24 or 48 expert streams, direct BF16 KV output, generic KV attention, inline RMSNorm conversion, grouped-order shortcuts, segmented CUDA graphs, and warp top-k. A dense-branch overlap prototype became exact only after branch-owned input copying, then measured 2212.977 ms median due roughly 2,400 per-request allocations; it was removed. Revisit overlap only with planner-owned storage and explicit asynchronous lifetimes. `EXPERT_BLAS_STREAMS` was previously raised from 10 to 16 to 32 in accepted commits; 32 is the current baseline.
+Native101 originally admitted zero real groups. Fixed structural repeated-half
+proof for full-width tables, normalized Q/K alias equivalence, and valid V RMS
+operation bits0..3. Actual-model stateful fixture now exercises all three.
+Full-table component passed16 proofs/33 formula records; complete pipeline
+23.30→12.10us. Do not quote the obsolete compact-table63% component gain.
 
-Potential next research task: determine whether any grouped submission/capture scheme can preserve each expert's **exact** current cuBLAS algorithm, workspace, input row count, and BF16 split reduction while reducing host/device launch overhead. Compare against the captured expert component tensors **before** full-model replay. Also inspect per-request kernel geometry and CUDA graph replay more carefully to understand vLLM's measured path. Avoid repeating a custom one-round F32 kernel. A candidate must beat the generic control in warmed same-pod runs and pass both exact gates before acceptance.
+Local profiling draft `combined101-profile-v1` is parked. Global-layer fusion and
+shared table preparation are unimplemented proposals; no savings claims.
 
-## Recreating the environment when authorized
+## Infrastructure and authorization
 
-1. Start from branch `perf/diffusion-gemma-cuda-expert-profiling` and inspect `git status`; preserve the opt-in profiler unless intentionally removing it. The sync fix in `aece436` skips the tracked `.bench/llama.cpp` gitlink. Follow `AGENTS.md` and enter the pinned Nix shell. **Creating a new pod requires a new explicit user instruction.**
-2. After the user authorizes a pod, `./scripts/cuda-devbox.sh template` if image digest changed, `create` only with authorization, then `bootstrap`. The last pod used RTX PRO 6000 Blackwell, 251 GB cgroup memory, and CUDA 12.9 Nsight package. The old pod ID and SSH endpoint are invalid. The ignored `.cuda-devbox.env` retains nonconnection template settings but has empty pod/address state.
-3. Restore the pinned 11-shard checkpoint to `/root/models/diffusiongemma` and verify sizes/SHA-256 against its official manifest. Restore oracle four-read inputs/reference and initialized state from the sibling `../inference/decision-model` history. Restore generation metadata and reconstruct the six 256 MiB draw files, checking their hashes and all eight canvases. Pod `/root` paths in previous logs no longer exist.
-4. Build debug CUDA, tokenizer, and CPU addons as needed. Create the Hugging Face offline revision snapshot symlink to the verified checkpoint. Install pinned vLLM 0.24.0 using `pnpm bench:diffusion-gemma-vllm-setup`; its script refuses an existing venv, so inspect before rerunning. Last pod used `/root/.cache/effect-torch/vllm-0.24.0/bin/python`.
-5. Fresh Blackwell FlashInfer JIT needed `C_INCLUDE_PATH=/usr/include:/usr/include/x86_64-linux-gnu` because Triton's C helper lacked host Python headers in the Nix shell. Nix's GCC wrapper linked the JIT `.so` against newer glibc than the host Python process, producing `GLIBC_ABI_GNU2_TLS` loader failure. Use `CXX=/usr/bin/g++` for FlashInfer C++ objects. The last pod successfully compiled with `MAX_JOBS=4` under a 251 GB limit; an earlier 125 GB pod OOMed with excessive parallelism, so size concurrency to the new machine. `HF_HUB_OFFLINE=1` and the pinned `VLLM_PYTHON` were used for the benchmark. No wheel or source patch was required; a cached `build.ninja` was relinked with host `g++` on the old pod.
-6. Use a reduced manifest with 32/128 prompt targets, 64 output tokens, concurrency 1, warmup 1, measured 5, and run one GPU job at a time. Effect runner: `pnpm --filter @effect-torch/bench exec tsx diffusion-gemma/effect-direct.ts`; vLLM runner: `pnpm bench:diffusion-gemma-vllm`. Both use `MANIFEST` and `OUTPUT`; Effect also needs `MODEL_PATH` and `INITIALIZED_STATE_PATH` (safetensors path). Keep load/JIT out of timed requests. After an accepted candidate, rerun `verify-full.ts` with four reads and prefill `256,278`, then `verify-generation.ts` with `prefillChunks: [256,278]` and new evidence paths. The generation inputs must point to the restored `generation/generation.json`.
-7. Run focused native/CUDA tests, then `pnpm typecheck`, `pnpm lint`, `cargo fmt --all -- --check`, relevant `cargo check`/tests, and `git diff --check`. Do not edit generated `dist/`, `target/`, or `node_modules/`, or generated native declarations by hand. Keep work local and unpushed unless asked.
+Local `/home/michaelarnaldi/effect-torch`; remote `/root/effect-torch`.
+RunPod `ctdfyl5lyv09eg`, RTX PRO6000 Blackwell96GB.
+SSH root@103.196.86.151:12168, key `.cuda-devbox-ssh-key`.
+Model `/root/models/diffusiongemma`; oracle `/root/oracle-eager-20260930`;
+initialized RoPE `initialized-state/initialized-rope.safetensors`;
+sealed bank `/root/native66-fresh-distinct-v1`.
+Shared Cargo target `/root/whole-read71-build-v1/target`.
 
-Previous local checks after the rejected warp removal passed: `cargo fmt --all -- --check`, `cargo check -p effect-torch-runtime-cuda --features napi-addon`, `pnpm typecheck`, `pnpm lint`, `bash -n scripts/cuda-devbox.sh`, and `git diff --check`. The final generic addon built and passed both exact gates on the now-deleted pod. There is no need to rerun those checks merely to validate this documentation edit.
+The latest user request explicitly authorizes destroying this devbox after preserving
+reproduction assets, committing the complete work on a branch, pushing and creating
+a PR. This supersedes the earlier no-commit/no-destruction handoff. Credentials
+and generated large dependencies remain outside Git. Never commit env files.
+
+Branch: `perf/diffusion-gemma-bf16-reproduction`. Teardown and verified archive
+receipts are recorded in the reproduction bundle when complete.
+
+Earlier history, including all original failed attempts and artifact references,
+is archived in `bench-results/diffusion-gemma-20260930/continuation-history-through101-release-v1.md`
+and the prior through81/through87 history files.

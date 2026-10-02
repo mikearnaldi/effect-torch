@@ -28,6 +28,112 @@ fn sum(a: Arc<Node>, dims: &[usize], keepdims: bool) -> Arc<Node> {
 }
 
 #[test]
+fn small_max_dispatch_requires_opt_in_and_short_trailing_f32_max() {
+    use crate::executable::{small_max_eligible, CudaKernelArgs};
+    let mut args = CudaKernelArgs {
+        elements: 256,
+        operation: 2,
+        compute_dtype: 1,
+        ..Default::default()
+    };
+    args.integers[1] = 128;
+    args.integers[2] = 1;
+    assert!(small_max_eligible("et_reduce_f32", &args, true));
+    assert!(!small_max_eligible("et_reduce_f32", &args, false));
+    assert!(!small_max_eligible("et_reduce_f64", &args, true));
+    for dtype in [0, 2, 3, 4, 5, 6] {
+        args.compute_dtype = dtype;
+        assert!(!small_max_eligible("et_reduce_f32", &args, true));
+    }
+    args.compute_dtype = 1;
+    for width in [0, 4096, 262144] {
+        args.integers[1] = width;
+        assert!(!small_max_eligible("et_reduce_f32", &args, true));
+    }
+    args.integers[1] = 128;
+    for operation in [0, 1, 3, 4] {
+        args.operation = operation;
+        assert!(!small_max_eligible("et_reduce_f32", &args, true));
+    }
+    args.operation = 2;
+    args.integers[2] = 0;
+    assert!(!small_max_eligible("et_reduce_f32", &args, true));
+    args.integers[2] = 1;
+    args.elements = 0;
+    assert!(!small_max_eligible("et_reduce_f32", &args, true));
+}
+
+#[test]
+#[ignore = "requires CUDA and EFFECT_TORCH_CUDA_SMALL_MAX=1"]
+fn small_max_matches_generic_bits_for_finite_nan_zero_and_infinity() {
+    assert_eq!(std::env::var("EFFECT_TORCH_CUDA_SMALL_MAX").unwrap(), "1");
+    // A transposed host layout forces the generic nontrailing reduction while
+    // keeping each row's value order identical. No process-global flag changes.
+    for width in [1, 7, 31, 32, 33, 128, 257, 4095] {
+        let rows = if width == 128 { 256 } else { 17 };
+        let values: Vec<f64> = (0..rows * width)
+            .map(|index| {
+                let row = index / width;
+                let column = index % width;
+                match row {
+                    0 => f64::NAN,
+                    1 => f64::NEG_INFINITY,
+                    2 => f64::INFINITY,
+                    3 => -0.0,
+                    4 => 0.0,
+                    5 => {
+                        if column % 2 == 0 {
+                            -0.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    6 => {
+                        if column % 2 == 0 {
+                            0.0
+                        } else {
+                            -0.0
+                        }
+                    }
+                    7 => [f64::NAN, -0.0, f64::NEG_INFINITY][column % 3],
+                    8 => [f64::NAN, f64::INFINITY, -1.0][column % 3],
+                    9 => [f64::NAN, -3.0, -1.0][column % 3],
+                    10 => f32::from_bits(1 + column as u32 % 17) as f64,
+                    11 => -(f32::from_bits(1 + column as u32 % 17) as f64),
+                    12 => [f32::MIN_POSITIVE as f64, -0.0, f64::NAN][column % 3],
+                    13 => [f32::MAX as f64, -(f32::MAX as f64)][column % 2],
+                    _ => ((index * 101 % 4093) as f64 - 2046.0) / 128.0,
+                }
+            })
+            .collect();
+        let transposed: Vec<_> = (0..width * rows)
+            .map(|index| values[(index % rows) * width + index / rows])
+            .collect();
+        let mut outputs = Vec::new();
+        for (shape, dims, data) in [
+            ([rows, width], vec![1], &values),
+            ([width, rows], vec![0], &transposed),
+        ] {
+            let root = node(NodeKind::Max {
+                a: input(0, &shape, DType::F32),
+                dims,
+                keepdims: false,
+            });
+            let executable = crate::compile(vec![root], 0).unwrap();
+            let output = executable
+                .execute(
+                    &[host(&shape, DType::F32, data)],
+                    &[],
+                    &CancellationFlag::new(),
+                )
+                .unwrap();
+            outputs.push(output[0].read_storage_bytes().unwrap());
+        }
+        assert_eq!(outputs[0], outputs[1], "width={width}");
+    }
+}
+
+#[test]
 #[ignore = "requires a CUDA device"]
 fn sum_independent_rational_rounding_witness() {
     // Exact dyadic sum = 355686261 / 1073741824. The sequential kernel rounded
@@ -408,5 +514,7 @@ fn sum_captured_compiled_softmax_routing_chain() {
             "stage {name}"
         );
     }
-    eprintln!("compiled routing chain exact, legacy={legacy}, probabilities=35584 weights=2224 all 278 rows and native indices preserved");
+    eprintln!(
+        "compiled routing chain exact, legacy={legacy}, probabilities=35584 weights=2224 all 278 rows and native indices preserved"
+    );
 }

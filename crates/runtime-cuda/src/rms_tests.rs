@@ -31,6 +31,49 @@ fn seeded(count: usize, seed: u32) -> Vec<f64> {
 }
 
 #[test]
+fn static_rms_requires_supported_storage_width_and_single_row_ctas() {
+    use crate::executable::{rms_static2816_kernel, CudaKernelArgs};
+    let mut args = CudaKernelArgs {
+        operation: 2,
+        elements: 256 * 2816,
+        output_dtype: 1,
+        ..Default::default()
+    };
+    args.integers[0] = 2816;
+    args.input_dtypes[0] = 1;
+    assert_eq!(
+        rms_static2816_kernel(&args),
+        Some("et_rms_norm_static2816_1_1")
+    );
+    args.operation = 1;
+    assert_eq!(rms_static2816_kernel(&args), None);
+    args.operation = 3;
+    for elements in [0, 2815, 2817, 65536 * 2816] {
+        args.elements = elements;
+        assert_eq!(rms_static2816_kernel(&args), None);
+    }
+    args.elements = 65535 * 2816;
+    assert!(rms_static2816_kernel(&args).is_some());
+    for width in [0, 1024, 2815, 4096] {
+        args.integers[0] = width;
+        assert_eq!(rms_static2816_kernel(&args), None);
+    }
+    args.integers[0] = 2816;
+    for dtype in [0, 2, 4, 5, 6] {
+        args.input_dtypes[0] = dtype;
+        assert_eq!(rms_static2816_kernel(&args), None);
+    }
+    args.input_dtypes[0] = 3;
+    args.output_dtype = 3;
+    assert_eq!(
+        rms_static2816_kernel(&args),
+        Some("et_rms_norm_static2816_3_3")
+    );
+    args.output_dtype = 2;
+    assert_eq!(rms_static2816_kernel(&args), None);
+}
+
+#[test]
 #[ignore = "requires a CUDA device"]
 fn rms_fixed_independent_bf16_rounding_regression() {
     // Fixed PyTorch 2.10.0+cu128 oracle from bounded RMS replay 31. The old
@@ -199,7 +242,12 @@ fn rms_widths_tails_views_and_dtype_contract() {
                             _ => 2e-6,
                         };
                         let atol = if dtype == DType::F16 { 3e-8 } else { 1e-14 };
-                        assert!((out[r*width+c]-expected).abs() <= atol + expected.abs()*relative, "{dtype:?} [{rows},{width}] weighted={weighted} at {r},{c}: {} != {expected}",out[r*width+c]);
+                        assert!(
+                            (out[r * width + c] - expected).abs()
+                                <= atol + expected.abs() * relative,
+                            "{dtype:?} [{rows},{width}] weighted={weighted} at {r},{c}: {} != {expected}",
+                            out[r * width + c]
+                        );
                     }
                 }
             }
@@ -280,5 +328,171 @@ fn rms_broadcast_extreme_finite_cancellation_and_retained_outputs() {
         }
         drop(executable);
         assert_eq!(retained[0].readback().unwrap(), vec![0.; 17 * width]);
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA and EFFECT_TORCH_CUDA_SHARED_RMS=1"]
+fn shared_rms_exact_products_views_retained_outputs_and_cancellation() {
+    use effect_torch_compiler::CompileOptions;
+    assert_eq!(std::env::var("EFFECT_TORCH_CUDA_SHARED_RMS").unwrap(), "1");
+    for dtype in [DType::BF16, DType::F32] {
+        for width in [1024, 1025, 2816] {
+            let rows = 11;
+            let x = input(0, &[1, rows, width], dtype);
+            let view = Node::new(NodeKind::Reshape {
+                a: x.clone(),
+                shape: vec![rows, width],
+            })
+            .unwrap();
+            let weight = input(1, &[width], dtype);
+            let roots = vec![
+                Node::new(NodeKind::RmsNorm {
+                    x: view.clone(),
+                    weight: None,
+                    eps: 1e-6,
+                })
+                .unwrap(),
+                Node::new(NodeKind::RmsNorm {
+                    x: x.clone(),
+                    weight: Some(weight),
+                    eps: 1e-6,
+                })
+                .unwrap(),
+                Node::new(NodeKind::RmsNorm {
+                    x,
+                    weight: Some(input(2, &[width], dtype)),
+                    eps: 1e-6,
+                })
+                .unwrap(),
+                view,
+            ];
+            let optimized =
+                crate::compile_with_options(roots.clone(), 0, CompileOptions::default()).unwrap();
+            assert!(optimized
+                .diagnostics()
+                .instructions
+                .iter()
+                .any(|i| i.kind == "et_shared_rms_norm_f32" && i.count == 1));
+            let reference = crate::compile_with_options(
+                roots,
+                0,
+                CompileOptions {
+                    optimize: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut retained = Vec::new();
+            for seed in [17, 29, 41] {
+                let mut values = seeded(rows * width, seed);
+                for column in 0..width {
+                    values[column] = -0.0;
+                    values[width + column] = if column % 2 == 0 { -0.0 } else { 0.0 };
+                    values[2 * width + column] = f32::from_bits(1 + column as u32 % 17) as f64;
+                    values[3 * width + column] = 1e30;
+                    values[4 * width + column] = if column == 0 { f64::NAN } else { 1.0 };
+                    values[5 * width + column] = if column == 0 { f64::INFINITY } else { -1.0 };
+                    values[6 * width + column] = if column == 0 { f64::NEG_INFINITY } else { 1.0 };
+                }
+                let bindings = [
+                    host(&[1, rows, width], dtype, &values),
+                    host(&[width], dtype, &seeded(width, seed + 101)),
+                    host(
+                        &[width],
+                        dtype,
+                        &(0..width)
+                            .map(|i| [-0.0, 0.0, 1.0, -1.0][i % 4])
+                            .collect::<Vec<_>>(),
+                    ),
+                ];
+                let input_bytes = bindings[0].read_storage_bytes().unwrap();
+                let cancelled = CancellationFlag::new();
+                cancelled.cancel();
+                assert!(optimized.execute(&bindings, &[], &cancelled).is_err());
+                let expected = reference
+                    .execute(&bindings, &[], &CancellationFlag::new())
+                    .unwrap();
+                let actual = optimized
+                    .execute(&bindings, &[], &CancellationFlag::new())
+                    .unwrap();
+                for (left, right) in actual.iter().zip(&expected) {
+                    let expected_bytes = right.read_storage_bytes().unwrap();
+                    assert_eq!(
+                        left.read_storage_bytes().unwrap(),
+                        expected_bytes,
+                        "{dtype:?} width={width} seed={seed}"
+                    );
+                    retained.push((left.clone(), expected_bytes));
+                }
+                assert_eq!(bindings[0].read_storage_bytes().unwrap(), input_bytes);
+            }
+            // All slices survive subsequent calls, executable drop, and owner
+            // handle release. Each retained slice keeps the allocation lease.
+            drop(optimized);
+            drop(reference);
+            for (output, expected) in retained {
+                assert_eq!(output.read_storage_bytes().unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA and EFFECT_TORCH_CUDA_SHARED_RMS=1"]
+fn shared_rms_materializes_outer_permute_before_shared_reduction() {
+    use effect_torch_compiler::CompileOptions;
+    assert_eq!(std::env::var("EFFECT_TORCH_CUDA_SHARED_RMS").unwrap(), "1");
+    let width = 1024;
+    let source = Node::new(NodeKind::Permute {
+        a: input(0, &[2, 3, width], DType::BF16),
+        dims: vec![1, 0, 2],
+    })
+    .unwrap();
+    let roots = vec![
+        Node::new(NodeKind::RmsNorm {
+            x: source.clone(),
+            weight: None,
+            eps: 1e-6,
+        })
+        .unwrap(),
+        Node::new(NodeKind::RmsNorm {
+            x: source,
+            weight: Some(input(1, &[width], DType::BF16)),
+            eps: 1e-6,
+        })
+        .unwrap(),
+    ];
+    let bindings = [
+        host(&[2, 3, width], DType::BF16, &seeded(6 * width, 17)),
+        host(&[width], DType::BF16, &seeded(width, 31)),
+    ];
+    let optimized =
+        crate::compile_with_options(roots.clone(), 0, CompileOptions::default()).unwrap();
+    assert!(optimized
+        .diagnostics()
+        .instructions
+        .iter()
+        .any(|i| i.kind == "et_shared_rms_norm_f32"));
+    let reference = crate::compile_with_options(
+        roots,
+        0,
+        CompileOptions {
+            optimize: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected = reference
+        .execute(&bindings, &[], &CancellationFlag::new())
+        .unwrap();
+    let actual = optimized
+        .execute(&bindings, &[], &CancellationFlag::new())
+        .unwrap();
+    for (left, right) in actual.iter().zip(expected) {
+        assert_eq!(
+            left.read_storage_bytes().unwrap(),
+            right.read_storage_bytes().unwrap()
+        );
     }
 }

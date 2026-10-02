@@ -7,6 +7,7 @@ import type {
   Executable,
   LazyTensor,
   NativeAddon,
+  NativeChain97Output,
   NativeCurrentBlockAttention,
   NativeDecodeOutputSelection,
   NativeGgufMetadataEntry,
@@ -18,6 +19,10 @@ import type {
   NativeTensor
 } from "./native-addon.js"
 
+import { register96 } from "./chain96.ts"
+import { type Chain97Request, register97 } from "./chain97.ts"
+import { registerRequestRng99 } from "./requestRng99.ts"
+
 const backendName = "@effect-torch/backend-cuda"
 
 interface TensorRecord {
@@ -25,13 +30,15 @@ interface TensorRecord {
   readonly kind: "lazy" | "concrete"
   readonly graph: LazyTensor
   readonly value?: NativeTensor | undefined
+  readonly literal89Bytes?: number | undefined
   disposed: boolean
 }
 
 interface ExecutableRecord {
   readonly owner: object
   readonly kind: "executable"
-  readonly value: Executable
+  readonly value: Executable | undefined
+  readonly literal89Roots?: ReadonlyArray<LazyTensor> | undefined
   readonly outputs: ReadonlyArray<{
     readonly shape: ReadonlyArray<number>
     readonly dtype: Runtime.DType
@@ -39,6 +46,11 @@ interface ExecutableRecord {
   }>
   readonly state?: Runtime.DecodeStateSchema | undefined
   readonly sourceShapes: ReadonlyArray<ReadonlyArray<number>>
+}
+
+const nativeExecutable = (record: ExecutableRecord): Executable => {
+  if (record.value === undefined) throw new Error("execute: literal executable does not accept state")
+  return record.value
 }
 
 type HandleRecord = TensorRecord | ExecutableRecord
@@ -370,7 +382,8 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       readonly shape: ReadonlyArray<number>
       readonly dtype: Runtime.DType
       readonly storage?: Runtime.EncodedTensorStorage | undefined
-    }
+    },
+    literal89Bytes?: number
   ): Runtime.LazyTensorHandle => {
     const storage = tensorStorage(graph.shape, graph.storage)
 
@@ -390,7 +403,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       storage
     )
 
-    records.set(handle, { owner, kind: "lazy", graph, disposed: false })
+    records.set(handle, { owner, kind: "lazy", graph, literal89Bytes, disposed: false })
     backendHandles.add(handle)
 
     return handle
@@ -750,7 +763,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       const nativeSequences = options.sequences.map((sequence) => sequence.target)
 
       if (options.sampling !== undefined) {
-        return await options.executable.value.executeSampled(
+        return await nativeExecutable(options.executable).executeSampled(
           [binding.value],
           nativeSequences,
           [...options.slots],
@@ -763,7 +776,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         )
       }
 
-      const outputs = await options.executable.value.executeStateful(
+      const outputs = await nativeExecutable(options.executable).executeStateful(
         [binding.value],
         nativeSequences,
         [...options.slots],
@@ -823,7 +836,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     const binding = await uploadTokens(values, [state.batch, width], options.tokenDtype, session)
 
     try {
-      const outputs = await options.executable.value.executeStateful(
+      const outputs = await nativeExecutable(options.executable).executeStateful(
         [binding.value],
         options.sequences.map((sequence) => sequence.target),
         [...options.slots],
@@ -887,7 +900,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       validLengths[slot] = options.lengths[request]!
     }
 
-    const outputs = await options.executable.value.executeStateful(
+    const outputs = await nativeExecutable(options.executable).executeStateful(
       [...options.bindings],
       [...options.sequences],
       [...options.slots],
@@ -952,7 +965,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     const binding = await uploadTokens(values, [state.batch, 1], options.tokenDtype, session)
 
     try {
-      return await options.executable.value.executeSampledSteps(
+      return await nativeExecutable(options.executable).executeSampledSteps(
         [binding.value],
         options.sequences.map((sequence) => sequence.target),
         [...options.slots],
@@ -1001,7 +1014,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         switch (request.op) {
           case "constant":
             if (inputs.length > 1) throw new Error("constant: expected zero or one tensor input")
-            return lazyHandle(runtime.constant(request.attributes.value, request.attributes.dtype))
+            return lazyHandle(
+              runtime.constant(request.attributes.value, request.attributes.dtype),
+              undefined,
+              inputs.length === 0 && request.attributes.dtype === "f32" && Number.isFinite(request.attributes.value)
+                ? 4
+                : undefined
+            )
           case "zeros":
             if (inputs.length > 1) throw new Error("zeros: expected zero or one tensor input")
             return lazyHandle(runtime.zeros([...request.attributes.shape], request.attributes.dtype))
@@ -1011,12 +1030,19 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           case "full":
             if (inputs.length > 1) throw new Error("full: expected zero or one tensor input")
             return lazyHandle(
-              runtime.full([...request.attributes.shape], request.attributes.value, request.attributes.dtype)
+              runtime.full([...request.attributes.shape], request.attributes.value, request.attributes.dtype),
+              undefined,
+              inputs.length === 0 && request.attributes.shape.length === 0 && request.attributes.dtype === "f32" &&
+                Number.isFinite(request.attributes.value) ?
+                4 :
+                undefined
             )
           case "fromBytes":
             if (inputs.length !== 0) throw new Error("fromBytes: expected no tensor inputs")
             return lazyHandle(
-              runtime.fromBytes(request.attributes.data, [...request.attributes.shape], request.attributes.dtype)
+              runtime.fromBytes(request.attributes.data, [...request.attributes.shape], request.attributes.dtype),
+              undefined,
+              request.attributes.dtype === "u32" ? request.attributes.data.byteLength : undefined
             )
           case "input": {
             const storage = request.attributes.storage
@@ -1055,6 +1081,41 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
     })
 
   const decode: Runtime.DecodeRuntime = {
+    prepareProcessedReadOnly: (request) =>
+      Effect.try({
+        try: () => {
+          const body = executableRecord(request.body, "prepareProcessedReadOnly")
+          const readout = request.readout === undefined
+            ? undefined
+            : executableRecord(request.readout, "prepareProcessedReadOnly")
+          const processor = executableRecord(request.processor, "prepareProcessedReadOnly")
+          const width = request.hostShape[1]
+          if (
+            request.hostShape.length !== 2 || request.hostShape[0] !== 1 || width === undefined ||
+            !Number.isInteger(width) || width < 1 || width > 256 || body.value === undefined ||
+            processor.value === undefined || (readout !== undefined && readout.value === undefined) ||
+            !body.value.supportsChain97(readout?.value, processor.value, width)
+          ) return undefined
+          return {
+            execute: (invocation: {
+              readonly hostInput: Uint32Array
+              readonly bindings: ReadonlyArray<Runtime.ConcreteTensorHandle>
+              readonly state: Runtime.ReadOnlyStateInvocation
+              readonly scalar: number
+            }) =>
+              executeProcessed97({
+                body: request.body,
+                head: request.readout,
+                sampler: request.processor,
+                canvas: invocation.hostInput,
+                bindingsWithoutCanvas: invocation.bindings,
+                state: invocation.state,
+                temperature: invocation.scalar
+              }).pipe(Effect.map((result) => ({ device: result.feedback, host: result.statistics })))
+          }
+        },
+        catch: errorFor("prepareProcessedReadOnly", "execute", "execution-failed")
+      }),
     makePool: (options) =>
       Effect.try({
         try: () => {
@@ -1622,7 +1683,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
                 validLengths[slot] = parallel.plan.trainedMaxRows + 1
               }
 
-              stageOutputs = await stage.value.executeStateful(
+              stageOutputs = await nativeExecutable(stage).executeStateful(
                 [
                   anchor.value,
                   ...session.artifact.retainedSharedTensors
@@ -1675,7 +1736,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
 
               const verificationStarted = performance.now()
 
-              const matched = await verifier.value.executeTargetMatching(
+              const matched = await nativeExecutable(verifier).executeTargetMatching(
                 entries.map(({ sequence }) => sequence.target),
                 slots,
                 proposalTokens,
@@ -1725,7 +1786,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           } else if (targetMatching) {
             const verificationStarted = performance.now()
 
-            const matched = await verifier.value.executeTargetMatching(
+            const matched = await nativeExecutable(verifier).executeTargetMatching(
               entries.map(({ sequence }) => sequence.target),
               entries.map((_, index) => index),
               entries.map(({ sequence }) => [
@@ -2006,7 +2067,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             throw new Error("executeDecode: stateful CUDA programs do not accept scalar or runtime values")
           }
 
-          return executable.value.executeSampled(
+          return nativeExecutable(executable).executeSampled(
             invocation.bindings.map((binding) => handleRecord(binding, "executeDecode", true).value!),
             state.sequences.map((sequence) => nativeSequence(sequence, "executeDecode").value),
             [...state.slots],
@@ -2278,6 +2339,157 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
       )
   }
 
+  // Private diagnostic only: native96 keeps existing per-stage execution and
+  // synchronization while reducing JS/native completion boundaries.
+  register96(owner, (request) => {
+    const lateClear = (values: ReadonlyArray<NativeTensor>) => {
+      for (const value of new Set(values)) {
+        try {
+          value.clear()
+        } catch {
+          // Cleanup must attempt every independently owned native output.
+        }
+      }
+    }
+    return cancellable(native, "executeChain96", "execute", (token) => {
+      const body = executableRecord(request.body, "executeChain96")
+      const head = request.head === undefined ? undefined : executableRecord(request.head, "executeChain96")
+      const sampler = executableRecord(request.sampler, "executeChain96")
+      if (body.state?.access !== "ReadOnly" || head?.state !== undefined || sampler.state !== undefined) {
+        throw new Error("executeChain96: expected read-only body and stateless remaining stages")
+      }
+      if (request.state.access !== "ReadOnly" || !Number.isFinite(request.temperature)) {
+        throw new Error("executeChain96: invalid state or temperature")
+      }
+      return nativeExecutable(body).executeChain96(
+        head === undefined ? null : nativeExecutable(head),
+        nativeExecutable(sampler),
+        request.bindings.map((binding) => handleRecord(binding, "executeChain96", true).value!),
+        request.state.prefixes.map((prefix) => nativePrefix(prefix, "executeChain96").value),
+        [...request.state.slots],
+        [...request.state.activeMask],
+        [...request.state.validLengths],
+        request.temperature,
+        token
+      )
+    }, lateClear).pipe(Effect.flatMap((values) =>
+      Effect.try({
+        try: () => {
+          try {
+            const sampler = executableRecord(request.sampler, "executeChain96")
+            if (values.length !== sampler.outputs.length || new Set(values).size !== values.length) {
+              throw new Error("executeChain96: inconsistent output count or duplicate tensor ownership")
+            }
+            return values.map((value, index) => concreteHandle(value, sampler.outputs[index]!))
+          } catch (cause) {
+            lateClear(values)
+            throw cause
+          }
+        },
+        catch: errorFor("executeChain96", "execute", "execution-failed")
+      })
+    ))
+  })
+
+  const executeProcessed97 = (request: Chain97Request) => {
+    const lateClear = (value: NativeChain97Output) => {
+      try {
+        value.feedback.clear()
+      } catch {
+        // Unpublished feedback remains a best-effort cleanup on interruption.
+      }
+    }
+    return cancellable(native, "executeChain97", "execute", (token) => {
+      const body = executableRecord(request.body, "executeChain97")
+      const head = request.head === undefined ? undefined : executableRecord(request.head, "executeChain97")
+      const sampler = executableRecord(request.sampler, "executeChain97")
+      if (body.state?.access !== "ReadOnly" || head?.state !== undefined || sampler.state !== undefined) {
+        throw new Error("executeChain97: expected read-only body and stateless remaining stages")
+      }
+      if (request.state.access !== "ReadOnly" || !Number.isFinite(request.temperature)) {
+        throw new Error("executeChain97: invalid state or temperature")
+      }
+      if (!(request.canvas instanceof Uint32Array) || request.canvas.length < 1 || request.canvas.length > 256) {
+        throw new Error("executeChain97: expected one bounded U32 host canvas")
+      }
+      if (
+        sampler.outputs.length !== 2 || sampler.outputs[1]!.dtype !== "f32" ||
+        sampler.outputs[1]!.shape.length !== 1 || sampler.outputs[1]!.shape[0] !== request.canvas.length * 4 + 1
+      ) {
+        throw new Error("executeChain97: expected feedback and packed F32 statistics")
+      }
+      // Snapshot borrowed host bytes synchronously before native submission.
+      const canvas = new Uint32Array(request.canvas)
+      return nativeExecutable(body).executeChain97(
+        head === undefined ? null : nativeExecutable(head),
+        nativeExecutable(sampler),
+        canvas,
+        request.bindingsWithoutCanvas.map((binding) => handleRecord(binding, "executeChain97", true).value!),
+        request.state.prefixes.map((prefix) => nativePrefix(prefix, "executeChain97").value),
+        [...request.state.slots],
+        [...request.state.activeMask],
+        [...request.state.validLengths],
+        request.temperature,
+        token
+      )
+    }, lateClear).pipe(Effect.flatMap((result) =>
+      Effect.try({
+        try: () => {
+          try {
+            const sampler = executableRecord(request.sampler, "executeChain97")
+            const length = sampler.outputs[1]!.shape[0]!
+            if (result.statistics.byteLength !== length * 4) {
+              throw new Error("executeChain97: packed statistics byte extent mismatch")
+            }
+            // Own the host copy independently of the native Buffer and offsets.
+            const statistics = new Float32Array(length)
+            new Uint8Array(statistics.buffer).set(result.statistics)
+            return { feedback: concreteHandle(result.feedback, sampler.outputs[0]!), statistics }
+          } catch (cause) {
+            lateClear(result)
+            throw cause
+          }
+        },
+        catch: errorFor("executeChain97", "execute", "execution-failed")
+      })
+    ))
+  }
+  register97(owner, executeProcessed97)
+
+  registerRequestRng99(owner, (request) =>
+    Effect.try({
+      try: () => {
+        const initial = executableRecord(request.initial, "forkRequestRng99")
+        const refinement = executableRecord(request.refinement, "forkRequestRng99")
+        if (!Number.isInteger(request.seed) || request.seed < 0 || request.seed > 0xffff_ffff) {
+          throw new Error("forkRequestRng99: seed must be a U32")
+        }
+        if (initial.state?.access !== "ReadOnly" || refinement.state?.access !== "ReadOnly") {
+          throw new Error("forkRequestRng99: expected read-only templates")
+        }
+        const values = nativeExecutable(initial).forkRequestRng99(nativeExecutable(refinement), request.seed)
+        if (values.length !== 2 || values[0] === values[1]) {
+          throw new Error("forkRequestRng99: expected two distinct executable wrappers")
+        }
+        const wrap = (
+          source: Runtime.ExecutableHandle,
+          record: ExecutableRecord,
+          value: Executable
+        ): Runtime.ExecutableHandle => {
+          // SAFETY: opaque executable ownership is recorded before the handle escapes.
+          const handle = Object.freeze({
+            diagnostics: source.diagnostics,
+            state: record.state
+          }) as Runtime.ExecutableHandle
+          records.set(handle, { ...record, value })
+          backendHandles.add(handle)
+          return handle
+        }
+        return [wrap(request.initial, initial, values[0]!), wrap(request.refinement, refinement, values[1]!)] as const
+      },
+      catch: errorFor("forkRequestRng99", "execute", "execution-failed")
+    }))
+
   const extensions: Runtime.RuntimeService["extensions"] = {
     decode,
     inference,
@@ -2316,7 +2528,52 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
         try: () => {
           if (request.roots.length === 0) throw new Error("compile: expected at least one root")
 
-          const roots = request.roots.map((root) => handleRecord(root, "compile").graph)
+          const rootRecords = request.roots.map((root) => handleRecord(root, "compile"))
+          const roots = rootRecords.map((record) => record.graph)
+          const literalBytes = rootRecords.reduce((sum, record) => sum + (record.literal89Bytes ?? Infinity), 0)
+          if (
+            process.env.EFFECT_TORCH_CUDA_LITERAL89 === "1" && request.state === undefined &&
+            (request.options === undefined || Object.values(request.options).every((value) => value === undefined)) &&
+            roots.length <= 8 && literalBytes <= 64 * 1024
+          ) {
+            const uniqueBytes = [...new Set(roots)].reduce(
+              (sum, graph) => sum + rootRecords[roots.indexOf(graph)]!.literal89Bytes!,
+              0
+            )
+            const diagnostics: Runtime.ExecutableDiagnostics = Object.freeze({
+              semanticNodesBeforeOptimization: new Set(roots).size,
+              semanticNodesAfterOptimization: new Set(roots).size,
+              instructions: Object.freeze([
+                Object.freeze({ kind: "literal_materialize89", count: new Set(roots).size })
+              ]),
+              pipelineCount: 0,
+              commandCount: new Set(roots).size,
+              synchronizationCount: 1,
+              memory: Object.freeze({
+                externalBytes: 0,
+                persistentBytes: 0,
+                stateBytes: 0,
+                outputBytes: uniqueBytes,
+                workspaceBytes: 0,
+                transactionBytes: 0,
+                peakLiveBytes: uniqueBytes,
+                packingOverheadBytes: 0
+              }),
+              compilePhases: Object.freeze([])
+            })
+            // SAFETY: records validate this opaque executable capability like ordinary compiled handles.
+            const handle = Object.freeze({ diagnostics }) as Runtime.ExecutableHandle
+            records.set(handle, {
+              owner,
+              kind: "executable",
+              value: undefined,
+              literal89Roots: Object.freeze([...roots]),
+              outputs: decodeOutputs(request.roots, undefined),
+              sourceShapes: request.roots.map((root) => root.shape)
+            })
+            backendHandles.add(handle)
+            return handle
+          }
 
           const value = runtime.compile(
             roots,
@@ -2403,6 +2660,13 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             throw new Error("execute: CUDA runtime values are not supported yet")
           }
 
+          if (executable.literal89Roots !== undefined) {
+            if (invocation.state !== undefined || invocation.bindings.length !== 0 || invocation.scalars.length !== 0) {
+              throw new Error("execute: literal executable accepts no state or bindings")
+            }
+            return runtime.materializeLiterals89([...executable.literal89Roots], token)
+          }
+
           const bindings = invocation.bindings.map((binding) => {
             const found = handleRecord(binding, "execute", true)
 
@@ -2412,7 +2676,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           if (invocation.state === undefined) {
             if (executable.state !== undefined) throw new Error("execute: stateful executable requires state")
 
-            return executable.value.execute(bindings, [...invocation.scalars], token)
+            return nativeExecutable(executable).execute(bindings, [...invocation.scalars], token)
           }
 
           if (executable.state === undefined) throw new Error("execute: stateless executable does not accept state")
@@ -2424,7 +2688,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
           if (state.access !== executable.state.access) throw new Error("execute: state access mismatch")
 
           if (state.access === "ReadOnly") {
-            return executable.value.executeReadOnly(
+            return nativeExecutable(executable).executeReadOnly(
               bindings,
               state.prefixes.map((prefix) => nativePrefix(prefix, "execute").value),
               [...state.slots],
@@ -2434,7 +2698,7 @@ export const createRuntimeAdapter = (native: NativeAddon, deviceOrdinal: number)
             )
           }
 
-          return executable.value.executeStateful(
+          return nativeExecutable(executable).executeStateful(
             bindings,
             state.sequences.map((sequence) => nativeSequence(sequence, "execute").value),
             [...state.slots],

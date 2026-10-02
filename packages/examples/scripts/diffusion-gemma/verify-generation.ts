@@ -322,11 +322,15 @@ const main = Effect.gen(function*() {
       ...runtime,
       compile: (request) =>
         Effect.suspend(() => {
+          const packedStatistics = request.roots.length === 2 && request.roots[0]!.shape.length === 3 &&
+            request.roots[1]!.dtype === "f32" && request.roots[1]!.shape.length === 1 &&
+            request.roots[1]!.shape[0] === request.roots[0]!.shape[1]! * 4 + 1
           const kind = request.state?.access === "Append" ?
             "encoder"
             : request.state?.access === "ReadOnly" ?
             "denoiser"
-            : request.roots.length === 6 && request.roots[1]!.dtype === "u32" && request.roots[2]!.dtype === "u32" ?
+            : packedStatistics ||
+                request.roots.length === 6 && request.roots[1]!.dtype === "u32" && request.roots[2]!.dtype === "u32" ?
             "sampler"
             : request.roots.length === 1 && request.roots[0]!.shape.length === 3 && request.roots[0]!.dtype === "f32" ?
             "readout"
@@ -478,6 +482,8 @@ const main = Effect.gen(function*() {
       const compileStarted = performance.now()
 
       const artifact = yield* Diffusion.compile(definition, model.parameters, {
+        fuseFullReadout: process.env.DIFFUSION_FUSED_READOUT === "1",
+        cachePositions: process.env.DIFFUSION_CACHE_POSITIONS === "1",
         maxTokens: Math.ceil((context * 2 + blockSize) / blockSize) * blockSize,
         blockSize,
         prefillChunks,
@@ -657,7 +663,7 @@ const main = Effect.gen(function*() {
             append:
               "Append before the first ReadOnly in each decision/generation request is prefill; subsequent Append is continuing-block commit. Each sample is one fixed-width invocation; validLengths records real tokens.",
             stateless:
-              "Single F32 rank-3 output is readout. Six outputs with sampled/argmax u32 roots are sampler. Roots, binding and output shapes are retained for classification audit.",
+              "Single F32 rank-3 output is readout. Sampler has either six outputs with sampled/argmax u32 roots, or feedback plus a packed F32 vector of four canvas statistics and one mean. Roots, binding and output shapes are retained for classification audit.",
             random:
               "Source callbacks include generation or replay file I/O/hashing; library randomMilliseconds additionally includes input validation.",
             aggregate:

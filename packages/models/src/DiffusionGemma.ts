@@ -21,6 +21,7 @@ import * as Schema from "effect/Schema"
 import { createHash, randomInt } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
+import * as GenerationStatistics from "./internal/diffusionGemmaStatistics.ts"
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER))
 
@@ -1886,7 +1887,9 @@ export interface GenerateOptions<E = never, R = never> {
  * upload canvasLength * vocabSize * 4 bytes each step. Default sampling draws
  * exponentials on the device. Full logits never cross to host.
  * randomMilliseconds includes generation and validation of the random inputs.
- * processingMilliseconds includes graph compilation, invocation and readback.
+ * processingMilliseconds includes separate sampler compilation, invocation and
+ * readback. Processed evaluation combines model and sampler execution, reported
+ * as processedEvaluationMilliseconds instead; its compilation is excluded.
  *
  * @since 0.1.0
  * @category generation
@@ -1895,6 +1898,7 @@ export interface Generated extends Diffusion.GenerationResult {
   readonly tokens: Uint32Array
   readonly randomMilliseconds: number
   readonly processingMilliseconds: number
+  readonly processedEvaluationMilliseconds: number
   readonly randomInputBytes: number
   readonly statisticsReadbackBytes: number
 }
@@ -1967,6 +1971,8 @@ export const generate = <E = never, R = never>(
 
     let randomMilliseconds = 0
     let processingMilliseconds = 0
+    let processedEvaluationMilliseconds = 0
+    let processedEvaluationStarted = 0
     let randomInputBytes = 0
     let statisticsReadbackBytes = 0
 
@@ -1996,11 +2002,38 @@ export const generate = <E = never, R = never>(
 
     const sampler = yield* Tensor.compile(
       explicitRandom === undefined
-        ? ([logits, temperature]) => generationStatisticsWithDeviceNoise(logits!, temperature!, program.predictionDtype)
+        ? ([logits, temperature]) =>
+          generationStatisticsWithDeviceNoise(logits!, temperature!, program.predictionDtype).pipe(
+            Effect.flatMap((statistics) =>
+              GenerationStatistics.pack(statistics, program.canvasLength, program.vocabSize)
+            )
+          )
         : ([logits, exponentials, temperature]) =>
-          generationStatistics(logits!, exponentials!, temperature!, program.predictionDtype),
+          generationStatistics(logits!, exponentials!, temperature!, program.predictionDtype).pipe(
+            Effect.flatMap((statistics) =>
+              GenerationStatistics.pack(statistics, program.canvasLength, program.vocabSize)
+            )
+          ),
       explicitRandom === undefined ? { ...options.compile, randomSeed: requestSeed } : options.compile
     )
+
+    // Experimental invocation-bound temperature; explicit replay draws keep their
+    // existing path. The frozen sampler remains private to this request.
+    const scalarTemperature93 = process.env.EFFECT_TORCH_DIFFUSION_SCALAR_TEMPERATURE93 === "1" &&
+      explicitRandom === undefined
+    let scalarSampler93: Tensor.CompiledProgram | undefined
+
+    const processedEvaluation97 = process.env.EFFECT_TORCH_DIFFUSION_PROCESSED_EVALUATION97 === "1" &&
+      explicitRandom === undefined
+    let processor97: Tensor.CompiledProgram | undefined
+    if (processedEvaluation97) {
+      const exemplar = yield* Tensor.zeros([1, program.canvasLength, program.vocabSize])
+      const input = yield* Tensor.makeInput(0, exemplar)
+      const scalar = yield* Tensor.makeScalarInput(1, "f32")
+      const statistics = yield* generationStatisticsWithDeviceNoise(input, scalar, program.predictionDtype)
+      const roots = yield* GenerationStatistics.pack(statistics, program.canvasLength, program.vocabSize)
+      processor97 = yield* Tensor.freezeProgram(roots, { ...options.compile, randomSeed: requestSeed })
+    }
 
     const pages: Array<Uint32Array> = []
 
@@ -2014,6 +2047,28 @@ export const generate = <E = never, R = never>(
       maxNewTokens,
       outputLimit: options.outputLimit ?? "whole-block",
       policy,
+      processed: processor97 === undefined ? undefined : {
+        processor: processor97,
+        scalar: (step) => {
+          processedEvaluationStarted = performance.now()
+          return generationTemperature(minTemperature, maxTemperature, maxSteps, step.remaining)
+        },
+        decode: (host) => {
+          const [sampled, argmax, entropy, order, mean] = GenerationStatistics.unpack(
+            Array.from(host),
+            program.canvasLength
+          )
+          statisticsReadbackBytes += host.byteLength
+          processedEvaluationMilliseconds += performance.now() - processedEvaluationStarted
+          return {
+            sampledTokens: Uint32Array.from(sampled!),
+            argmaxTokens: Uint32Array.from(argmax!),
+            tokenEntropy: Float32Array.from(entropy!),
+            entropyOrder: Uint32Array.from(order!),
+            meanEntropy: mean![0]!
+          }
+        }
+      },
       initialize: (block) =>
         Effect.gen(function*() {
           // Python evaluates the random default even when decoder_input_ids is supplied.
@@ -2054,15 +2109,21 @@ export const generate = <E = never, R = never>(
 
             if (exponentials !== undefined) inputs.push(yield* Tensor.fromTypedArray(exponentials, logits.shape))
 
-            inputs.push(
-              yield* Tensor.full(
-                [],
-                generationTemperature(minTemperature, maxTemperature, maxSteps, step.remaining)
-              )
-            )
+            const temperature = generationTemperature(minTemperature, maxTemperature, maxSteps, step.remaining)
+            if (scalarTemperature93 && scalarSampler93 === undefined) {
+              const input = yield* Tensor.makeInput(0, logits)
+              const scalar = yield* Tensor.makeScalarInput(1, "f32")
+              const statistics = yield* generationStatisticsWithDeviceNoise(input, scalar, program.predictionDtype)
+              const roots = yield* GenerationStatistics.pack(statistics, program.canvasLength, program.vocabSize)
+              scalarSampler93 = yield* Tensor.freezeProgram(roots, { ...options.compile, randomSeed: requestSeed })
+            }
+            if (!scalarTemperature93) inputs.push(yield* Tensor.full([], temperature))
 
+            const execution = scalarSampler93 === undefined
+              ? sampler.call(inputs)
+              : Tensor.runProgram(scalarSampler93, inputs, [temperature])
             const outputs = yield* Effect.acquireRelease(
-              sampler.call(inputs).pipe(Effect.onExit((exit) =>
+              execution.pipe(Effect.onExit((exit) =>
                 Effect.sync(() => {
                   if (Exit.isSuccess(exit)) acquired = exit.value
                 })
@@ -2071,10 +2132,16 @@ export const generate = <E = never, R = never>(
               { interruptible: true }
             )
 
-            const [sampled, argmax, entropy, order, mean] = yield* Effect.forEach(
-              outputs.slice(1),
-              Tensor.toNumberArray
-            )
+            const statistics = outputs.length === 2
+              ? yield* Tensor.toNumberArray(outputs[1]!).pipe(
+                Effect.flatMap((values) =>
+                  values.length === program.canvasLength * 4 + 1
+                    ? Effect.succeed(GenerationStatistics.unpack(values, program.canvasLength))
+                    : invalid("packed generation statistics have an unexpected length")
+                )
+              )
+              : yield* Effect.forEach(outputs.slice(1), Tensor.toNumberArray)
+            const [sampled, argmax, entropy, order, mean] = statistics
 
             statisticsReadbackBytes += (program.canvasLength * 4 + 1) * 4
             processingMilliseconds += performance.now() - started
@@ -2114,7 +2181,15 @@ export const generate = <E = never, R = never>(
       offset += page.length
     }
 
-    return { ...result, tokens, randomMilliseconds, processingMilliseconds, randomInputBytes, statisticsReadbackBytes }
+    return {
+      ...result,
+      tokens,
+      randomMilliseconds,
+      processingMilliseconds,
+      processedEvaluationMilliseconds,
+      randomInputBytes,
+      statisticsReadbackBytes
+    }
   })
 
 /**

@@ -9,3 +9,5 @@ bench-results/
 .cuda-devbox-ssh-key
 .cuda-devbox-ssh-key.pub
 .bench/
+__pycache__/
+*.py[cod]

@@ -1,0 +1,17 @@
+{
+  "validatedAt": "2026-10-02T06:42:09.535492+00:00",
+  "checks": {
+    "pnpm typecheck": "passed",
+    "pnpm lint": "passed",
+    "cargo fmt --all -- --check": "passed after formatting-only corrections",
+    "cargo check -p effect-torch-runtime-cuda --features napi-addon": "passed (two unused-constant warnings)",
+    "reproduce.py verify": "measured-goal-achieved",
+    "verify-inventory.py fixtures": "one positive and nine negative passed"
+  },
+  "frozenCandidateValidation": {
+    "hostTestsPassed": 230,
+    "gpuChecksPassed": 10,
+    "naturalQuality": "12/12"
+  },
+  "scope": "Frozen GPU candidate and raw receipts were verified previously on the pod; final local checks do not claim another inference measurement."
+}

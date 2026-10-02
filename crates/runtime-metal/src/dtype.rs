@@ -360,6 +360,29 @@ impl TargetDTypeCapabilities for MetalDTypeCapabilities {
     }
 
     fn classify_region(&self, spec: &RegionDTypeSpec<'_>) -> DTypeDisposition {
+        if matches!(
+            spec.region,
+            NativeRegion::DualArgmax(_)
+                | NativeRegion::RouterTail(_)
+                | NativeRegion::AttentionFfnEntrance(_)
+                | NativeRegion::RmsResidual(_)
+                | NativeRegion::FfnNextNorm(_)
+                | NativeRegion::FfnTail(_)
+                | NativeRegion::VNormKvAttention(_)
+                | NativeRegion::NormRope(_)
+                | NativeRegion::GroupedExpertGated(_)
+                | NativeRegion::SmallSoftmax(_)
+                | NativeRegion::Entropy(_)
+                | NativeRegion::Bf16Softmax(_)
+                | NativeRegion::SharedRmsNorm(_)
+                | NativeRegion::ExpertRouteRank(_)
+                | NativeRegion::OrderedScatterReduce(_)
+        ) {
+            return unsupported(
+                DTypeRequirement::Region,
+                "ordered scatter fusion is not implemented on Metal",
+            );
+        }
         let Some(first) = spec.boundary_results.first() else {
             return unsupported(DTypeRequirement::Region, "region has no results");
         };

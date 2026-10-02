@@ -67,6 +67,8 @@ const compare = (actual: ReadonlyArray<number>, expected: ReadonlyArray<number>)
   let maxAbsoluteError = 0
   let squaredError = 0
   let squaredReference = 0
+  let squaredActual = 0
+  let dotProduct = 0
   let beyondOneBf16Step = 0
 
   for (let i = 0; i < actual.length; i++) {
@@ -79,6 +81,8 @@ const compare = (actual: ReadonlyArray<number>, expected: ReadonlyArray<number>)
     maxAbsoluteError = Math.max(maxAbsoluteError, error)
     squaredError += error * error
     squaredReference += expected[i] * expected[i]
+    squaredActual += actual[i] * actual[i]
+    dotProduct += actual[i] * expected[i]
 
     if (error > Math.max(2 ** -133, 2 ** (Math.floor(Math.log2(Math.abs(expected[i]))) - 7)) + 2e-6) beyondOneBf16Step++
   }
@@ -88,6 +92,13 @@ const compare = (actual: ReadonlyArray<number>, expected: ReadonlyArray<number>)
     exact,
     maxAbsoluteError,
     relativeL2: Math.sqrt(squaredError / Math.max(squaredReference, 1e-30)),
+    rootMeanSquaredError: Math.sqrt(squaredError / Math.max(actual.length, 1)),
+    referenceRootMeanSquare: Math.sqrt(squaredReference / Math.max(expected.length, 1)),
+    maxErrorOverReferenceRms: maxAbsoluteError /
+      Math.max(Math.sqrt(squaredReference / Math.max(expected.length, 1)), 1e-30),
+    cosineSimilarity: squaredActual === 0 || squaredReference === 0
+      ? squaredActual === squaredReference ? 1 : 0
+      : Math.max(-1, Math.min(1, dotProduct / Math.sqrt(squaredActual * squaredReference))),
     beyondOneBf16Step
   }
 }
@@ -542,6 +553,8 @@ const program = Effect.gen(function*() {
     const execution = yield* measured(
       "compile",
       Diffusion.compile(model.definition, model.parameters, {
+        fuseFullReadout: process.env.DIFFUSION_FUSED_READOUT === "1",
+        cachePositions: process.env.DIFFUSION_CACHE_POSITIONS === "1",
         maxTokens,
         blockSize,
         prefillChunks,
@@ -710,6 +723,65 @@ const program = Effect.gen(function*() {
     }
 
     yield* sampleMemory("after-concurrent-reads")
+    if (process.env.EFFECT_TORCH_WHOLE_READ71_LIFECYCLE === "1") {
+      yield* stage("retained-output-and-prefix-owners")
+      yield* Effect.scoped(Effect.gen(function*() {
+        const evaluate = (canvas: Uint32Array) =>
+          Effect.acquireRelease(
+            execution.evaluate(prefix, canvas, { _tag: "Initial" }),
+            Tensor.clear,
+            { interruptible: true }
+          )
+        const digest = (tensor: Tensor.Any) =>
+          Tensor.toTypedArray(tensor).pipe(
+            Effect.map((data) => hash(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)))
+          )
+        const retained = yield* Effect.forEach(
+          concurrentInputs,
+          (input) => evaluate(Uint32Array.from(input.canvas_ids)),
+          { concurrency: 2 }
+        )
+        const before = yield* Effect.forEach(retained, digest)
+        yield* read(Uint32Array.from(concurrentInputs[1]!.canvas_ids))
+        const after = yield* Effect.forEach(retained, digest)
+        if (before.some((value, index) => value !== after[index])) {
+          throw new Error("later replay overwrote a retained full-model output")
+        }
+        const freshPrefix = yield* Effect.acquireRelease(
+          execution.encode(Uint32Array.from(inputs.case.promptIds)),
+          (value) => Effect.orDie(execution.release(value)),
+          { interruptible: true }
+        )
+        const relocated = yield* Effect.acquireRelease(
+          execution.evaluate(freshPrefix, Uint32Array.from(concurrentInputs[0]!.canvas_ids), { _tag: "Initial" }),
+          Tensor.clear,
+          { interruptible: true }
+        )
+        if ((yield* digest(relocated)) !== before[0]) {
+          throw new Error("new prefix owners changed full-model output")
+        }
+        const final = yield* Effect.forEach(retained, digest)
+        if (before.some((value, index) => value !== final[index])) {
+          throw new Error("prefix relocation overwrote a retained full-model output")
+        }
+        writeFileSync(
+          join(output, "graph71-lifecycle.json"),
+          JSON.stringify(
+            {
+              retainedOutputs: 2,
+              fullOutputHashes: before,
+              retainedAfterReplay: true,
+              retainedAfterPrefixRelocation: true,
+              freshPrefixOwnersExact: true,
+              cancellationTested: false
+            },
+            null,
+            2
+          ) + "\n",
+          { flag: "wx" }
+        )
+      }))
+    }
     yield* stage("comparison-gate")
 
     if (

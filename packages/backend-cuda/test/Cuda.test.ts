@@ -205,6 +205,22 @@ it.effect("clears unpublished native outputs after interruption", () =>
         return Promise.resolve<Array<NativeTensorDouble>>([])
       }
 
+      supportsChain97(): boolean {
+        return false
+      }
+
+      executeChain97(): never {
+        throw new Error("unexpected private chain dispatch")
+      }
+
+      forkRequestRng99(): never {
+        throw new Error("unexpected private RNG fork")
+      }
+
+      executeChain96(): never {
+        throw new Error("unexpected private chain dispatch")
+      }
+
       executeSampled() {
         return Promise.resolve<Array<number>>([])
       }
@@ -290,6 +306,10 @@ it.effect("clears unpublished native outputs after interruption", () =>
 
       uploadBytes() {
         return new NativeTensorDouble()
+      }
+
+      materializeLiterals89(): Promise<Array<NativeTensorDouble>> {
+        throw new Error("literal89 is disabled in this test")
       }
 
       fromMaterialized() {

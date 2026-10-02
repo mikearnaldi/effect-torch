@@ -2,12 +2,15 @@
 use crate::buffer::CudaBuffer;
 use crate::capabilities::CudaCapabilities;
 use crate::lowering::{
-    Command, CommandKind, CudaLoweredProgram, CudaProgramBuilder, BF16_LINEAR_BIAS_KERNEL,
+    Command, CommandKind, CommandOverlap, CudaLoweredProgram, CudaProgramBuilder,
+    BF16_LINEAR_BIAS_KERNEL,
 };
-use crate::value::element_count;
+use crate::value::{element_count, validate_dense_reshape, validate_planned_buffer};
 use crate::workspace::{self, CudaMemorySpace, InvocationResources, CUDA_STORAGE_ALIGNMENT};
 use crate::{CudaDevice, CudaValue};
-use cudarc::driver::{sys, CudaEvent, CudaGraph, DeviceRepr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    sys, CudaEvent, CudaGraph, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
+};
 use effect_torch_compiler::{
     build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport,
     DiagnosticsInput, GraphIndex, LoweringUnit, MemoryPlannerConfig, ProgramRequest,
@@ -16,7 +19,7 @@ use effect_torch_compiler::{
 use effect_torch_graph::{AttentionRounding, KvAttentionMode, Node, NodeKind, PositionOffset};
 use effect_torch_runtime::{
     CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, KvLayerDescriptor, MemoryPlan,
-    StateAccessMode, ValueId,
+    StateAccessMode, StorageRepresentation, ValueId,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
@@ -27,6 +30,15 @@ use std::sync::{
 #[cfg(test)]
 #[path = "kv_matmul_tests.rs"]
 mod kv_matmul_tests;
+
+#[path = "expert_pair61.rs"]
+pub(crate) mod expert_pair61;
+
+#[path = "whole_read71.rs"]
+mod whole_read71;
+
+#[path = "whole_read71_admission.rs"]
+mod whole_read71_admission;
 
 /// By-value launch ABI shared by every typed CUDA kernel.
 #[repr(C)]
@@ -49,6 +61,45 @@ pub(crate) struct CudaKernelArgs {
 // SAFETY: repr(C), scalar fields only, and all fields are initialized. The CUDA
 // declaration has the same field order and widths.
 unsafe impl DeviceRepr for CudaKernelArgs {}
+
+pub(crate) fn rms_static2816_kernel(args: &CudaKernelArgs) -> Option<&'static str> {
+    if args.operation & 2 == 0
+        || args.integers[0] != 2816
+        || args.elements == 0
+        || args.elements % 2816 != 0
+        || args.elements / 2816 > 65535
+    {
+        return None;
+    }
+    match (args.input_dtypes[0], args.output_dtype) {
+        (1, 1) => Some("et_rms_norm_static2816_1_1"),
+        (1, 3) => Some("et_rms_norm_static2816_1_3"),
+        (3, 1) => Some("et_rms_norm_static2816_3_1"),
+        (3, 3) => Some("et_rms_norm_static2816_3_3"),
+        _ => None,
+    }
+}
+
+pub(crate) fn small_max_eligible(name: &str, args: &CudaKernelArgs, enabled: bool) -> bool {
+    enabled
+        && name == "et_reduce_f32"
+        && args.compute_dtype == dtype_code(DType::F32)
+        && args.operation == 2
+        && args.integers[2] != 0
+        && (1..4096).contains(&args.integers[1])
+        && args.elements != 0
+}
+
+pub(crate) fn ordered_scatter_route_map_eligible(name: &str, args: &CudaKernelArgs) -> bool {
+    matches!(
+        name,
+        "et_ordered_scatter_reduce" | "et_ordered_sorted_reduce"
+    ) && (1..=32).contains(&args.integers[0])
+        && args.integers[1] != 0
+        && args.integers[1] % 256 == 0
+        && args.elements != 0
+        && args.elements % args.integers[1] == 0
+}
 
 pub(crate) fn dtype_code(dtype: DType) -> u32 {
     match dtype {
@@ -191,6 +242,9 @@ impl Instruction {
                 let mut s = KernelSpec::new("et_top_k_indices", &[Some(*a)]);
                 s.args.integers[0] = *k as u64;
                 s.args.integers[1] = *width as u64;
+                s.args.integers[2] = u64::from(
+                    std::env::var("EFFECT_TORCH_CUDA_ROUTER_BITONIC").as_deref() == Ok("1"),
+                );
                 s
             }
             Self::Index {
@@ -212,6 +266,12 @@ impl Instruction {
             }
             Self::RmsNorm { x, weight, eps, .. } => {
                 let mut s = KernelSpec::new("et_rms_norm", &[Some(*x), *weight]);
+                s.args.operation = u32::from(
+                    std::env::var("EFFECT_TORCH_CUDA_RMS_VECTOR_LOADS").as_deref() == Ok("1"),
+                );
+                if std::env::var("EFFECT_TORCH_CUDA_RMS_STATIC2816").as_deref() == Ok("1") {
+                    s.args.operation |= 2;
+                }
                 s.args.scalars[0] = *eps;
                 s
             }
@@ -632,7 +692,7 @@ impl Instruction {
                 s
             }
             Self::Value(_) | Self::Input { .. } | Self::StateCursor { .. } | Self::Alias { .. } => {
-                return Err("compile: binding or alias is not a CUDA kernel".into())
+                return Err("compile: binding or alias is not a CUDA kernel".into());
             }
         };
         Ok(spec)
@@ -910,6 +970,29 @@ fn child_index(index: &GraphIndex, node: &Arc<Node>) -> Result<usize, String> {
 fn checked_len(len: usize) -> Result<u32, String> {
     u32::try_from(len).map_err(|_| "compile: CUDA dimension exceeds u32".into())
 }
+
+fn grouped_copy_launch<'a>(name: &'a str, args: &CudaKernelArgs) -> (&'a str, u32) {
+    let width = args.integers[0];
+    if args.integers[2] == 0
+        || args.output_dtype != dtype_code(DType::BF16)
+        || !matches!(width, 704 | 1408 | 2816)
+        || args.inputs[0] % 16 != 0
+        || args.output % 16 != 0
+    {
+        return (name, 256);
+    }
+    let vector = match name {
+        "et_grouped_gather" if args.integers[1] != 0 => "et_grouped_gather_vector",
+        "et_grouped_scatter" => "et_grouped_scatter_vector",
+        _ => return (name, 256),
+    };
+    (vector, if width == 704 { 128 } else { 256 })
+}
+
+#[cfg(test)]
+#[path = "grouped_copy_tests.rs"]
+mod grouped_copy_tests;
+
 fn semantic_instruction(
     node: &Node,
     index: &GraphIndex,
@@ -1410,7 +1493,7 @@ fn semantic_instruction(
                     1 => 2,
                     2 => 3,
                     _ => {
-                        return Err("compile: invalid layer norm backward output index".to_string())
+                        return Err("compile: invalid layer norm backward output index".to_string());
                     }
                 },
                 x: child_index(&index, x)?,
@@ -1967,6 +2050,32 @@ fn packed_geometry(weight: &Node) -> Result<(GgmlKQuant, u32, u32, u32), String>
     Ok((codec, rows, columns, row_bytes))
 }
 
+/// Private request stream shared only by explicitly forked diagnostic programs.
+pub(crate) struct RequestRng99 {
+    seed: u64,
+    runs: AtomicU64,
+}
+impl RequestRng99 {
+    pub(crate) fn new(seed: u32) -> Self {
+        Self {
+            seed: u64::from(seed),
+            runs: AtomicU64::new(0),
+        }
+    }
+    pub(crate) fn graphs_disabled() -> bool {
+        [
+            "EFFECT_TORCH_CUDA_GRAPHS",
+            "EFFECT_TORCH_CUDA_OVERLAP_PRIMARY_GRAPHS",
+            "EFFECT_TORCH_CUDA_WHOLE_READ71",
+            "EFFECT_TORCH_CUDA_EXPERT_SEQUENCE_GRAPHS",
+            "EFFECT_TORCH_CUDA_EXPERT_BRANCH_GRAPHS",
+            "EFFECT_TORCH_CUDA_EXPERT_PAIR_GRAPH61",
+        ]
+        .iter()
+        .all(|name| std::env::var(name).as_deref() != Ok("1"))
+    }
+}
+
 pub struct CudaExecutable {
     state_layout: Option<CudaStateLayout>,
     device: Arc<CudaDevice>,
@@ -1978,8 +2087,11 @@ pub struct CudaExecutable {
     diagnostics: ExecutableDiagnostics,
     compiler_work: CompilerWorkReport,
     random_seed: Option<u64>,
+    request_rng99_eligible: bool,
     runs: AtomicU64,
     graph_runtime: Mutex<GraphRuntime>,
+    pair61: expert_pair61::Runtime,
+    whole_read71: Mutex<whole_read71::Runtime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1987,6 +2099,56 @@ struct GraphKey {
     start: usize,
     end: usize,
     pointers: Arc<[u64]>,
+}
+
+/// Borrowed address metadata only; invocation resources retain every allocation.
+#[derive(Clone, Copy)]
+struct GraphValueAddress {
+    address: u64,
+    dtype: DType,
+    representation: StorageRepresentation,
+    bytes: usize,
+}
+
+impl GraphValueAddress {
+    fn from_value(value: &CudaValue) -> Self {
+        Self {
+            address: value.storage_address(),
+            dtype: value.dtype(),
+            representation: value.spec().storage.representation,
+            bytes: value.storage_bytes(),
+        }
+    }
+}
+
+struct GraphAddressScratch {
+    entries: Vec<Option<(u64, GraphValueAddress)>>,
+    generation: u64,
+}
+
+impl GraphAddressScratch {
+    fn new(count: usize) -> Self {
+        Self {
+            entries: vec![None; count],
+            generation: 0,
+        }
+    }
+    fn begin(&mut self) {
+        if self.generation == u64::MAX {
+            self.entries.fill(None);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
+    }
+    fn get(&self, id: ValueId) -> Option<GraphValueAddress> {
+        self.entries[id.index()]
+            .filter(|(generation, _)| *generation == self.generation)
+            .map(|(_, value)| value)
+    }
+    fn insert(&mut self, id: ValueId, value: GraphValueAddress) {
+        self.entries[id.index()] = Some((self.generation, value));
+    }
 }
 
 struct CapturedGraph(CudaGraph);
@@ -2001,6 +2163,129 @@ struct GraphRuntime {
     hits: u64,
     captures: u64,
     seen: HashSet<GraphKey>,
+}
+
+/// Bounded host-only graph diagnostics. Enabling this never enables graphs or
+/// records CUDA events; the separate GRAPH_TRACE option keeps its old behavior.
+struct GraphDiagnostics {
+    file: std::fs::File,
+    program: usize,
+    run: u64,
+    enabled: bool,
+    emitted: bool,
+    attempts: u64,
+    hits: u64,
+    captures: u64,
+    first_seen_misses: u64,
+    attempted_commands: u64,
+    hit_commands: u64,
+    captured_commands: u64,
+    key_pointer_entries: u64,
+    segment_searches: u64,
+    segment_search_ms: f64,
+    materialize_ms: f64,
+    key_ms: f64,
+    attempt_lengths: [u64; 65],
+    hit_lengths: [u64; 65],
+    capture_lengths: [u64; 65],
+    cache_start: usize,
+    cache_end: usize,
+    seen_start: usize,
+    seen_end: usize,
+}
+impl GraphDiagnostics {
+    fn open(
+        path: &std::ffi::OsStr,
+        program: usize,
+        run: u64,
+        enabled: bool,
+        cache: usize,
+        seen: usize,
+    ) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| format!("execute: CUDA graph diagnostic file: {error}"))?;
+        Ok(Self {
+            file,
+            program,
+            run,
+            enabled,
+            emitted: false,
+            attempts: 0,
+            hits: 0,
+            captures: 0,
+            first_seen_misses: 0,
+            attempted_commands: 0,
+            hit_commands: 0,
+            captured_commands: 0,
+            key_pointer_entries: 0,
+            segment_searches: 0,
+            segment_search_ms: 0.,
+            materialize_ms: 0.,
+            key_ms: 0.,
+            attempt_lengths: [0; 65],
+            hit_lengths: [0; 65],
+            capture_lengths: [0; 65],
+            cache_start: cache,
+            cache_end: cache,
+            seen_start: seen,
+            seen_end: seen,
+        })
+    }
+    fn length_bucket(commands: usize) -> usize {
+        (usize::BITS - commands.leading_zeros()) as usize
+    }
+    fn record_attempt(&mut self, commands: usize) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.attempted_commands = self.attempted_commands.saturating_add(commands as u64);
+        let bucket = Self::length_bucket(commands);
+        self.attempt_lengths[bucket] = self.attempt_lengths[bucket].saturating_add(1);
+    }
+    fn record_hit(&mut self, commands: usize) {
+        self.hits = self.hits.saturating_add(1);
+        self.hit_commands = self.hit_commands.saturating_add(commands as u64);
+        let bucket = Self::length_bucket(commands);
+        self.hit_lengths[bucket] = self.hit_lengths[bucket].saturating_add(1);
+    }
+    fn record_capture(&mut self, commands: usize) {
+        self.captures = self.captures.saturating_add(1);
+        self.captured_commands = self.captured_commands.saturating_add(commands as u64);
+        let bucket = Self::length_bucket(commands);
+        self.capture_lengths[bucket] = self.capture_lengths[bucket].saturating_add(1);
+    }
+    fn emit(&mut self, completed: bool) -> Result<(), String> {
+        if self.emitted {
+            return Ok(());
+        }
+        let record = serde_json::json!({
+            "event": "cuda-graph-host-diagnostics", "diagnostic": true,
+            "addsStreamSynchronization": false, "graphsEnabled": self.enabled, "completed": completed,
+            "pid": std::process::id(), "program": format!("0x{:x}", self.program), "run": self.run,
+            "attempts": self.attempts, "hits": self.hits, "captures": self.captures,
+            "firstSeenMisses": self.first_seen_misses,
+            "attemptedCommands": self.attempted_commands, "hitCommands": self.hit_commands,
+            "capturedCommands": self.captured_commands, "keyPointerEntries": self.key_pointer_entries,
+            "segmentSearches": self.segment_searches, "segmentSearchCpuMilliseconds": self.segment_search_ms,
+            "materializeCpuMilliseconds": self.materialize_ms, "keyCpuMilliseconds": self.key_ms,
+            "lengthHistogramEncoding": "bucket0=0; bucketK=[2^(K-1),2^K-1] commands including bridged host commands",
+            "attemptLengthHistogram": self.attempt_lengths.as_slice(),
+            "hitLengthHistogram": self.hit_lengths.as_slice(), "captureLengthHistogram": self.capture_lengths.as_slice(),
+            "cacheEntriesStart": self.cache_start, "cacheEntriesEnd": self.cache_end,
+            "seenKeysStart": self.seen_start, "seenKeysEnd": self.seen_end
+        });
+        self.emitted = true;
+        std::io::Write::write_all(&mut self.file, format!("{record}\n").as_bytes())
+            .map_err(|error| format!("execute: CUDA graph diagnostic write: {error}"))
+    }
+}
+impl Drop for GraphDiagnostics {
+    fn drop(&mut self) {
+        // Preserve the invocation's original error/cancellation. Successful
+        // invocations report diagnostic I/O failures through emit() explicitly.
+        let _ = self.emit(false);
+    }
 }
 
 /// Physical KV layout frozen before lowering and memory planning.
@@ -2087,15 +2372,37 @@ pub struct CudaStateInvocation {
     pub(crate) cache: Option<CudaKvCache>,
 }
 
+#[derive(Clone)]
+enum GroupedRouting {
+    Host(Vec<u32>),
+    DeviceReady,
+}
+
 struct InvocationFence {
     stream: Arc<cudarc::driver::CudaStream>,
+    dense_stream: Option<Arc<CudaStream>>,
     worker_events: Vec<cudarc::driver::CudaEvent>,
     complete: bool,
+    pair61_graphs: Vec<Arc<crate::explicit_graph61::ExplicitGraph61>>,
+    moe75_retained: Vec<(
+        Arc<crate::fused_moe75::Plan>,
+        Vec<CudaValue>,
+        Vec<CudaBuffer<u8>>,
+    )>,
 }
 impl Drop for InvocationFence {
     fn drop(&mut self) {
         if !self.complete {
-            let _ = self.stream.synchronize();
+            let mut failed = false;
+            if let Some(stream) = &self.dense_stream {
+                failed |= stream.synchronize().is_err();
+            }
+            failed |= self.stream.synchronize().is_err();
+            if failed && !self.moe75_retained.is_empty() {
+                // A foreign runner can fail after submitting work. If draining
+                // fails too, quarantine every referenced owner and lease.
+                std::mem::forget(std::mem::take(&mut self.moe75_retained));
+            }
         }
     }
 }
@@ -2115,6 +2422,28 @@ impl Drop for StreamCaptureFence {
 }
 
 impl CudaExecutable {
+    #[cfg(test)]
+    pub(crate) fn enable_dense_overlap_for_test(&mut self) -> Result<usize, String> {
+        let branches =
+            crate::planned_overlap::plan_dense_overlap(&mut self.program, &mut self.commands)?;
+        self.memory = effect_torch_compiler::plan_memory(
+            &self.program,
+            &MemoryPlannerConfig::uniform(
+                CudaMemorySpace::Device,
+                usize::MAX / 2,
+                CUDA_STORAGE_ALIGNMENT,
+                CUDA_STORAGE_ALIGNMENT,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        self.pair61 = expert_pair61::Runtime::plan(self)?;
+        Ok(branches)
+    }
+    #[cfg(test)]
+    pub(crate) fn graph_counts_for_test(&self) -> (u64, u64) {
+        let runtime = self.graph_runtime.lock().unwrap();
+        (runtime.captures, runtime.hits)
+    }
     pub fn ordinal(&self) -> u32 {
         self.device.ordinal
     }
@@ -2127,6 +2456,49 @@ impl CudaExecutable {
     pub fn outputs(&self) -> &[(Vec<usize>, DType)] {
         &self.outputs
     }
+    /// Bounded diagnostic successor signature, checked before any chain stage runs.
+    pub(crate) fn chain96_successor(&self, scalar_dtypes: &[DType]) -> bool {
+        let mut tensors = 0;
+        let mut scalars = vec![false; scalar_dtypes.len()];
+        for command in &self.commands {
+            match command.kind {
+                CommandKind::Input { binding } => {
+                    let Some(output) = command.output else {
+                        return false;
+                    };
+                    let meta = &self.program.values[output.index()];
+                    if binding != 0 || meta.storage.representation != StorageRepresentation::Dense {
+                        return false;
+                    }
+                    tensors += 1;
+                }
+                CommandKind::Scalar { binding } => {
+                    let Some(output) = command.output else {
+                        return false;
+                    };
+                    let meta = &self.program.values[output.index()];
+                    if scalar_dtypes.get(binding) != Some(&meta.dtype)
+                        || !meta.shape.is_empty()
+                        || meta.storage.representation != StorageRepresentation::Dense
+                    {
+                        return false;
+                    }
+                    scalars[binding] = true;
+                }
+                _ => {}
+            }
+        }
+        tensors == 1 && scalars.iter().all(|seen| *seen) && self.chain96_dense_outputs()
+    }
+    pub(crate) fn chain96_dense_outputs(&self) -> bool {
+        self.program.outputs.iter().all(|id| {
+            self.program.values[id.index()].storage.representation == StorageRepresentation::Dense
+        })
+    }
+    pub(crate) fn request_rng99_admitted(&self) -> bool {
+        self.request_rng99_eligible
+    }
+
     pub fn instruction_count(&self) -> usize {
         self.commands.len()
     }
@@ -2150,6 +2522,13 @@ impl CudaExecutable {
             scalars,
             None,
             cancelled,
+            None,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
             #[cfg(test)]
             None,
             #[cfg(test)]
@@ -2164,7 +2543,81 @@ impl CudaExecutable {
         cancelled: &CancellationFlag,
         after_gemm: &dyn Fn(),
     ) -> Result<Vec<CudaValue>, String> {
-        self.execute_inner(bindings, &[], None, cancelled, Some(after_gemm), None)
+        self.execute_inner(
+            bindings,
+            &[],
+            None,
+            cancelled,
+            None,
+            Some(after_gemm),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    /// Test-only cancellation point after the actual two-output fused launch.
+    #[cfg(test)]
+    pub(crate) fn execute_with_ffn63_hook(
+        &self,
+        bindings: &[CudaValue],
+        cancelled: &CancellationFlag,
+        hook: &dyn Fn(),
+    ) -> Result<Vec<CudaValue>, String> {
+        self.execute_inner(
+            bindings,
+            &[],
+            None,
+            cancelled,
+            None,
+            None,
+            None,
+            Some(hook),
+            None,
+            None,
+        )
+    }
+    /// Test-only cancellation after both original rotary tables were submitted.
+    #[cfg(test)]
+    pub(crate) fn execute_with_rotary66_hook(
+        &self,
+        bindings: &[CudaValue],
+        cancelled: &CancellationFlag,
+        hook: &dyn Fn(),
+    ) -> Result<Vec<CudaValue>, String> {
+        self.execute_inner(
+            bindings,
+            &[],
+            None,
+            cancelled,
+            None,
+            None,
+            None,
+            None,
+            Some(hook),
+            None,
+        )
+    }
+    /// Test-only cancellation after all five softmax100 kernels were submitted.
+    #[cfg(test)]
+    pub(crate) fn execute_with_softmax100_hook(
+        &self,
+        bindings: &[CudaValue],
+        cancelled: &CancellationFlag,
+        hook: &dyn Fn(),
+    ) -> Result<Vec<CudaValue>, String> {
+        self.execute_inner(
+            bindings,
+            &[],
+            None,
+            cancelled,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(hook),
+        )
     }
     pub fn execute_stateful(
         &self,
@@ -2178,6 +2631,7 @@ impl CudaExecutable {
             scalars,
             state,
             cancelled,
+            None,
             #[cfg(test)]
             None,
         )
@@ -2190,14 +2644,36 @@ impl CudaExecutable {
         cancelled: &CancellationFlag,
         after_kv: &dyn Fn(),
     ) -> Result<Vec<CudaValue>, String> {
-        self.execute_state_transaction(bindings, &[], state, cancelled, Some(after_kv))
+        self.execute_state_transaction(bindings, &[], state, cancelled, None, Some(after_kv))
     }
+    pub(crate) fn execute_stateful_request99(
+        &self,
+        bindings: &[CudaValue],
+        state: &mut CudaStateInvocation,
+        cancelled: &CancellationFlag,
+        rng: &RequestRng99,
+    ) -> Result<Vec<CudaValue>, String> {
+        if state.access != StateAccessMode::ReadOnly {
+            return Err("requestRng99: read-only state required".into());
+        }
+        self.execute_state_transaction(
+            bindings,
+            &[],
+            state,
+            cancelled,
+            Some(rng),
+            #[cfg(test)]
+            None,
+        )
+    }
+
     fn execute_state_transaction(
         &self,
         bindings: &[CudaValue],
         scalars: &[f64],
         state: &mut CudaStateInvocation,
         cancelled: &CancellationFlag,
+        request_rng99: Option<&RequestRng99>,
         #[cfg(test)] after_kv: Option<&dyn Fn()>,
     ) -> Result<Vec<CudaValue>, String> {
         if !scalars.is_empty() {
@@ -2211,10 +2687,17 @@ impl CudaExecutable {
             scalars,
             Some(state),
             cancelled,
+            request_rng99,
             #[cfg(test)]
             None,
             #[cfg(test)]
             after_kv,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
         );
         if result.is_err() {
             state.sequences = before;
@@ -2249,9 +2732,15 @@ impl CudaExecutable {
         resources: &InvocationResources,
         id: ValueId,
     ) -> Result<CudaBuffer<u8>, String> {
+        let (location, byte_offset) = match &self.memory.locations[id.index()] {
+            effect_torch_runtime::Location::Alias { root, byte_offset } => {
+                (&self.memory.locations[root.index()], *byte_offset)
+            }
+            location => (location, 0),
+        };
         resources.buffer(
-            &self.memory.locations[id.index()],
-            0,
+            location,
+            byte_offset,
             self.program.values[id.index()].decl.bytes,
         )
     }
@@ -2266,7 +2755,11 @@ impl CudaExecutable {
             self.buffer(resources, id)?,
         )
     }
-    fn graph_segment_end(&self, start: usize) -> Option<usize> {
+    fn graph_segment_end(
+        commands: &[Command],
+        start: usize,
+        protect_overlap: bool,
+    ) -> Option<usize> {
         fn captures_work(command: &Command) -> bool {
             command.output.is_some()
                 && match &command.kind {
@@ -2295,16 +2788,26 @@ impl CudaExecutable {
                     | CommandKind::Value(_)
                     | CommandKind::Input { .. }
                     | CommandKind::Alias { .. }
+                    | CommandKind::PlannedAlias
             )
         }
-        if !self.commands.get(start).is_some_and(captures_work) {
+        let boundary =
+            |command: &Command| protect_overlap && command.overlap != CommandOverlap::Primary;
+        if !commands
+            .get(start)
+            .is_some_and(|command| !boundary(command) && captures_work(command))
+        {
             return None;
         }
         let mut cursor = start + 1;
         let mut end = cursor;
         let mut work = 1usize;
-        while let Some(command) = self.commands.get(cursor) {
-            if captures_work(command) {
+        while let Some(command) = commands.get(cursor) {
+            // Fork, worker execution/completion and join must remain ordinary
+            // dispatch. A graph never captures or skips their event ownership.
+            if boundary(command) {
+                break;
+            } else if captures_work(command) {
                 work += 1;
                 end = cursor + 1;
             } else if !bridges_work(command) {
@@ -2313,6 +2816,94 @@ impl CudaExecutable {
             cursor += 1;
         }
         (work >= 2).then_some(end)
+    }
+    fn graph_binding<'a>(
+        &self,
+        bindings: &'a [CudaValue],
+        binding: usize,
+        output: ValueId,
+    ) -> Result<&'a CudaValue, String> {
+        let meta = &self.program.values[output.index()];
+        let value = bindings
+            .get(binding)
+            .ok_or_else(|| format!("execute: missing CUDA binding {binding}"))?;
+        if value.ordinal() != self.device.ordinal
+            || value.shape() != meta.shape
+            || value.dtype() != meta.dtype
+            || value.spec().storage.representation != meta.storage.representation
+        {
+            return Err(format!(
+                "execute: CUDA binding {binding} violates its value specification"
+            ));
+        }
+        Ok(value)
+    }
+    fn planned_graph_key(
+        &self,
+        resources: &InvocationResources,
+        bindings: &[CudaValue],
+        values: &[Option<CudaValue>],
+        scratch: &mut GraphAddressScratch,
+        start: usize,
+        end: usize,
+    ) -> Result<GraphKey, String> {
+        scratch.begin();
+        for command in &self.commands[start..end] {
+            let Some(output) = command.output else {
+                continue;
+            };
+            let meta = &self.program.values[output.index()];
+            let value = match &command.kind {
+                CommandKind::Prepare => continue,
+                CommandKind::Value(value) => GraphValueAddress::from_value(value),
+                CommandKind::Input { binding } => {
+                    GraphValueAddress::from_value(self.graph_binding(bindings, *binding, output)?)
+                }
+                CommandKind::Alias { source } => {
+                    let source = scratch
+                        .get(*source)
+                        .or_else(|| {
+                            values[source.index()]
+                                .as_ref()
+                                .map(GraphValueAddress::from_value)
+                        })
+                        .ok_or("execute: captured alias source is unavailable")?;
+                    validate_dense_reshape(
+                        source.dtype,
+                        source.representation,
+                        source.bytes,
+                        &meta.shape,
+                    )?;
+                    source
+                }
+                _ => {
+                    let buffer = self.buffer(resources, output)?;
+                    validate_planned_buffer(meta.spec(), &buffer)?;
+                    GraphValueAddress {
+                        address: buffer.address(),
+                        dtype: meta.dtype,
+                        representation: meta.storage.representation,
+                        bytes: buffer.len(),
+                    }
+                }
+            };
+            scratch.insert(output, value);
+        }
+        self.graph_key_with_addresses(resources, start, end, |id| {
+            scratch
+                .get(id)
+                .or_else(|| {
+                    values[id.index()]
+                        .as_ref()
+                        .map(GraphValueAddress::from_value)
+                })
+                .map(|value| value.address)
+                .ok_or_else(|| {
+                    format!(
+                        "execute: captured CUDA value {id} unavailable in segment {start}..{end}"
+                    )
+                })
+        })
     }
     fn materialize_graph_values(
         &self,
@@ -2331,19 +2922,7 @@ impl CudaExecutable {
                 CommandKind::Prepare => continue,
                 CommandKind::Value(value) => value.clone(),
                 CommandKind::Input { binding } => {
-                    let value = bindings
-                        .get(*binding)
-                        .ok_or_else(|| format!("execute: missing CUDA binding {binding}"))?;
-                    if value.ordinal() != self.device.ordinal
-                        || value.shape() != meta.shape
-                        || value.dtype() != meta.dtype
-                        || value.spec().storage.representation != meta.storage.representation
-                    {
-                        return Err(format!(
-                            "execute: CUDA binding {binding} violates its value specification"
-                        ));
-                    }
-                    value.clone()
+                    self.graph_binding(bindings, *binding, output)?.clone()
                 }
                 CommandKind::Alias { source } => values[source.index()]
                     .as_ref()
@@ -2372,6 +2951,15 @@ impl CudaExecutable {
                     )
                 })
         };
+        self.graph_key_with_addresses(resources, start, end, value_address)
+    }
+    fn graph_key_with_addresses(
+        &self,
+        resources: &InvocationResources,
+        start: usize,
+        end: usize,
+        value_address: impl Fn(ValueId) -> Result<u64, String>,
+    ) -> Result<GraphKey, String> {
         let mut pointers = Vec::new();
         for (offset, command) in self.commands[start..end].iter().enumerate() {
             if matches!(command.kind, CommandKind::Prepare) {
@@ -2423,7 +3011,8 @@ impl CudaExecutable {
                 CommandKind::Prepare
                 | CommandKind::Value(_)
                 | CommandKind::Input { .. }
-                | CommandKind::Alias { .. } => {}
+                | CommandKind::Alias { .. }
+                | CommandKind::PlannedAlias => {}
                 _ => return Err("execute: non-capturable command in CUDA graph segment".into()),
             }
         }
@@ -2441,6 +3030,15 @@ impl CudaExecutable {
         let position = (failure >> 32) as usize;
         let name = match self.commands.get(position).map(|command| &command.kind) {
             Some(CommandKind::Kernel { name, .. }) => *name,
+            Some(CommandKind::GroupedExpert {
+                device_control: Some(_),
+                ..
+            }) if code == 1 => {
+                return Err("groupedExpertLinearRows: expert index is out of range".into());
+            }
+            Some(CommandKind::FusedMoe75 { .. }) if code == 1 => {
+                return Err("fused MoE75: invalid expert routes".into());
+            }
             _ => return Err("execute: CUDA error context is invalid".into()),
         };
         Err(match code {
@@ -2458,30 +3056,102 @@ impl CudaExecutable {
         scalars: &[f64],
         mut state: Option<&mut CudaStateInvocation>,
         cancelled: &CancellationFlag,
+        request_rng99: Option<&RequestRng99>,
         #[cfg(test)] after_gemm: Option<&dyn Fn()>,
         #[cfg(test)] after_kv: Option<&dyn Fn()>,
+        #[cfg(test)] after_ffn63: Option<&dyn Fn()>,
+        #[cfg(test)] after_rotary66: Option<&dyn Fn()>,
+        #[cfg(test)] after_softmax100: Option<&dyn Fn()>,
     ) -> Result<Vec<CudaValue>, String> {
-        let resources = workspace::acquire(self.device.ordinal, &self.memory.segments)?;
+        if request_rng99.is_some() {
+            if !self.request_rng99_admitted() || !RequestRng99::graphs_disabled() {
+                return Err(
+                    "requestRng99: seeded single-source template and disabled graphs required"
+                        .into(),
+                );
+            }
+            if cancelled.is_cancelled() {
+                return Err("operation aborted".into());
+            }
+        }
+        let has_moe75 = self
+            .commands
+            .iter()
+            .any(|c| matches!(c.kind, CommandKind::FusedMoe75 { .. }));
+        // Declared before the fence: the device gate remains held through its
+        // error/cancellation drain, including asynchronous foreign submissions.
+        let moe75_gate = has_moe75
+            .then(|| self.device.graph_execution.lock())
+            .transpose()
+            .map_err(|_| "execute: CUDA MoE75 execution lock poisoned")?;
+        let ordinary_resources = workspace::acquire(self.device.ordinal, &self.memory.segments)?;
+        let resources = &ordinary_resources;
         // Drop the fence before returning leases on errors or interruption.
         let mut fence = InvocationFence {
             stream: self.device.stream.clone(),
+            dense_stream: None,
             worker_events: Vec::new(),
             complete: false,
+            pair61_graphs: Vec::new(),
+            moe75_retained: Vec::new(),
         };
-        let run = self.runs.fetch_add(1, Ordering::Relaxed);
+        let (run, random_seed) = match request_rng99 {
+            Some(request) => (request.runs.fetch_add(1, Ordering::Relaxed), request.seed),
+            None => (
+                self.runs.fetch_add(1, Ordering::Relaxed),
+                self.random_seed.unwrap_or(0),
+            ),
+        };
         // Opt-in diagnosis of a bounded run. Synchronization below attributes
         // asynchronous GEMMs to their own command rather than the next kernel.
         let trace = std::env::var("EFFECT_TORCH_CUDA_TRACE").is_ok_and(|value| value == "1");
         let graph_trace =
             std::env::var("EFFECT_TORCH_CUDA_GRAPH_TRACE").is_ok_and(|value| value == "1");
-        let graphs_requested =
-            std::env::var("EFFECT_TORCH_CUDA_GRAPHS").is_ok_and(|value| value == "1");
+        let overlap_primary_graphs = std::env::var("EFFECT_TORCH_CUDA_OVERLAP_PRIMARY_GRAPHS")
+            .is_ok_and(|value| value == "1");
+        let graphs_requested = overlap_primary_graphs
+            || std::env::var("EFFECT_TORCH_CUDA_GRAPHS").is_ok_and(|value| value == "1");
+        let whole_requested = std::env::var("EFFECT_TORCH_CUDA_WHOLE_READ71").as_deref() == Ok("1")
+            && !graphs_requested
+            && !trace
+            && !graph_trace
+            && state
+                .as_ref()
+                .is_some_and(|state| state.access == StateAccessMode::ReadOnly)
+            && std::env::var_os("EFFECT_TORCH_CUDA_GROUPED_PROFILE_PATH").is_none()
+            && !expert_pair61::enabled()
+            && std::env::var("EFFECT_TORCH_CUDA_EXPERT_SEQUENCE_GRAPHS").as_deref() != Ok("1")
+            && std::env::var("EFFECT_TORCH_CUDA_EXPERT_BRANCH_GRAPHS").as_deref() != Ok("1");
+        #[cfg(test)]
+        let whole_requested = whole_requested
+            && after_gemm.is_none()
+            && after_kv.is_none()
+            && after_ffn63.is_none()
+            && after_rotary66.is_none()
+            && after_softmax100.is_none()
+            && !crate::device::device_expert_failure_pending();
         let grouped_profile_path = std::env::var_os("EFFECT_TORCH_CUDA_GROUPED_PROFILE_PATH");
+        let grouped_status_summary =
+            std::env::var("EFFECT_TORCH_CUDA_GROUPED_STATUS_SUMMARY").as_deref() == Ok("1");
+        let grouped_rows_block =
+            std::env::var("EFFECT_TORCH_CUDA_GROUPED_ROWS_BLOCK").as_deref() == Ok("1");
+        let grouped_vector_copy =
+            std::env::var("EFFECT_TORCH_CUDA_GROUPED_VECTOR_COPY").as_deref() == Ok("1");
+        // Diagnostic traces use serial execution so existing intervals remain
+        // attributable to one command. Planned lifetimes remain conservative.
+        let overlap_enabled = !trace
+            && grouped_profile_path.is_none()
+            && self
+                .commands
+                .iter()
+                .any(|command| matches!(command.overlap, CommandOverlap::Worker { .. }));
         let mut grouped_profile = Vec::<(&'static str, CudaEvent, CudaEvent)>::new();
         let mut gemm_profile =
             Vec::<(usize, usize, usize, usize, bool, bool, CudaEvent, CudaEvent)>::new();
         let mut grouped_activation_start = None::<CudaEvent>;
         let mut grouped_control_wait_ms = Vec::<f64>::new();
+        let mut grouped_shapes = BTreeMap::<(bool, usize, usize, usize), usize>::new();
+        let mut grouped_submission_ms = BTreeMap::<bool, (usize, f64)>::new();
         let profile_event = || -> Result<Option<CudaEvent>, String> {
             grouped_profile_path
                 .is_some()
@@ -2515,713 +3185,1765 @@ impl CudaExecutable {
             }
             Ok(())
         };
-        let graph_candidate = self.commands.iter().any(|command| {
-            matches!(
-                command.kind,
-                CommandKind::Kernel {
-                    state: StateAccess::Kv { .. }
-                        | StateAccess::Kda { layer: Some(_), .. }
-                        | StateAccess::Conv { layer: Some(_), .. },
-                    ..
-                }
-            )
-        });
+        let graph_candidate = (!overlap_enabled || overlap_primary_graphs)
+            && (overlap_enabled
+                || self.commands.iter().any(|command| {
+                    matches!(
+                        command.kind,
+                        CommandKind::Kernel {
+                            state: StateAccess::Kv { .. }
+                                | StateAccess::Kda { layer: Some(_), .. }
+                                | StateAccess::Conv { layer: Some(_), .. },
+                            ..
+                        }
+                    )
+                }));
+        if run == 0
+            && std::env::var("EFFECT_TORCH_CUDA_DENSE_OVERLAP_TRACE")
+                .is_ok_and(|value| value == "1")
+        {
+            let branches = self
+                .commands
+                .iter()
+                .filter(|command| {
+                    matches!(command.overlap, CommandOverlap::Worker { start: true, .. })
+                })
+                .count();
+            eprintln!("CUDA dense overlap enabled={overlap_enabled} branches={branches}");
+        }
         #[cfg(test)]
         let graph_enabled = graph_candidate
             && graphs_requested
             && !trace
             && after_gemm.is_none()
-            && after_kv.is_none();
+            && after_kv.is_none()
+            && after_ffn63.is_none()
+            && after_rotary66.is_none()
+            && after_softmax100.is_none();
         #[cfg(not(test))]
         let graph_enabled =
             graph_candidate && graphs_requested && !trace && grouped_profile_path.is_none();
-        let _graph_execution = graph_enabled
-            .then(|| self.device.graph_execution.lock())
+        let expert_sequence_graphs = std::env::var("EFFECT_TORCH_CUDA_EXPERT_SEQUENCE_GRAPHS")
+            .is_ok_and(|value| value == "1");
+        let pair61_enabled = expert_pair61::enabled()
+            && !graphs_requested
+            && !trace
+            && grouped_profile_path.is_none()
+            && !expert_sequence_graphs
+            && std::env::var("EFFECT_TORCH_CUDA_EXPERT_BRANCH_GRAPHS").as_deref() != Ok("1");
+        #[cfg(test)]
+        let pair61_enabled = pair61_enabled
+            && after_gemm.is_none()
+            && after_kv.is_none()
+            && after_ffn63.is_none()
+            && after_rotary66.is_none()
+            && after_softmax100.is_none()
+            && !crate::device::device_expert_failure_pending();
+        let _graph_execution = (moe75_gate.is_none()
+            && (whole_requested
+                || graph_enabled
+                || pair61_enabled
+                || overlap_enabled
+                || expert_sequence_graphs
+                || std::env::var("EFFECT_TORCH_CUDA_EXPERT_BRANCH_GRAPHS")
+                    .is_ok_and(|v| v == "1")))
+        .then(|| self.device.graph_execution.lock())
+        .transpose()
+        .map_err(|_| "execute: CUDA graph execution lock poisoned")?;
+        let mut whole_runtime = whole_requested
+            .then(|| self.whole_read71.lock())
             .transpose()
-            .map_err(|_| "execute: CUDA graph execution lock poisoned")?;
+            .map_err(|_| "execute: whole-read71 cache lock poisoned")?;
+        let whole_plan = if let Some(runtime) = whole_runtime.as_mut() {
+            if !runtime.examined {
+                runtime.plan = whole_read71_admission::plan(self)?.map(Arc::new);
+                whole_read71::trace(
+                    if runtime.plan.is_some() {
+                        "admitted"
+                    } else {
+                        "declined"
+                    },
+                    runtime.plan.as_deref(),
+                    self.state_layout
+                        .as_ref()
+                        .map_or(0, |layout| layout.kv_layers.len()),
+                )?;
+                runtime.examined = true;
+            }
+            runtime.plan.clone()
+        } else {
+            None
+        };
+        let mut whole_active = false;
+        let mut whole_capturing = false;
+        let mut whole_submitted = false;
+        let mut whole_status_private = false;
+        let mut whole_state = None::<Arc<HashMap<usize, whole_read71::PreparedState>>>;
+        let mut whole_payload = None::<cudarc::driver::PinnedHostSlice<u8>>;
+        let mut whole_saved = Vec::<(ValueId, Option<CudaValue>)>::new();
         let mut graph_runtime = graph_enabled
             .then(|| self.graph_runtime.lock())
             .transpose()
             .map_err(|_| "execute: CUDA graph cache lock poisoned")?;
+        let mut graph_address_scratch = (graph_runtime.is_some()
+            && std::env::var("EFFECT_TORCH_CUDA_GRAPH_PLANNED_KEYS").as_deref() == Ok("1"))
+        .then(|| GraphAddressScratch::new(self.program.values.len()));
+        let mut graph_diagnostics =
+            if std::env::var("EFFECT_TORCH_CUDA_GRAPH_DIAGNOSTICS").as_deref() == Ok("1") {
+                let path = std::env::var_os("EFFECT_TORCH_CUDA_GRAPH_DIAGNOSTICS_PATH").ok_or(
+                    "execute: graph diagnostics requires EFFECT_TORCH_CUDA_GRAPH_DIAGNOSTICS_PATH",
+                )?;
+                let (cache, seen) = graph_runtime
+                    .as_ref()
+                    .map(|r| (r.cache.len(), r.seen.len()))
+                    .unwrap_or_default();
+                Some(GraphDiagnostics::open(
+                    &path,
+                    self as *const Self as usize,
+                    run,
+                    graph_enabled,
+                    cache,
+                    seen,
+                )?)
+            } else {
+                None
+            };
         let mut capture_fence = StreamCaptureFence {
             stream: self.device.stream.clone(),
             active: false,
         };
         let mut capture: Option<(GraphKey, usize)> = None;
         let mut deferred_status = None;
-        let mut grouped_routing = HashMap::<ValueId, Vec<u32>>::new();
-        let mut values: Vec<Option<CudaValue>> = vec![None; self.program.values.len()];
-        let mut position = 0usize;
-        while position < self.commands.len() {
-            if cancelled.is_cancelled() {
-                return Err("operation aborted".into());
-            }
-            if capture.is_none() {
-                if let (Some(runtime), Some(end)) =
-                    (graph_runtime.as_mut(), self.graph_segment_end(position))
-                {
-                    self.materialize_graph_values(
-                        &resources,
-                        bindings,
-                        &mut values,
-                        position,
-                        end,
-                    )?;
-                    let key = self.graph_key(&resources, &values, position, end)?;
-                    if let Some(graph) = runtime.cache.get(&key) {
-                        graph.0.launch().map_err(|error| error.to_string())?;
-                        if graph_trace {
-                            self.device.stream.synchronize().map_err(|error| {
-                                format!(
-                                    "CUDA graph replay {}..{} failed: {error}",
-                                    key.start, key.end
-                                )
-                            })?;
+        let mut last_skipped_validation = None;
+        let result = (|| -> Result<Vec<CudaValue>, String> {
+            let mut grouped_routing = HashMap::<ValueId, GroupedRouting>::new();
+            let mut dense_completed = HashMap::<usize, CudaEvent>::new();
+            let mut active_dense_branches = 0usize;
+            let mut values: Vec<Option<CudaValue>> = vec![None; self.program.values.len()];
+            let mut position = 0usize;
+            while position < self.commands.len() {
+                if cancelled.is_cancelled() {
+                    return Err("operation aborted".into());
+                }
+                if let Some(plan) = whole_plan.as_ref().filter(|plan| plan.start == position) {
+                    let runtime = whole_runtime
+                        .as_mut()
+                        .ok_or("whole-read71 runtime missing")?;
+                    let current_state = state.as_deref_mut().ok_or("whole-read71 state missing")?;
+                    let geometry = whole_read71::geometry(current_state);
+                    let policy = whole_read71::policy();
+                    if runtime
+                        .frame
+                        .as_ref()
+                        .is_none_or(|frame| frame.geometry == geometry && frame.policy == policy)
+                    {
+                        self.preflight_bindings71(plan, bindings)?;
+                        if deferred_status != Some(plan.status) || active_dense_branches != 0 {
+                            return Err("whole-read71 boundary status or worker mismatch".into());
                         }
-                        runtime.hits += 1;
-                        position = end;
-                        continue;
-                    }
-                    // Loader programs often repeat with different weight addresses.
-                    // Capture only after this exact command and pointer set repeats.
-                    if !runtime.seen.insert(key.clone()) {
-                        self.device
-                            .stream
-                            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-                            .map_err(|error| format!("CUDA graph capture failed: {error}"))?;
-                        capture_fence.active = true;
-                        capture = Some((key, end));
+                        if runtime.frame.is_none() {
+                            runtime.frame = Some(self.make_frame71(plan, geometry)?);
+                        }
+                        let frame = runtime.frame.as_mut().ok_or("whole-read71 frame missing")?;
+                        whole_submitted = true;
+                        whole_state = Some(self.prepare_state71(
+                            plan,
+                            frame,
+                            current_state,
+                            &mut whole_payload,
+                        )?);
+                        whole_saved =
+                            self.enter_body71(plan, frame, &resources, bindings, &mut values)?;
+                        whole_status_private = true;
+                        if cancelled.is_cancelled() {
+                            return Err("operation aborted".into());
+                        }
+                        if let Some(graph) = &frame.graph {
+                            last_skipped_validation = Some(plan.end - 1);
+                            graph.launch(&self.device.stream)?;
+                            #[cfg(test)]
+                            whole_read71::after_launch(cancelled);
+                            whole_read71::trace("hit", Some(plan), current_state.kv_layers.len())?;
+                            self.leave_body71(
+                                plan,
+                                frame,
+                                &resources,
+                                &mut values,
+                                std::mem::take(&mut whole_saved),
+                            )?;
+                            whole_status_private = false;
+                            position = plan.end;
+                            continue;
+                        }
+                        whole_active = true;
+                        if frame.warmed {
+                            self.device
+                                .stream
+                                .begin_capture(
+                                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                                )
+                                .map_err(|e| format!("whole-read71 begin capture: {e}"))?;
+                            whole_capturing = true;
+                        } else {
+                            whole_read71::trace("warm", Some(plan), current_state.kv_layers.len())?;
+                        }
+                    } else {
+                        whole_read71::trace(
+                            "geometry-or-policy-miss",
+                            Some(plan),
+                            current_state.kv_layers.len(),
+                        )?;
                     }
                 }
-            }
-            let command = &self.commands[position];
-            let Some(output_id) = command.output else {
-                position += 1;
-                continue;
-            };
-            let meta = &self.program.values[output_id.index()];
-            let traced = trace
-                && !matches!(
-                    command.kind,
-                    CommandKind::Prepare
-                        | CommandKind::Value(_)
-                        | CommandKind::Input { .. }
-                        | CommandKind::Alias { .. }
-                );
-            let started = if traced {
-                self.device
-                    .stream
-                    .synchronize()
-                    .map_err(|error| error.to_string())?;
-                let value = |id: ValueId| {
-                    let value = &self.program.values[id.index()];
-                    serde_json::json!({ "shape": value.shape, "dtype": value.dtype.name() })
+                let resources = if whole_active {
+                    &whole_runtime
+                        .as_ref()
+                        .and_then(|r| r.frame.as_ref())
+                        .and_then(|f| f.storage.as_ref())
+                        .ok_or("whole-read71 storage missing")?
+                        .resources
+                } else {
+                    &resources
                 };
-                let operation = match &command.kind {
-                    CommandKind::Kernel {
-                        name,
-                        inputs,
-                        args,
-                        checked,
-                        state,
-                        kv_matmul,
-                        ..
-                    } => serde_json::json!({
-                        "kernel": if kv_matmul.is_some() { "kv_stepwise_bf16_gemm_active_rows" } else { name },
-                        "capturable": !checked && kv_matmul.is_none(),
-                        "dynamicGemmDimensions": kv_matmul.is_some(),
-                        "workspaceBytes": kv_matmul.map(|plan| plan.bytes),
-                        "inputs": inputs.iter().flatten().map(|id| value(*id)).collect::<Vec<_>>(),
-                        "state": format!("{state:?}"),
-                        "integers": args.integers,
-                        "computeDtype": args.compute_dtype
-                    }),
-                    CommandKind::Gemm {
-                        x, weight, plan, ..
-                    } => serde_json::json!({
-                        "kernel": "cublas_bf16_gemm", "inputs": [value(*x), value(*weight)],
-                        "m": plan.m, "n": plan.n, "k": plan.k, "batch": plan.batch
-                    }),
-                    CommandKind::LinearBias { .. } => {
-                        serde_json::json!({ "kernel": "et_linear_bias_f32" })
+                // Do not capture implicit buffer events while a dense worker may
+                // still access a shared operand. Fork/join execution stays ordinary.
+                // Tuple operands below are evaluated eagerly. Avoid scanning every
+                // suffix of a capturable segment when graph execution is disabled.
+                if graph_runtime.is_some() && capture.is_none() && active_dense_branches == 0 {
+                    let search_start = graph_diagnostics
+                        .as_ref()
+                        .map(|_| std::time::Instant::now());
+                    let segment_end =
+                        Self::graph_segment_end(&self.commands, position, overlap_enabled);
+                    if let (Some(stats), Some(start)) = (graph_diagnostics.as_mut(), search_start) {
+                        stats.segment_searches = stats.segment_searches.saturating_add(1);
+                        stats.segment_search_ms += start.elapsed().as_secs_f64() * 1000.;
                     }
-                    CommandKind::FusedElementwise { inputs, .. } => serde_json::json!({
-                        "kernel": "fused_elementwise", "capturable": true,
-                        "inputs": inputs.iter().flatten().map(|id| value(*id)).collect::<Vec<_>>()
-                    }),
+                    if let (Some(runtime), Some(end)) = (graph_runtime.as_mut(), segment_end) {
+                        if let Some(stats) = graph_diagnostics.as_mut() {
+                            stats.record_attempt(end - position);
+                        }
+                        if graph_address_scratch.is_none() {
+                            let materialize_start = graph_diagnostics
+                                .as_ref()
+                                .map(|_| std::time::Instant::now());
+                            self.materialize_graph_values(
+                                &resources,
+                                bindings,
+                                &mut values,
+                                position,
+                                end,
+                            )?;
+                            if let (Some(stats), Some(start)) =
+                                (graph_diagnostics.as_mut(), materialize_start)
+                            {
+                                stats.materialize_ms += start.elapsed().as_secs_f64() * 1000.;
+                            }
+                        }
+                        let key_start = graph_diagnostics
+                            .as_ref()
+                            .map(|_| std::time::Instant::now());
+                        let key = if let Some(scratch) = graph_address_scratch.as_mut() {
+                            self.planned_graph_key(
+                                &resources, bindings, &values, scratch, position, end,
+                            )?
+                        } else {
+                            self.graph_key(&resources, &values, position, end)?
+                        };
+                        // Hardware ownership tests compare both constructions before any
+                        // cache lookup/capture; production builds do not materialize here.
+                        #[cfg(test)]
+                        if graph_address_scratch.is_some() {
+                            let mut reference_values = values.clone();
+                            self.materialize_graph_values(
+                                &resources,
+                                bindings,
+                                &mut reference_values,
+                                position,
+                                end,
+                            )?;
+                            assert_eq!(
+                                key,
+                                self.graph_key(&resources, &reference_values, position, end)?
+                            );
+                        }
+                        if let (Some(stats), Some(start)) = (graph_diagnostics.as_mut(), key_start)
+                        {
+                            stats.key_ms += start.elapsed().as_secs_f64() * 1000.;
+                            stats.key_pointer_entries = stats
+                                .key_pointer_entries
+                                .saturating_add(key.pointers.len() as u64);
+                        }
+                        if let Some(graph) = runtime.cache.get(&key) {
+                            if graph_address_scratch.is_some() {
+                                let materialize_start = graph_diagnostics
+                                    .as_ref()
+                                    .map(|_| std::time::Instant::now());
+                                self.materialize_graph_values(
+                                    &resources,
+                                    bindings,
+                                    &mut values,
+                                    position,
+                                    end,
+                                )?;
+                                if let (Some(stats), Some(start)) =
+                                    (graph_diagnostics.as_mut(), materialize_start)
+                                {
+                                    stats.materialize_ms += start.elapsed().as_secs_f64() * 1000.;
+                                }
+                            }
+                            graph.0.launch().map_err(|error| error.to_string())?;
+                            if graph_trace {
+                                self.device.stream.synchronize().map_err(|error| {
+                                    format!(
+                                        "CUDA graph replay {}..{} failed: {error}",
+                                        key.start, key.end
+                                    )
+                                })?;
+                            }
+                            runtime.hits += 1;
+                            if let Some(stats) = graph_diagnostics.as_mut() {
+                                stats.record_hit(end - position);
+                            }
+                            position = end;
+                            continue;
+                        }
+                        // Loader programs often repeat with different weight addresses.
+                        // Capture only after this exact command and pointer set repeats.
+                        let first_seen = runtime.seen.insert(key.clone());
+                        if let Some(stats) = graph_diagnostics.as_mut() {
+                            stats.seen_end = runtime.seen.len();
+                            if first_seen {
+                                stats.first_seen_misses = stats.first_seen_misses.saturating_add(1);
+                            }
+                        }
+                        if !first_seen {
+                            if graph_address_scratch.is_some() {
+                                let materialize_start = graph_diagnostics
+                                    .as_ref()
+                                    .map(|_| std::time::Instant::now());
+                                self.materialize_graph_values(
+                                    &resources,
+                                    bindings,
+                                    &mut values,
+                                    position,
+                                    end,
+                                )?;
+                                if let (Some(stats), Some(start)) =
+                                    (graph_diagnostics.as_mut(), materialize_start)
+                                {
+                                    stats.materialize_ms += start.elapsed().as_secs_f64() * 1000.;
+                                }
+                            }
+                            self.device
+                                .stream
+                                .begin_capture(
+                                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                                )
+                                .map_err(|error| format!("CUDA graph capture failed: {error}"))?;
+                            capture_fence.active = true;
+                            capture = Some((key, end));
+                        }
+                    }
+                }
+                if pair61_enabled {
+                    if let Some(pair) = self.prepare_pair61(
+                        position,
+                        &resources,
+                        &values,
+                        deferred_status,
+                        grouped_rows_block,
+                        grouped_vector_copy,
+                    )? {
+                        if cancelled.is_cancelled() {
+                            return Err("operation aborted".into());
+                        }
+                        // Retain before attempting submission: a driver error can
+                        // report prior asynchronous work. Never retry eager here.
+                        fence.pair61_graphs.push(pair.graph.clone());
+                        // SAFETY: current invocation values/resources retain every
+                        // validated range; device gate and cache lock serialize use.
+                        #[cfg(test)]
+                        expert_pair61::before_launch()?;
+                        unsafe {
+                            pair.graph.launch(&self.device.stream)?;
+                        }
+                        last_skipped_validation = Some(position);
+                        #[cfg(test)]
+                        expert_pair61::after_launch(cancelled)?;
+                        grouped_routing.insert(pair.control, GroupedRouting::DeviceReady);
+                        for (id, value) in pair.outputs {
+                            values[id.index()] = Some(value);
+                        }
+                        position = pair.end + 1;
+                        continue;
+                    }
+                }
+                let command = &self.commands[position];
+                let overlap = if overlap_enabled {
+                    command.overlap
+                } else {
+                    CommandOverlap::Primary
+                };
+                if let CommandOverlap::Join { branch } = overlap {
+                    let event = dense_completed
+                        .remove(&branch)
+                        .ok_or("execute: dense overlap completion is missing")?;
+                    self.device
+                        .stream
+                        .wait(&event)
+                        .map_err(|error| error.to_string())?;
+                    fence.worker_events.push(event);
+                    active_dense_branches = active_dense_branches
+                        .checked_sub(1)
+                        .ok_or("execute: dense overlap join has no active branch")?;
+                }
+                if let CommandOverlap::Worker { start: true, .. } = overlap {
+                    active_dense_branches += 1;
+                    fence.dense_stream = Some(self.device.dense_cublas.stream().clone());
+                    let ready = self
+                        .device
+                        .stream
+                        .record_event(None)
+                        .map_err(|error| error.to_string())?;
+                    self.device
+                        .dense_cublas
+                        .stream()
+                        .wait(&ready)
+                        .map_err(|error| error.to_string())?;
+                    fence.worker_events.push(ready);
+                }
+                let stream = if matches!(overlap, CommandOverlap::Worker { .. }) {
+                    self.device.dense_cublas.stream()
+                } else {
+                    &self.device.stream
+                };
+                let Some(output_id) = command.output else {
+                    position += 1;
+                    continue;
+                };
+                let meta = &self.program.values[output_id.index()];
+                let traced = trace
+                    && !matches!(
+                        command.kind,
+                        CommandKind::Prepare
+                            | CommandKind::Value(_)
+                            | CommandKind::Input { .. }
+                            | CommandKind::Alias { .. }
+                            | CommandKind::PlannedAlias
+                    );
+                let started = if traced {
+                    self.device
+                        .stream
+                        .synchronize()
+                        .map_err(|error| error.to_string())?;
+                    let value = |id: ValueId| {
+                        let value = &self.program.values[id.index()];
+                        serde_json::json!({ "shape": value.shape, "dtype": value.dtype.name() })
+                    };
+                    let operation = match &command.kind {
+                        CommandKind::Kernel {
+                            name,
+                            inputs,
+                            args,
+                            checked,
+                            state,
+                            kv_matmul,
+                            ..
+                        } => serde_json::json!({
+                            "kernel": if kv_matmul.is_some() { "kv_stepwise_bf16_gemm_active_rows" } else { name },
+                            "capturable": !checked && kv_matmul.is_none(),
+                            "dynamicGemmDimensions": kv_matmul.is_some(),
+                            "workspaceBytes": kv_matmul.map(|plan| plan.bytes),
+                            "inputs": inputs.iter().flatten().map(|id| value(*id)).collect::<Vec<_>>(),
+                            "state": format!("{state:?}"),
+                            "integers": args.integers,
+                            "computeDtype": args.compute_dtype
+                        }),
+                        CommandKind::Gemm {
+                            x, weight, plan, ..
+                        } => serde_json::json!({
+                            "kernel": "cublas_bf16_gemm", "inputs": [value(*x), value(*weight)],
+                            "m": plan.m, "n": plan.n, "k": plan.k, "batch": plan.batch
+                        }),
+                        CommandKind::GemmPair {
+                            x,
+                            weights,
+                            second_output,
+                            plan,
+                            ..
+                        } => serde_json::json!({
+                            "kernel": "et_kv_pair57", "inputs": [value(*x), value(weights[0]), value(weights[1])],
+                            "secondOutput": value(*second_output), "m": plan.m, "n": plan.n, "k": plan.k, "batch": plan.batch, "capturable": false
+                        }),
+                        CommandKind::LinearBias { .. } => {
+                            serde_json::json!({ "kernel": "et_linear_bias_f32" })
+                        }
+                        CommandKind::FusedElementwise {
+                            inputs,
+                            wide_sum,
+                            wide_arg,
+                            ..
+                        } => serde_json::json!({
+                            "kernel": if *wide_sum { "fused_elementwise_sum" } else if *wide_arg { "fused_elementwise_arg" } else { "fused_elementwise" }, "capturable": true,
+                            "inputs": inputs.iter().flatten().map(|id| value(*id)).collect::<Vec<_>>()
+                        }),
+                        CommandKind::GroupedExpert {
+                            rows,
+                            columns,
+                            inner,
+                            experts,
+                            indexes,
+                            control,
+                            reuse_routing,
+                            source_rows,
+                            device_control,
+                            ..
+                        } => serde_json::json!({
+                            "kernel": "grouped_expert_linear_rows", "rows": rows, "columns": columns,
+                            "inner": inner, "experts": experts, "capturable": false,
+                            "indexesValue": indexes.get(), "controlValue": control.get(),
+                            "routingReused": reuse_routing,
+                            "sourceRows": source_rows,
+                            "deviceControl59": device_control.is_some(),
+                            "controlReadbackBytes": if *reuse_routing || device_control.is_some() { 0 } else { (experts + 2) * 4 }
+                        }),
+                        CommandKind::FusedMoe75 { plan, .. } => serde_json::json!({
+                            "kernel": "fused_moe75", "arithmetic": "relaxed-bf16",
+                            "gemm1": plan.selected_gemm1, "gemm2": plan.selected_gemm2
+                        }),
+                        CommandKind::NormRope101 { .. } => {
+                            serde_json::json!({ "kernel": "triton_normrope101", "capturable": false })
+                        }
+                        CommandKind::Softmax100 { .. } => {
+                            serde_json::json!({ "kernel": "triton_softmax100", "capturable": false })
+                        }
+                        CommandKind::Norm98Entrance { rows, .. } => {
+                            serde_json::json!({ "kernel": "triton_norm98_entrance", "rows": rows, "capturable": false })
+                        }
+                        CommandKind::Norm98Tail { rows, .. } => {
+                            serde_json::json!({ "kernel": "triton_norm98_tail", "rows": rows, "capturable": false })
+                        }
+                        CommandKind::Scalar { .. } => serde_json::json!({ "kernel": "et_fill" }),
+                        CommandKind::Cursor { .. } => {
+                            serde_json::json!({ "kernel": "cursor_upload" })
+                        }
+                        _ => unreachable!(),
+                    };
+                    emit_trace(serde_json::json!({
+                        "event": "begin", "program": format!("{self:p}"), "run": run, "instruction": position,
+                        "operation": operation, "output": value(output_id),
+                        "state": state.as_ref().map(|state| serde_json::json!({
+                            "cursors": state.sequences.iter().map(|sequence| sequence.cursor).collect::<Vec<_>>(),
+                            "validLengths": state.valid_lengths, "capacity": state.capacity,
+                            "access": format!("{:?}", state.access)
+                        }))
+                    }))?;
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let output = match &command.kind {
+                    CommandKind::Prepare => {
+                        position += 1;
+                        continue;
+                    }
+                    CommandKind::Value(value) => value.clone(),
+                    CommandKind::Input { binding } => {
+                        let value = bindings
+                            .get(*binding)
+                            .ok_or_else(|| format!("execute: missing CUDA binding {binding}"))?;
+                        if value.ordinal() != self.device.ordinal
+                            || value.shape() != meta.shape
+                            || value.dtype() != meta.dtype
+                            || value.spec().storage.representation != meta.storage.representation
+                        {
+                            return Err(format!(
+                                "execute: CUDA binding {binding} violates its value specification"
+                            ));
+                        }
+                        if whole_active {
+                            whole_runtime
+                                .as_ref()
+                                .and_then(|r| r.frame.as_ref())
+                                .and_then(|f| f.storage.as_ref())
+                                .and_then(|s| s.live_ins.get(&output_id))
+                                .cloned()
+                                .ok_or("whole-read71 unstaged input")?
+                        } else {
+                            value.clone()
+                        }
+                    }
+                    CommandKind::Alias { source } => {
+                        #[cfg(test)]
+                        if meta.decl.name.starts_with("rotary_reuse66_") {
+                            if let Some(hook) = after_rotary66 {
+                                hook();
+                            }
+                        }
+                        values[source.index()]
+                            .as_ref()
+                            .ok_or("execute: alias source is unavailable")?
+                            .reshape_dense(meta.shape.clone())?
+                    }
+                    CommandKind::PlannedAlias => self.planned_value(&resources, output_id)?,
+                    CommandKind::Norm98Entrance {
+                        inputs,
+                        sum_a,
+                        rows,
+                        rho,
+                        plan,
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let address = |id: ValueId| {
+                            values[id.index()]
+                                .as_ref()
+                                .map(CudaValue::storage_address)
+                                .ok_or("execute: norm98 input unavailable")
+                        };
+                        let bytes = u64::from(*rows) * 2816 * 2;
+                        let base = output.storage_address();
+                        // Copy only into declared invocation-private storage.
+                        whole_read71::copy(stream, address(inputs[0])?, base, bytes as usize)?;
+                        let args = crate::triton_norm98::Entrance98 {
+                            rows: *rows,
+                            attention: base,
+                            hidden: address(inputs[1])?,
+                            attention_weight: address(inputs[2])?,
+                            dense_weight: address(inputs[3])?,
+                            expert_weight: address(inputs[4])?,
+                            router_weight: address(inputs[5])?,
+                            rho_bf16: rho.address(stream.context())?,
+                            sum_a: self.buffer(&resources, *sum_a)?.address(),
+                            dense: base + bytes,
+                            expert: base + 2 * bytes,
+                            router: base + 3 * bytes,
+                        };
+                        // All pointers belong to declared values/resources retained by
+                        // the existing invocation fence, including launch-error paths.
+                        unsafe {
+                            plan.launch_entrance(stream, &args)?;
+                        }
+                        output
+                    }
+                    CommandKind::Softmax100 {
+                        source,
+                        scratch,
+                        plan,
+                    } => {
+                        let input = values[source.index()]
+                            .as_ref()
+                            .ok_or("execute: softmax100 input unavailable")?;
+                        let output = self.planned_value(&resources, output_id)?;
+                        let invocation = crate::triton_softmax100::Invocation100 {
+                            input: input.storage_address(),
+                            output: output.storage_address(),
+                            scratch: self.buffer(&resources, *scratch)?.address(),
+                        };
+                        unsafe {
+                            plan.launch(stream, invocation)?;
+                        }
+                        #[cfg(test)]
+                        if let Some(hook) = after_softmax100 {
+                            hook();
+                        }
+                        output
+                    }
+                    CommandKind::NormRope101 {
+                        packed,
+                        borrowed,
+                        table_strides,
+                        scratch,
+                        outputs,
+                        plan,
+                    } => {
+                        let address = |id: ValueId| {
+                            values[id.index()]
+                                .as_ref()
+                                .map(CudaValue::storage_address)
+                                .ok_or("execute: normrope101 input unavailable")
+                        };
+                        let buffer = |id: ValueId| {
+                            self.buffer(&resources, id).map(|buffer| buffer.address())
+                        };
+                        let invocation = crate::triton_normrope101::Invocation101 {
+                            packed: buffer(*packed)?,
+                            query_weight: address(borrowed[0])?,
+                            key_weight: address(borrowed[1])?,
+                            cosine: address(borrowed[2])?,
+                            cosine_stride: table_strides[0],
+                            sine_stride: table_strides[1],
+                            sine: address(borrowed[3])?,
+                            table: buffer(scratch[0])?,
+                            positions: buffer(scratch[1])?,
+                            sum_q: buffer(scratch[2])?,
+                            sum_k: buffer(scratch[3])?,
+                            raw_query: buffer(scratch[4])?,
+                            raw_key: buffer(scratch[5])?,
+                            raw_value: buffer(scratch[6])?,
+                            query: buffer(outputs[0])?,
+                            key: buffer(outputs[1])?,
+                            value: buffer(outputs[2])?,
+                        };
+                        unsafe {
+                            plan.launch(stream, &invocation)?;
+                        }
+                        self.planned_value(&resources, output_id)?
+                    }
+                    CommandKind::Norm98Tail {
+                        inputs,
+                        entrance,
+                        sum_a,
+                        attention_weight,
+                        hidden,
+                        combined,
+                        rows,
+                        plan,
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let address = |id: ValueId| {
+                            values[id.index()]
+                                .as_ref()
+                                .map(CudaValue::storage_address)
+                                .ok_or("execute: norm98 input unavailable")
+                        };
+                        let args = crate::triton_norm98::Tail98 {
+                            rows: *rows,
+                            private_attention: self.buffer(&resources, *entrance)?.address(),
+                            dense: address(inputs[0])?,
+                            expert: address(inputs[1])?,
+                            dense_weight: address(inputs[3])?,
+                            expert_weight: address(inputs[4])?,
+                            combined_weight: address(inputs[5])?,
+                            scale: address(inputs[6])?,
+                            next_weight: address(inputs[7])?,
+                            sum_a: self.buffer(&resources, *sum_a)?.address(),
+                            attention_weight: address(*attention_weight)?,
+                            hidden: address(*hidden)?,
+                            combined_f32: self.buffer(&resources, *combined)?.address(),
+                            next_norm: output.storage_address(),
+                        };
+                        unsafe {
+                            plan.launch_tail(stream, &args)?;
+                        }
+                        #[cfg(test)]
+                        if let Some(hook) = after_ffn63 {
+                            hook();
+                        }
+                        output
+                    }
+                    CommandKind::Scalar { binding } => {
+                        let value = *scalars
+                            .get(*binding)
+                            .ok_or("execute: scalar binding is missing")?;
+                        let output = self.planned_value(&resources, output_id)?;
+                        let args = CudaKernelArgs {
+                            output: output.storage_address(),
+                            elements: element_count(&meta.shape)? as u64,
+                            output_dtype: dtype_code(meta.dtype),
+                            scalars: [value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                            ..Default::default()
+                        };
+                        self.launch("et_fill", &args)?;
+                        output
+                    }
+                    CommandKind::Cursor { tensor } => {
+                        let state = state
+                            .as_deref()
+                            .ok_or("execute: state cursor requires state")?;
+                        let mut cursors = vec![0i64; element_count(&meta.shape)?];
+                        if *tensor {
+                            let rows = state.packed_rows_per_sequence.unwrap_or(1) as usize;
+                            for (request, &slot) in state.slots.iter().enumerate() {
+                                for offset in 0..rows {
+                                    let target = cursors
+                                        .get_mut(slot as usize * rows + offset)
+                                        .ok_or("execute: cursor lane is invalid")?;
+                                    *target =
+                                        i64::from(state.sequences[request].cursor) + offset as i64;
+                                }
+                            }
+                        } else {
+                            cursors[0] = i64::from(
+                                state
+                                    .sequences
+                                    .first()
+                                    .ok_or("execute: cursor sequence missing")?
+                                    .cursor,
+                            );
+                        }
+                        let output = self.planned_value(&resources, output_id)?;
+                        let mut buffer = output.buffer.cast::<i64>(cursors.len())?;
+                        self.device
+                            .stream
+                            .memcpy_htod(&cursors, &mut buffer)
+                            .map_err(|e| e.to_string())?;
+                        output
+                    }
+                    CommandKind::FusedMoe75 {
+                        x,
+                        indexes,
+                        scales,
+                        down,
+                        workspace,
+                        map,
+                        routes,
+                        status,
+                        plan,
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let retained = [*x, *indexes, *scales, *down]
+                            .into_iter()
+                            .map(|id| {
+                                values[id.index()]
+                                    .clone()
+                                    .ok_or("execute: MoE75 input unavailable")
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let workspace = self.buffer(&resources, *workspace)?;
+                        let map = self.buffer(&resources, *map)?;
+                        let routes = self.buffer(&resources, *routes)?;
+                        let status = self.buffer(&resources, *status)?;
+                        let route_address = routes.address();
+                        let status_address = status.address();
+                        let addresses = [
+                            retained[0].storage_address(),
+                            retained[1].storage_address(),
+                            retained[2].storage_address(),
+                            retained[3].storage_address(),
+                            output.storage_address(),
+                            workspace.address(),
+                            map.address(),
+                        ];
+                        let mut retained = retained;
+                        retained.push(output.clone());
+                        // Retain BEFORE calling: runMoe may throw after enqueue.
+                        fence.moe75_retained.push((
+                            plan.clone(),
+                            retained,
+                            vec![workspace, map, routes, status],
+                        ));
+                        last_skipped_validation = Some(position);
+                        unsafe {
+                            plan.launch(
+                                stream,
+                                addresses,
+                                status_address,
+                                u32::try_from(position)
+                                    .map_err(|_| "MoE75 error context overflow")?,
+                                route_address,
+                            )?;
+                        }
+                        output
+                    }
+                    CommandKind::Gemm {
+                        x,
+                        weight,
+                        weight_transposed,
+                        plan,
+                        out_f32,
+                        workspace,
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let x_value = values[x.index()]
+                            .as_ref()
+                            .ok_or("execute: GEMM activation is unavailable")?;
+                        let weight_value = values[weight.index()]
+                            .as_ref()
+                            .ok_or("execute: GEMM weight is unavailable")?;
+                        let workspace = self.buffer(&resources, *workspace)?;
+                        // SAFETY: lowering checked geometry and binding types. Values
+                        // and the invocation fence retain these allocations until the
+                        // device stream completes, including cancellation and errors.
+                        let profile_start = profile_event()?;
+                        unsafe {
+                            let blas = if whole_active {
+                                let storage = whole_runtime
+                                    .as_ref()
+                                    .and_then(|r| r.frame.as_ref())
+                                    .and_then(|f| f.storage.as_ref())
+                                    .ok_or("whole-read71 storage missing")?;
+                                if matches!(overlap, CommandOverlap::Worker { .. }) {
+                                    &storage.dense_blas
+                                } else {
+                                    &storage.primary_blas
+                                }
+                            } else if matches!(overlap, CommandOverlap::Worker { .. }) {
+                                &self.device.dense_cublas
+                            } else {
+                                &self.device.cublas
+                            };
+                            blas.gemm_bf16(
+                                *plan,
+                                *weight_transposed,
+                                x_value.storage_address(),
+                                weight_value.storage_address(),
+                                output.storage_address(),
+                                *out_f32,
+                                workspace.address(),
+                            )?;
+                        }
+                        let profile_end = profile_event()?;
+                        if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                            gemm_profile.push((
+                                plan.m,
+                                plan.n,
+                                plan.k,
+                                plan.batch,
+                                *weight_transposed,
+                                *out_f32,
+                                start,
+                                end,
+                            ));
+                        }
+                        #[cfg(test)]
+                        if let Some(after_gemm) = after_gemm {
+                            after_gemm();
+                        }
+                        output
+                    }
+                    CommandKind::PackedProjection77 {
+                        skip_split,
+                        x,
+                        weight,
+                        outputs,
+                        widths,
+                        temporary,
+                        workspace,
+                        plan,
+                    } => {
+                        let input = values[x.index()]
+                            .as_ref()
+                            .ok_or("packed77 input unavailable")?;
+                        let weight = values[weight.index()]
+                            .as_ref()
+                            .ok_or("packed77 weight unavailable")?;
+                        let temporary = self.buffer(&resources, *temporary)?;
+                        let workspace = self.buffer(&resources, *workspace)?;
+                        let produced = outputs
+                            .iter()
+                            .map(|id| self.planned_value(&resources, *id))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        unsafe {
+                            let blas = if matches!(overlap, CommandOverlap::Worker { .. }) {
+                                &self.device.dense_cublas
+                            } else {
+                                &self.device.cublas
+                            };
+                            blas.gemm_bf16(
+                                *plan,
+                                true,
+                                input.storage_address(),
+                                weight.storage_address(),
+                                temporary.address(),
+                                false,
+                                workspace.address(),
+                            )?;
+                        }
+                        if !skip_split {
+                            let mut args = CudaKernelArgs::default();
+                            args.inputs[0] = temporary.address();
+                            args.elements = (plan.m * plan.n) as u64;
+                            args.integers[0] = plan.n as u64;
+                            for (role, (value, width)) in produced.iter().zip(widths).enumerate() {
+                                args.inputs[role + 1] = value.storage_address();
+                                args.integers[role + 1] = *width as u64;
+                            }
+                            let mut launch = stream.launch_builder(
+                                self.device.kernel("et_packed_projection77_split")?,
+                            );
+                            launch.arg(&args);
+                            unsafe {
+                                launch.launch(LaunchConfig {
+                                    grid_dim: ((args.elements as u32).div_ceil(256), 1, 1),
+                                    block_dim: (256, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })
+                            }
+                            .map_err(|e| e.to_string())?;
+                        }
+                        for (id, value) in outputs.iter().zip(&produced) {
+                            values[id.index()] = Some(value.clone());
+                        }
+                        #[cfg(test)]
+                        if let Some(after_gemm) = after_gemm {
+                            after_gemm();
+                        }
+                        produced[0].clone()
+                    }
+                    CommandKind::GemmPair {
+                        x,
+                        weights,
+                        second_output,
+                        plan,
+                        workspaces,
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let second = self.planned_value(&resources, *second_output)?;
+                        let input = |id: ValueId| {
+                            values[id.index()]
+                                .as_ref()
+                                .ok_or("execute: paired GEMM input is unavailable")
+                        };
+                        let addresses = [
+                            input(*x)?.storage_address(),
+                            input(weights[0])?.storage_address(),
+                            input(weights[1])?.storage_address(),
+                            output.storage_address(),
+                            second.storage_address(),
+                        ];
+                        // Select fallback before any submission. A failed launch must propagate
+                        // through the invocation fence, never retry partially submitted work.
+                        if let Some(kernel) = crate::kv_pair::select_kernel(
+                            self.device.kv_pair.as_ref(),
+                            *plan,
+                            addresses,
+                        ) {
+                            unsafe {
+                                kernel.launch(&self.device.stream, addresses)?;
+                            }
+                        } else {
+                            for role in 0..2 {
+                                let workspace = self.buffer(&resources, workspaces[role])?;
+                                unsafe {
+                                    let blas = if whole_active {
+                                        &whole_runtime
+                                            .as_ref()
+                                            .and_then(|r| r.frame.as_ref())
+                                            .and_then(|f| f.storage.as_ref())
+                                            .ok_or("whole-read71 storage missing")?
+                                            .primary_blas
+                                    } else {
+                                        &self.device.cublas
+                                    };
+                                    blas.gemm_bf16(
+                                        *plan,
+                                        true,
+                                        addresses[0],
+                                        addresses[1 + role],
+                                        addresses[3 + role],
+                                        false,
+                                        workspace.address(),
+                                    )?;
+                                }
+                            }
+                        }
+                        #[cfg(test)]
+                        if let Some(after_gemm) = after_gemm {
+                            after_gemm();
+                        }
+                        // Both definitions occur here, after all binding bookkeeping.
+                        // Invocation resources and the fence retain each allocation.
+                        values[second_output.index()] = Some(second);
+                        output
+                    }
                     CommandKind::GroupedExpert {
+                        x,
+                        weight,
+                        indexes,
                         rows,
                         columns,
                         inner,
                         experts,
-                        indexes,
                         control,
+                        row_map,
+                        gathered,
+                        projected,
+                        workspace,
                         reuse_routing,
+                        splitk_workspace,
                         source_rows,
-                        ..
-                    } => serde_json::json!({
-                        "kernel": "grouped_expert_linear_rows", "rows": rows, "columns": columns,
-                        "inner": inner, "experts": experts, "capturable": false,
-                        "indexesValue": indexes.get(), "controlValue": control.get(),
-                        "routingReused": reuse_routing,
-                        "sourceRows": source_rows,
-                        "controlReadbackBytes": if *reuse_routing { 0 } else { (experts + 2) * 4 }
-                    }),
-                    CommandKind::Scalar { .. } => serde_json::json!({ "kernel": "et_fill" }),
-                    CommandKind::Cursor { .. } => serde_json::json!({ "kernel": "cursor_upload" }),
-                    _ => unreachable!(),
-                };
-                emit_trace(serde_json::json!({
-                    "event": "begin", "program": format!("{self:p}"), "run": run, "instruction": position,
-                    "operation": operation, "output": value(output_id),
-                    "state": state.as_ref().map(|state| serde_json::json!({
-                        "cursors": state.sequences.iter().map(|sequence| sequence.cursor).collect::<Vec<_>>(),
-                        "validLengths": state.valid_lengths, "capacity": state.capacity,
-                        "access": format!("{:?}", state.access)
-                    }))
-                }))?;
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let output = match &command.kind {
-                CommandKind::Prepare => {
-                    position += 1;
-                    continue;
-                }
-                CommandKind::Value(value) => value.clone(),
-                CommandKind::Input { binding } => {
-                    let value = bindings
-                        .get(*binding)
-                        .ok_or_else(|| format!("execute: missing CUDA binding {binding}"))?;
-                    if value.ordinal() != self.device.ordinal
-                        || value.shape() != meta.shape
-                        || value.dtype() != meta.dtype
-                        || value.spec().storage.representation != meta.storage.representation
-                    {
-                        return Err(format!(
-                            "execute: CUDA binding {binding} violates its value specification"
-                        ));
-                    }
-                    value.clone()
-                }
-                CommandKind::Alias { source } => values[source.index()]
-                    .as_ref()
-                    .ok_or("execute: alias source is unavailable")?
-                    .reshape_dense(meta.shape.clone())?,
-                CommandKind::Scalar { binding } => {
-                    let value = *scalars
-                        .get(*binding)
-                        .ok_or("execute: scalar binding is missing")?;
-                    let output = self.planned_value(&resources, output_id)?;
-                    let args = CudaKernelArgs {
-                        output: output.storage_address(),
-                        elements: element_count(&meta.shape)? as u64,
-                        output_dtype: dtype_code(meta.dtype),
-                        scalars: [value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                        ..Default::default()
-                    };
-                    self.launch("et_fill", &args)?;
-                    output
-                }
-                CommandKind::Cursor { tensor } => {
-                    let state = state
-                        .as_deref()
-                        .ok_or("execute: state cursor requires state")?;
-                    let mut cursors = vec![0i64; element_count(&meta.shape)?];
-                    if *tensor {
-                        let rows = state.packed_rows_per_sequence.unwrap_or(1) as usize;
-                        for (request, &slot) in state.slots.iter().enumerate() {
-                            for offset in 0..rows {
-                                let target = cursors
-                                    .get_mut(slot as usize * rows + offset)
-                                    .ok_or("execute: cursor lane is invalid")?;
-                                *target =
-                                    i64::from(state.sequences[request].cursor) + offset as i64;
+                        input_sorted,
+                        output_sorted,
+                        inverse_routing,
+                        device_control,
+                    } => {
+                        if *reuse_routing {
+                            let activation_end = profile_event()?;
+                            if let (Some(start), Some(end)) =
+                                (grouped_activation_start.take(), activation_end)
+                            {
+                                grouped_profile.push(("activation", start, end));
                             }
                         }
-                    } else {
-                        cursors[0] = i64::from(
-                            state
-                                .sequences
-                                .first()
-                                .ok_or("execute: cursor sequence missing")?
-                                .cursor,
-                        );
-                    }
-                    let output = self.planned_value(&resources, output_id)?;
-                    let mut buffer = output.buffer.cast::<i64>(cursors.len())?;
-                    self.device
-                        .stream
-                        .memcpy_htod(&cursors, &mut buffer)
-                        .map_err(|e| e.to_string())?;
-                    output
-                }
-                CommandKind::Gemm {
-                    x,
-                    weight,
-                    weight_transposed,
-                    plan,
-                    out_f32,
-                    workspace,
-                } => {
-                    let output = self.planned_value(&resources, output_id)?;
-                    let x_value = values[x.index()]
-                        .as_ref()
-                        .ok_or("execute: GEMM activation is unavailable")?;
-                    let weight_value = values[weight.index()]
-                        .as_ref()
-                        .ok_or("execute: GEMM weight is unavailable")?;
-                    let workspace = self.buffer(&resources, *workspace)?;
-                    // SAFETY: lowering checked geometry and binding types. Values
-                    // and the invocation fence retain these allocations until the
-                    // device stream completes, including cancellation and errors.
-                    let profile_start = profile_event()?;
-                    unsafe {
-                        self.device.cublas.gemm_bf16(
-                            *plan,
-                            *weight_transposed,
-                            x_value.storage_address(),
-                            weight_value.storage_address(),
-                            output.storage_address(),
-                            *out_f32,
-                            workspace.address(),
-                        )?;
-                    }
-                    let profile_end = profile_event()?;
-                    if let (Some(start), Some(end)) = (profile_start, profile_end) {
-                        gemm_profile.push((
-                            plan.m,
-                            plan.n,
-                            plan.k,
-                            plan.batch,
-                            *weight_transposed,
-                            *out_f32,
-                            start,
-                            end,
-                        ));
-                    }
-                    #[cfg(test)]
-                    if let Some(after_gemm) = after_gemm {
-                        after_gemm();
-                    }
-                    output
-                }
-                CommandKind::GroupedExpert {
-                    x,
-                    weight,
-                    indexes,
-                    rows,
-                    columns,
-                    inner,
-                    experts,
-                    control,
-                    row_map,
-                    gathered,
-                    projected,
-                    workspace,
-                    reuse_routing,
-                    source_rows,
-                } => {
-                    if *reuse_routing {
-                        let activation_end = profile_event()?;
-                        if let (Some(start), Some(end)) =
-                            (grouped_activation_start.take(), activation_end)
-                        {
-                            grouped_profile.push(("activation", start, end));
-                        }
-                    }
-                    let output = self.planned_value(&resources, output_id)?;
-                    if *rows != 0 {
-                        let address = |id: &ValueId| -> Result<u64, String> {
-                            Ok(values[id.index()]
-                                .as_ref()
-                                .ok_or("execute: grouped expert operand unavailable")?
-                                .storage_address())
-                        };
-                        let control_id = *control;
-                        let control = self
-                            .buffer(&resources, control_id)?
-                            .cast::<u32>(experts + 2)?;
-                        let row_map = self.buffer(&resources, *row_map)?;
-                        let gathered = self.buffer(&resources, *gathered)?;
-                        let projected = self.buffer(&resources, *projected)?;
-                        let mut args = CudaKernelArgs {
-                            output: control.address(),
-                            elements: (experts + 2) as u64,
-                            output_dtype: dtype_code(DType::U32),
-                            ..Default::default()
-                        };
-                        args.inputs[0] = address(indexes)?;
-                        args.integers[0] = *experts as u64;
-                        let offsets = if *reuse_routing {
-                            grouped_routing
-                                .get(&control_id)
-                                .cloned()
-                                .ok_or("execute: grouped expert routing cache is missing")?
-                        } else {
-                            let profile_start = profile_event()?;
-                            let control_started = trace.then(std::time::Instant::now);
-                            self.launch("et_fill", &args)?;
-                            args.elements = *rows as u64;
-                            self.launch("et_grouped_counts", &args)?;
-                            args.elements = 1;
-                            self.launch("et_grouped_offsets", &args)?;
-                            let profile_end = profile_event()?;
-                            if let (Some(start), Some(end)) = (profile_start, profile_end) {
-                                grouped_profile.push(("control", start, end));
-                            }
-                            // This is an explicit non-capturable host completion point.
-                            // Only status and E+1 offsets cross the host. No padded
-                            // groups, activations, weights, or row maps are read back.
-                            let readback_started = trace.then(std::time::Instant::now);
-                            let control_wait_started = grouped_profile_path
-                                .as_ref()
-                                .map(|_| std::time::Instant::now());
-                            let offsets = self
-                                .device
-                                .stream
-                                .clone_dtoh(&control)
-                                .map_err(|e| e.to_string())?;
-                            if let Some(started) = control_wait_started {
-                                grouped_control_wait_ms
-                                    .push(started.elapsed().as_secs_f64() * 1000.0);
-                            }
-                            if let Some(started) = control_started {
-                                emit_trace(serde_json::json!({
-                                    "event": "grouped_control", "program": format!("{self:p}"), "run": run,
-                                    "instruction": position, "capturable": false, "bytes": (experts + 2) * 4,
-                                    "milliseconds": started.elapsed().as_secs_f64() * 1000.0,
-                                    "readbackAndWaitMilliseconds": readback_started.unwrap().elapsed().as_secs_f64() * 1000.0,
-                                    "activeGroupRows": offsets[1..].windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>()
-                                }))?;
-                            }
-                            if let Some(status) = deferred_status {
-                                let status = self.buffer(&resources, status)?.cast::<u64>(1)?;
-                                let failure = self
-                                    .device
-                                    .stream
-                                    .clone_dtoh(&status)
-                                    .map_err(|e| e.to_string())?[0];
-                                self.status_result(failure)?;
-                            }
-                            grouped_routing.insert(control_id, offsets.clone());
-                            offsets
-                        };
-                        if offsets[0] != 0 {
-                            return Err(
-                                "groupedExpertLinearRows: expert index is out of range".into()
-                            );
-                        }
-                        if cancelled.is_cancelled() {
-                            return Err("operation aborted".into());
-                        }
-                        if *columns != 0 && *inner == 0 {
-                            args.output = output.storage_address();
-                            args.output_dtype = dtype_code(meta.dtype);
-                            args.elements = (*rows * *columns) as u64;
-                            self.launch("et_fill", &args)?;
-                        } else if *columns != 0 {
-                            if !*reuse_routing {
+                        let output = self.planned_value(&resources, output_id)?;
+                        if *rows != 0 {
+                            let address = |id: &ValueId| -> Result<u64, String> {
+                                Ok(values[id.index()]
+                                    .as_ref()
+                                    .ok_or("execute: grouped expert operand unavailable")?
+                                    .storage_address())
+                            };
+                            let control_id = *control;
+                            let control = self
+                                .buffer(&resources, control_id)?
+                                .cast::<u32>(experts + 2)?;
+                            let row_map = self.buffer(&resources, *row_map)?;
+                            let gathered_address = if *input_sorted {
+                                address(x)?
+                            } else {
+                                self.buffer(&resources, *gathered)?.address()
+                            };
+                            let projected_address = if *output_sorted {
+                                output.storage_address()
+                            } else {
+                                self.buffer(&resources, *projected)?.address()
+                            };
+                            let mut args = CudaKernelArgs {
+                                output: control.address(),
+                                elements: (experts + 2) as u64,
+                                output_dtype: dtype_code(DType::U32),
+                                ..Default::default()
+                            };
+                            args.inputs[0] = address(indexes)?;
+                            args.integers[0] = *experts as u64;
+                            let offsets = if let Some((_, status)) = device_control {
+                                if graphs_requested || !self.device.device_expert_ready() {
+                                    return Err(
+                                        "execute: device expert policy changed after compilation"
+                                            .into(),
+                                    );
+                                }
+                                if deferred_status != Some(*status) {
+                                    return Err(
+                                        "execute: device expert status not initialized".into()
+                                    );
+                                }
+                                args.scratch[3] = self.buffer(&resources, *status)?.address();
+                                if *reuse_routing {
+                                    if !matches!(
+                                        grouped_routing.get(&control_id),
+                                        Some(GroupedRouting::DeviceReady)
+                                    ) {
+                                        return Err(
+                                            "execute: device expert routing cache mismatch".into(),
+                                        );
+                                    }
+                                } else {
+                                    self.launch("et_fill", &args)?;
+                                    args.elements = *rows as u64;
+                                    self.launch("et_grouped_counts", &args)?;
+                                    args.elements = 1;
+                                    self.launch("et_grouped_offsets", &args)?;
+                                    last_skipped_validation = Some(position);
+                                    grouped_routing.insert(control_id, GroupedRouting::DeviceReady);
+                                }
+                                None
+                            } else if *reuse_routing {
+                                Some(
+                                    grouped_routing
+                                        .get(&control_id)
+                                        .and_then(|routing| match routing {
+                                            GroupedRouting::Host(offsets) => Some(offsets.clone()),
+                                            GroupedRouting::DeviceReady => None,
+                                        })
+                                        .ok_or(
+                                            "execute: grouped expert host routing cache is missing",
+                                        )?,
+                                )
+                            } else {
                                 let profile_start = profile_event()?;
+                                let control_started = trace.then(std::time::Instant::now);
+                                self.launch("et_fill", &args)?;
                                 args.elements = *rows as u64;
-                                args.inputs[1] = control.address();
-                                args.output = row_map.address();
-                                self.launch("et_grouped_rows", &args)?;
+                                self.launch("et_grouped_counts", &args)?;
+                                args.elements = 1;
+                                if grouped_status_summary {
+                                    if let Some(status) = deferred_status {
+                                        // Checked kernels execute on the primary stream,
+                                        // before this offsets kernel. The status allocation
+                                        // remains live through the final invocation check.
+                                        args.scratch[3] =
+                                            self.buffer(&resources, status)?.address();
+                                    }
+                                }
+                                self.launch("et_grouped_offsets", &args)?;
                                 let profile_end = profile_event()?;
                                 if let (Some(start), Some(end)) = (profile_start, profile_end) {
-                                    grouped_profile.push(("row_map", start, end));
+                                    grouped_profile.push(("control", start, end));
                                 }
+                                // This is an explicit non-capturable host completion point.
+                                // Only status and E+1 offsets cross the host. No padded
+                                // groups, activations, weights, or row maps are read back.
+                                let readback_started = trace.then(std::time::Instant::now);
+                                let control_wait_started = grouped_profile_path
+                                    .as_ref()
+                                    .map(|_| std::time::Instant::now());
+                                let offsets = self
+                                    .device
+                                    .stream
+                                    .clone_dtoh(&control)
+                                    .map_err(|e| e.to_string())?;
+                                if let Some(started) = control_wait_started {
+                                    grouped_control_wait_ms
+                                        .push(started.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                if let Some(started) = control_started {
+                                    emit_trace(serde_json::json!({
+                                        "event": "grouped_control", "program": format!("{self:p}"), "run": run,
+                                        "instruction": position, "capturable": false, "bytes": (experts + 2) * 4,
+                                        "milliseconds": started.elapsed().as_secs_f64() * 1000.0,
+                                        "readbackAndWaitMilliseconds": readback_started.unwrap().elapsed().as_secs_f64() * 1000.0,
+                                        "activeGroupRows": offsets[1..].windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>()
+                                    }))?;
+                                }
+                                if let Some(status) = deferred_status.filter(|_| {
+                                    !grouped_status_summary || offsets[0] & 0x8000_0000 != 0
+                                }) {
+                                    let status = self.buffer(&resources, status)?.cast::<u64>(1)?;
+                                    let failure = self
+                                        .device
+                                        .stream
+                                        .clone_dtoh(&status)
+                                        .map_err(|e| e.to_string())?[0];
+                                    self.status_result(failure)?;
+                                }
+                                grouped_routing
+                                    .insert(control_id, GroupedRouting::Host(offsets.clone()));
+                                Some(offsets)
+                            };
+                            if offsets.as_ref().is_some_and(|offsets| offsets[0] != 0) {
+                                return Err(
+                                    "groupedExpertLinearRows: expert index is out of range".into(),
+                                );
                             }
-                            let profile_start = profile_event()?;
-                            args.inputs[0] = address(x)?;
-                            args.inputs[1] = row_map.address();
-                            args.output = gathered.address();
-                            args.output_dtype = dtype_code(meta.dtype);
-                            args.elements = (*rows * *inner) as u64;
-                            args.integers[0] = *inner as u64;
-                            args.integers[1] = *source_rows as u64;
-                            self.launch("et_grouped_gather", &args)?;
-                            let profile_end = profile_event()?;
-                            if let (Some(start), Some(end)) = (profile_start, profile_end) {
-                                grouped_profile.push((
-                                    if *reuse_routing {
-                                        "second_gather"
-                                    } else {
-                                        "first_gather"
-                                    },
-                                    start,
-                                    end,
-                                ));
-                            }
-                            let width = meta.dtype.size_in_bytes();
-                            let weights = address(weight)?;
-                            let workspace = workspace
-                                .map(|id| self.buffer(&resources, id))
-                                .transpose()?;
-                            let mut bf16_groups = Vec::new();
-                            for (expert, range) in offsets[1..].windows(2).enumerate() {
-                                if cancelled.is_cancelled() {
-                                    return Err("operation aborted".into());
+                            if let Some((metadata, status)) = device_control {
+                                let metadata = self.buffer(&resources, *metadata)?;
+                                if metadata.len() < crate::expert_device::BYTES
+                                    || metadata.address() % 16 != 0
+                                {
+                                    return Err(
+                                        "execute: device expert metadata bounds/alignment".into()
+                                    );
                                 }
-                                let start = range[0] as usize;
-                                let count = (range[1] - range[0]) as usize;
-                                if count == 0 {
-                                    continue;
-                                }
-                                let x = gathered.address() + (start * *inner * width) as u64;
-                                let weight = weights + (expert * *columns * *inner * width) as u64;
-                                let out = projected.address() + (start * *columns * width) as u64;
-                                if meta.dtype == DType::BF16 {
-                                    let plan = crate::cublas::Bf16GemmPlan {
-                                        m: count,
-                                        n: *columns,
-                                        k: *inner,
-                                        batch: 1,
-                                        stride_x: count * *inner,
-                                        stride_weight: 0,
-                                        stride_out: count * *columns,
-                                    };
-                                    bf16_groups.push((plan, x, weight, out));
-                                } else {
-                                    let mut gemm = CudaKernelArgs {
-                                        output: out,
-                                        elements: (count * *columns) as u64,
-                                        ..Default::default()
-                                    };
-                                    gemm.inputs[..2].copy_from_slice(&[x, weight]);
-                                    gemm.integers[..2]
-                                        .copy_from_slice(&[*columns as u64, *inner as u64]);
-                                    self.launch("et_grouped_matmul_f32", &gemm)?;
-                                }
-                                #[cfg(test)]
-                                if let Some(after_gemm) = after_gemm {
-                                    after_gemm();
-                                }
-                            }
-                            if !bf16_groups.is_empty() {
-                                // SAFETY: every group uses checked geometry and
-                                // invocation-planned allocations retained by the fence.
-                                unsafe {
-                                    let profile_start = profile_event()?;
-                                    let events = self.device.grouped_gemm_bf16(
-                                        &bf16_groups,
-                                        workspace
-                                            .as_ref()
-                                            .ok_or("grouped GEMM workspace missing")?
-                                            .address(),
-                                    )?;
-                                    let profile_end = profile_event()?;
-                                    if let (Some(start), Some(end)) = (profile_start, profile_end) {
-                                        grouped_profile.push((
-                                            if *reuse_routing {
-                                                "second_projection"
-                                            } else {
-                                                "first_projection"
-                                            },
-                                            start,
-                                            end,
-                                        ));
-                                        if !*reuse_routing {
-                                            grouped_activation_start = profile_event()?;
-                                        }
+                                let mut packet = CudaKernelArgs::default();
+                                packet.inputs[..4].copy_from_slice(&[
+                                    control.address(),
+                                    gathered_address,
+                                    address(weight)?,
+                                    row_map.address(),
+                                ]);
+                                if *inverse_routing {
+                                    if row_map.len() < rows * 8 {
+                                        return Err("execute: device expert inverse bounds".into());
                                     }
-                                    fence.worker_events.extend(events);
+                                    packet.inputs[4] = row_map.address() + (rows * 4) as u64;
                                 }
+                                packet.output = projected_address;
+                                packet.scratch = [
+                                    metadata.address(),
+                                    metadata.address() + 8192,
+                                    metadata.address() + 8192 + 1536,
+                                    self.buffer(&resources, *status)?.address(),
+                                ];
+                                packet.integers[..4].copy_from_slice(&[
+                                    *columns as u64,
+                                    *inner as u64,
+                                    *rows as u64,
+                                    u64::from(*inverse_routing),
+                                ]);
+                                packet.error_context = u32::try_from(position)
+                                    .map_err(|_| "execute: device expert context overflow")?;
+                                packet.elements = (*rows * *columns) as u64;
+                                self.launch("et_expert_device_metadata59", &packet)?;
+                                self.launch("et_expert_device_sanitize59", &packet)?;
                             }
                             if cancelled.is_cancelled() {
                                 return Err("operation aborted".into());
                             }
-                            args.inputs[0] = projected.address();
-                            args.inputs[1] = row_map.address();
-                            args.output = output.storage_address();
-                            args.elements = (*rows * *columns) as u64;
-                            args.integers[0] = *columns as u64;
-                            let profile_start = profile_event()?;
-                            self.launch("et_grouped_scatter", &args)?;
-                            let profile_end = profile_event()?;
-                            if let (Some(start), Some(end)) = (profile_start, profile_end) {
-                                grouped_profile.push((
-                                    if *reuse_routing {
-                                        "second_scatter"
+                            if *columns != 0 && *inner == 0 {
+                                args.output = output.storage_address();
+                                args.output_dtype = dtype_code(meta.dtype);
+                                args.elements = (*rows * *columns) as u64;
+                                self.launch("et_fill", &args)?;
+                            } else if *columns != 0 {
+                                if !*reuse_routing {
+                                    let profile_start = profile_event()?;
+                                    args.elements = *rows as u64;
+                                    args.inputs[1] = control.address();
+                                    args.output = row_map.address();
+                                    args.integers[3] = u64::from(grouped_rows_block);
+                                    if *inverse_routing {
+                                        let offset = rows
+                                            .checked_mul(4)
+                                            .ok_or("execute: inverse map offset overflow")?;
+                                        let capacity = offset
+                                            .checked_mul(2)
+                                            .ok_or("execute: inverse map capacity overflow")?;
+                                        if row_map.len() < capacity {
+                                            return Err(
+                                                "execute: inverse map capacity missing".into()
+                                            );
+                                        }
+                                        args.scratch[0] = row_map
+                                            .address()
+                                            .checked_add(offset as u64)
+                                            .ok_or("execute: inverse map address overflow")?;
+                                        self.launch("et_grouped_rows_inverse", &args)?;
+                                        args.scratch[0] = 0;
                                     } else {
-                                        "first_scatter"
-                                    },
-                                    start,
-                                    end,
-                                ));
+                                        self.launch("et_grouped_rows", &args)?;
+                                    }
+                                    let profile_end = profile_event()?;
+                                    if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                        grouped_profile.push(("row_map", start, end));
+                                    }
+                                }
+                                let profile_start = profile_event()?;
+                                args.inputs[0] = address(x)?;
+                                args.inputs[1] = row_map.address();
+                                args.output = gathered_address;
+                                args.output_dtype = dtype_code(meta.dtype);
+                                args.elements = (*rows * *inner) as u64;
+                                args.integers[0] = *inner as u64;
+                                args.integers[1] = *source_rows as u64;
+                                args.integers[2] = u64::from(grouped_vector_copy);
+                                if !*input_sorted {
+                                    self.launch("et_grouped_gather", &args)?;
+                                }
+                                let profile_end = profile_event()?;
+                                if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                    grouped_profile.push((
+                                        if *reuse_routing {
+                                            "second_gather"
+                                        } else {
+                                            "first_gather"
+                                        },
+                                        start,
+                                        end,
+                                    ));
+                                }
+                                let width = meta.dtype.size_in_bytes();
+                                let weights = address(weight)?;
+                                let workspace = workspace
+                                    .map(|id| self.buffer(&resources, id))
+                                    .transpose()?;
+                                let mut bf16_groups = Vec::new();
+                                for (expert, range) in offsets
+                                    .as_deref()
+                                    .unwrap_or(&[])
+                                    .get(1..)
+                                    .unwrap_or(&[])
+                                    .windows(2)
+                                    .enumerate()
+                                {
+                                    if cancelled.is_cancelled() {
+                                        return Err("operation aborted".into());
+                                    }
+                                    let start = range[0] as usize;
+                                    let count = (range[1] - range[0]) as usize;
+                                    if count == 0 {
+                                        continue;
+                                    }
+                                    let x = gathered_address + (start * *inner * width) as u64;
+                                    let weight =
+                                        weights + (expert * *columns * *inner * width) as u64;
+                                    let out = projected_address + (start * *columns * width) as u64;
+                                    if meta.dtype == DType::BF16 {
+                                        let plan = crate::cublas::Bf16GemmPlan {
+                                            m: count,
+                                            n: *columns,
+                                            k: *inner,
+                                            batch: 1,
+                                            stride_x: count * *inner,
+                                            stride_weight: 0,
+                                            stride_out: count * *columns,
+                                        };
+                                        bf16_groups.push((plan, x, weight, out));
+                                    } else {
+                                        let mut gemm = CudaKernelArgs {
+                                            output: out,
+                                            elements: (count * *columns) as u64,
+                                            ..Default::default()
+                                        };
+                                        gemm.inputs[..2].copy_from_slice(&[x, weight]);
+                                        gemm.integers[..2]
+                                            .copy_from_slice(&[*columns as u64, *inner as u64]);
+                                        self.launch("et_grouped_matmul_f32", &gemm)?;
+                                    }
+                                    #[cfg(test)]
+                                    if let Some(after_gemm) = after_gemm {
+                                        after_gemm();
+                                    }
+                                }
+                                if let Some((metadata, _)) = device_control {
+                                    let events = unsafe {
+                                        self.device.device_expert_gemm(
+                                            self.buffer(&resources, *metadata)?.address(),
+                                            *columns,
+                                            *inner,
+                                        )?
+                                    };
+                                    fence.worker_events.extend(events);
+                                    #[cfg(test)]
+                                    if let Some(after_gemm) = after_gemm {
+                                        after_gemm();
+                                    }
+                                }
+                                if !bf16_groups.is_empty() {
+                                    if grouped_profile_path.is_some() {
+                                        for (plan, ..) in &bf16_groups {
+                                            *grouped_shapes
+                                                .entry((*reuse_routing, plan.m, plan.n, plan.k))
+                                                .or_default() += 1;
+                                        }
+                                    }
+                                    // SAFETY: every group uses checked geometry and
+                                    // invocation-planned allocations retained by the fence.
+                                    unsafe {
+                                        let profile_start = profile_event()?;
+                                        let submission_started = grouped_profile_path
+                                            .as_ref()
+                                            .map(|_| std::time::Instant::now());
+                                        let events = self.device.grouped_gemm_bf16(
+                                            &bf16_groups,
+                                            workspace
+                                                .as_ref()
+                                                .ok_or("grouped GEMM workspace missing")?
+                                                .address(),
+                                            *splitk_workspace,
+                                            workspace
+                                                .as_ref()
+                                                .ok_or("grouped GEMM workspace missing")?
+                                                .len(),
+                                        )?;
+                                        if let Some(started) = submission_started {
+                                            let total = grouped_submission_ms
+                                                .entry(*reuse_routing)
+                                                .or_default();
+                                            total.0 += 1;
+                                            total.1 += started.elapsed().as_secs_f64() * 1000.0;
+                                        }
+                                        let profile_end = profile_event()?;
+                                        if let (Some(start), Some(end)) =
+                                            (profile_start, profile_end)
+                                        {
+                                            grouped_profile.push((
+                                                if *reuse_routing {
+                                                    "second_projection"
+                                                } else {
+                                                    "first_projection"
+                                                },
+                                                start,
+                                                end,
+                                            ));
+                                            if !*reuse_routing {
+                                                grouped_activation_start = profile_event()?;
+                                            }
+                                        }
+                                        fence.worker_events.extend(events);
+                                    }
+                                }
+                                if cancelled.is_cancelled() {
+                                    return Err("operation aborted".into());
+                                }
+                                args.inputs[0] = projected_address;
+                                args.inputs[1] = row_map.address();
+                                args.output = output.storage_address();
+                                args.elements = (*rows * *columns) as u64;
+                                args.integers[0] = *columns as u64;
+                                let profile_start = profile_event()?;
+                                if !*output_sorted {
+                                    self.launch("et_grouped_scatter", &args)?;
+                                }
+                                let profile_end = profile_event()?;
+                                if let (Some(start), Some(end)) = (profile_start, profile_end) {
+                                    grouped_profile.push((
+                                        if *reuse_routing {
+                                            "second_scatter"
+                                        } else {
+                                            "first_scatter"
+                                        },
+                                        start,
+                                        end,
+                                    ));
+                                }
                             }
                         }
+                        output
                     }
-                    output
-                }
-                CommandKind::LinearBias {
-                    accumulator,
-                    bias,
-                    args,
-                } => {
-                    let output = self.planned_value(&resources, output_id)?;
-                    let mut args = *args;
-                    args.inputs[0] = values[accumulator.index()]
-                        .as_ref()
-                        .ok_or("execute: linear accumulator is unavailable")?
-                        .storage_address();
-                    args.inputs[1] = values[bias.index()]
-                        .as_ref()
-                        .ok_or("execute: linear bias is unavailable")?
-                        .storage_address();
-                    args.output = output.storage_address();
-                    // This kernel cannot report a numerical error. Stream order
-                    // makes the GEMM accumulator visible without status transfers
-                    // or a host wait; the invocation fence handles launch errors.
-                    self.launch(BF16_LINEAR_BIAS_KERNEL, &args)?;
-                    output
-                }
-                CommandKind::FusedElementwise {
-                    function,
-                    args,
-                    inputs,
-                } => {
-                    let output = self.planned_value(&resources, output_id)?;
-                    let mut args = *args;
-                    args.output = output.storage_address();
-                    for (slot, input) in inputs.iter().enumerate() {
-                        if let Some(input) = input {
-                            args.inputs[slot] = values[input.index()]
+                    CommandKind::LinearBias {
+                        accumulator,
+                        bias,
+                        args,
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let mut args = *args;
+                        args.inputs[0] = values[accumulator.index()]
+                            .as_ref()
+                            .ok_or("execute: linear accumulator is unavailable")?
+                            .storage_address();
+                        args.inputs[1] = values[bias.index()]
+                            .as_ref()
+                            .ok_or("execute: linear bias is unavailable")?
+                            .storage_address();
+                        args.output = output.storage_address();
+                        // This kernel cannot report a numerical error. Stream order
+                        // makes the GEMM accumulator visible without status transfers
+                        // or a host wait; the invocation fence handles launch errors.
+                        self.launch(BF16_LINEAR_BIAS_KERNEL, &args)?;
+                        output
+                    }
+                    CommandKind::FusedElementwise {
+                        function,
+                        args,
+                        inputs,
+                        wide_sum,
+                        wide_arg,
+                        ..
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let mut args = *args;
+                        args.output = output.storage_address();
+                        for (slot, input) in inputs.iter().enumerate() {
+                            if let Some(input) = input {
+                                args.inputs[slot] = values[input.index()]
+                                    .as_ref()
+                                    .ok_or("execute: fused CUDA input unavailable")?
+                                    .storage_address();
+                            }
+                        }
+                        if args.elements != 0 {
+                            let mut launch = stream.launch_builder(function);
+                            launch.arg(&args);
+                            unsafe {
+                                launch.launch(LaunchConfig {
+                                    grid_dim: (
+                                        if *wide_sum || *wide_arg {
+                                            args.elements.min(65535)
+                                        } else {
+                                            args.elements.div_ceil(256).min(65535)
+                                        } as u32,
+                                        1,
+                                        1,
+                                    ),
+                                    block_dim: (
+                                        if *wide_sum || *wide_arg { 1024 } else { 256 },
+                                        1,
+                                        1,
+                                    ),
+                                    shared_mem_bytes: 0,
+                                })
+                            }
+                            .map_err(|error| error.to_string())?;
+                        }
+                        output
+                    }
+                    CommandKind::Kernel {
+                        name,
+                        args,
+                        inputs,
+                        scratch,
+                        status,
+                        checked,
+                        state: access,
+                        state_buffers,
+                        kv_matmul,
+                        ..
+                    } => {
+                        let output = self.planned_value(&resources, output_id)?;
+                        let mut args = *args;
+                        args.output = output.storage_address();
+                        args.metadata = self.metadata[position]
+                            .as_ref()
+                            .ok_or("execute: kernel metadata missing")?
+                            .address();
+                        for (role, id) in inputs.iter().enumerate() {
+                            if let Some(id) = id {
+                                args.inputs[role] = values[id.index()]
+                                    .as_ref()
+                                    .ok_or("execute: input unavailable")?
+                                    .storage_address();
+                            }
+                        }
+                        let scratch_buffers = scratch
+                            .iter()
+                            .map(|id| id.map(|id| self.buffer(&resources, id)).transpose())
+                            .collect::<Result<Vec<_>, _>>()?;
+                        for (slot, buffer) in scratch_buffers.iter().enumerate() {
+                            if let Some(buffer) = buffer {
+                                args.scratch[slot] = buffer.address();
+                            }
+                        }
+                        if *checked {
+                            let status =
+                                status.ok_or("execute: checked CUDA kernel has no status")?;
+                            if deferred_status.is_some_and(|current| current != status) {
+                                return Err(
+                                    "execute: checked CUDA kernels do not share status".into()
+                                );
+                            }
+                            let mut buffer = self.buffer(&resources, status)?.cast::<u64>(1)?;
+                            if deferred_status.is_none() {
+                                self.device
+                                    .stream
+                                    .memcpy_htod(&[0u64], &mut buffer)
+                                    .map_err(|e| e.to_string())?;
+                                deferred_status = Some(status);
+                            }
+                            args.scratch[3] = buffer.address();
+                            args.error_context = u32::try_from(position)
+                                .map_err(|_| "execute: CUDA error context exceeds u32")?;
+                        }
+                        if name.starts_with("et_random_") {
+                            args.integers[0] = args.integers[0]
+                                .wrapping_add(random_seed)
+                                .wrapping_add(run.wrapping_mul(0x9e3779b97f4a7c15));
+                        }
+                        let transaction_buffers = state_buffers
+                            .iter()
+                            .map(|id| id.map(|id| self.buffer(&resources, id)).transpose())
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let mut kv_ranges = Vec::new();
+                        if let Some(prepared) = whole_state
+                            .as_ref()
+                            .and_then(|commands| commands.get(&position))
+                            .filter(|_| whole_active)
+                        {
+                            let storage = whole_runtime
                                 .as_ref()
-                                .ok_or("execute: fused CUDA input unavailable")?
-                                .storage_address();
+                                .and_then(|r| r.frame.as_ref())
+                                .and_then(|f| f.storage.as_ref())
+                                .ok_or("whole-read71 storage missing")?;
+                            for (offset, target) in &prepared.refills {
+                                whole_read71::copy(
+                                    &self.device.stream,
+                                    storage.slab.address() + *offset as u64,
+                                    target.address(),
+                                    target.len(),
+                                )?;
+                            }
+                            if matches!(access, StateAccess::Kv { .. }) {
+                                for role in [3, 4, 7] {
+                                    args.inputs[role] = prepared.args.inputs[role];
+                                }
+                                for role in [1, 2, 5] {
+                                    args.integers[role] = prepared.args.integers[role];
+                                }
+                            }
+                            kv_ranges.clone_from(&prepared.ranges);
+                        } else {
+                            self.prepare_kernel_state(
+                                access,
+                                &mut args,
+                                &scratch_buffers,
+                                &transaction_buffers,
+                                state.as_deref_mut(),
+                                &mut kv_ranges,
+                                None,
+                            )?;
                         }
+                        if let Some(plan) = kv_matmul {
+                            if traced {
+                                emit_trace(serde_json::json!({
+                                    "event":"kv_gemm_geometry", "instruction":position, "capturable":false,
+                                    "lanes":kv_ranges.iter().map(|&(lane,p,q)|serde_json::json!({"lane":lane,"p":p,"q":q})).collect::<Vec<_>>(),
+                                    "workspaceBytes":plan.bytes, "kernelAndGemmSubmissions":2+5*kv_ranges.len(),
+                                }))?;
+                            }
+                            let blas = if whole_active {
+                                &whole_runtime
+                                    .as_ref()
+                                    .and_then(|r| r.frame.as_ref())
+                                    .and_then(|f| f.storage.as_ref())
+                                    .ok_or("whole-read71 storage missing")?
+                                    .primary_blas
+                            } else {
+                                &self.device.cublas
+                            };
+                            crate::kv_matmul::execute_with_blas(
+                                blas,
+                                &args,
+                                *plan,
+                                &kv_ranges,
+                                |name, args| self.launch(name, args),
+                            )?;
+                        } else {
+                            self.launch_on(stream, name, &args)?;
+                        }
+                        #[cfg(test)]
+                        if *name == "et_ffn_next_norm63_bf16" {
+                            if let Some(hook) = after_ffn63 {
+                                hook();
+                            }
+                        }
+                        #[cfg(test)]
+                        if matches!(access, StateAccess::Kv { .. }) {
+                            if let Some(hook) = after_kv {
+                                hook();
+                            }
+                        }
+                        self.commit_kernel_state(access, &scratch_buffers, state.as_deref_mut())?;
+                        output
                     }
-                    if args.elements != 0 {
-                        let mut launch = self.device.stream.launch_builder(function);
-                        launch.arg(&args);
-                        unsafe {
-                            launch.launch(LaunchConfig {
-                                grid_dim: (args.elements.div_ceil(256).min(65535) as u32, 1, 1),
-                                block_dim: (256, 1, 1),
-                                shared_mem_bytes: 0,
-                            })
-                        }
+                };
+                if let Some(started) = started {
+                    self.device
+                        .stream
+                        .synchronize()
                         .map_err(|error| error.to_string())?;
-                    }
-                    output
+                    emit_trace(serde_json::json!({
+                        "event": "end", "program": format!("{self:p}"), "run": run, "instruction": position,
+                        "diagnostic": true, "streamSynchronized": true,
+                        "milliseconds": started.elapsed().as_secs_f64() * 1000.0
+                    }))?;
                 }
-                CommandKind::Kernel {
-                    name,
-                    args,
-                    inputs,
-                    scratch,
-                    status,
-                    checked,
-                    state: access,
-                    state_buffers,
-                    kv_matmul,
+                values[output_id.index()] = Some(output);
+                if let CommandOverlap::Worker {
+                    branch,
+                    finish: true,
                     ..
-                } => {
-                    let output = self.planned_value(&resources, output_id)?;
-                    let mut args = *args;
-                    args.output = output.storage_address();
-                    args.metadata = self.metadata[position]
-                        .as_ref()
-                        .ok_or("execute: kernel metadata missing")?
-                        .address();
-                    for (role, id) in inputs.iter().enumerate() {
-                        if let Some(id) = id {
-                            args.inputs[role] = values[id.index()]
-                                .as_ref()
-                                .ok_or("execute: input unavailable")?
-                                .storage_address();
-                        }
+                } = overlap
+                {
+                    let event = stream
+                        .record_event(None)
+                        .map_err(|error| error.to_string())?;
+                    if dense_completed.insert(branch, event).is_some() {
+                        return Err("execute: dense overlap completion repeated".into());
                     }
-                    let scratch_buffers = scratch
-                        .iter()
-                        .map(|id| id.map(|id| self.buffer(&resources, id)).transpose())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    for (slot, buffer) in scratch_buffers.iter().enumerate() {
-                        if let Some(buffer) = buffer {
-                            args.scratch[slot] = buffer.address();
-                        }
-                    }
-                    if *checked {
-                        let status = status.ok_or("execute: checked CUDA kernel has no status")?;
-                        if deferred_status.is_some_and(|current| current != status) {
-                            return Err("execute: checked CUDA kernels do not share status".into());
-                        }
-                        let mut buffer = self.buffer(&resources, status)?.cast::<u64>(1)?;
-                        if deferred_status.is_none() {
-                            self.device
-                                .stream
-                                .memcpy_htod(&[0u64], &mut buffer)
-                                .map_err(|e| e.to_string())?;
-                            deferred_status = Some(status);
-                        }
-                        args.scratch[3] = buffer.address();
-                        args.error_context = u32::try_from(position)
-                            .map_err(|_| "execute: CUDA error context exceeds u32")?;
-                    }
-                    if name.starts_with("et_random_") {
-                        args.integers[0] = args.integers[0]
-                            .wrapping_add(self.random_seed.unwrap_or(0))
-                            .wrapping_add(run.wrapping_mul(0x9e3779b97f4a7c15));
-                    }
-                    let transaction_buffers = state_buffers
-                        .iter()
-                        .map(|id| id.map(|id| self.buffer(&resources, id)).transpose())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let mut kv_ranges = Vec::new();
-                    self.prepare_kernel_state(
-                        access,
-                        &mut args,
-                        &scratch_buffers,
-                        &transaction_buffers,
-                        state.as_deref_mut(),
-                        &mut kv_ranges,
-                    )?;
-                    if let Some(plan) = kv_matmul {
-                        if traced {
-                            emit_trace(serde_json::json!({
-                                "event":"kv_gemm_geometry", "instruction":position, "capturable":false,
-                                "lanes":kv_ranges.iter().map(|&(lane,p,q)|serde_json::json!({"lane":lane,"p":p,"q":q})).collect::<Vec<_>>(),
-                                "workspaceBytes":plan.bytes, "kernelAndGemmSubmissions":2+5*kv_ranges.len(),
-                            }))?;
-                        }
-                        crate::kv_matmul::execute(
-                            &self.device,
-                            &args,
-                            *plan,
-                            &kv_ranges,
-                            |name, args| self.launch(name, args),
-                        )?;
-                    } else {
-                        self.launch(name, &args)?;
-                    }
-                    #[cfg(test)]
-                    if matches!(access, StateAccess::Kv { .. }) {
-                        if let Some(hook) = after_kv {
-                            hook();
-                        }
-                    }
-                    self.commit_kernel_state(access, &scratch_buffers, state.as_deref_mut())?;
-                    output
                 }
-            };
-            if let Some(started) = started {
-                self.device
-                    .stream
-                    .synchronize()
-                    .map_err(|error| error.to_string())?;
-                emit_trace(serde_json::json!({
-                    "event": "end", "program": format!("{self:p}"), "run": run, "instruction": position,
-                    "diagnostic": true, "streamSynchronized": true,
-                    "milliseconds": started.elapsed().as_secs_f64() * 1000.0
-                }))?;
-            }
-            values[output_id.index()] = Some(output);
-            position += 1;
-            if capture.as_ref().is_some_and(|(_, end)| *end == position) {
-                let (key, _) = capture.take().unwrap();
-                let graph = self
+                position += 1;
+                if whole_active && whole_plan.as_ref().is_some_and(|plan| plan.end == position) {
+                    if !dense_completed.is_empty() || active_dense_branches != 0 {
+                        return Err("whole-read71 open worker at body exit".into());
+                    }
+                    let frame = whole_runtime
+                        .as_mut()
+                        .and_then(|r| r.frame.as_mut())
+                        .ok_or("whole-read71 frame missing")?;
+                    if whole_capturing {
+                        // End-capture is attempted exactly once, including on failure.
+                        whole_capturing = false;
+                        frame.graph = Some(whole_read71::Graph::finish(
+                            &self.device.stream,
+                            &mut frame.quarantined,
+                        )?);
+                        frame.graph.as_ref().unwrap().launch(&self.device.stream)?;
+                        #[cfg(test)]
+                        whole_read71::after_launch(cancelled);
+                        whole_read71::trace(
+                            "capture",
+                            whole_plan.as_deref(),
+                            self.state_layout
+                                .as_ref()
+                                .map_or(0, |layout| layout.kv_layers.len()),
+                        )?;
+                    }
+                    frame.warmed = true;
+                    let plan = whole_plan.as_ref().unwrap();
+                    self.leave_body71(
+                        plan,
+                        frame,
+                        &ordinary_resources,
+                        &mut values,
+                        std::mem::take(&mut whole_saved),
+                    )?;
+                    whole_status_private = false;
+                    whole_active = false;
+                }
+                if capture.as_ref().is_some_and(|(_, end)| *end == position) {
+                    let (key, _) = capture.take().unwrap();
+                    let graph = self
                     .device
                     .stream
                     .end_capture(
@@ -3229,121 +4951,290 @@ impl CudaExecutable {
                     )
                     .map_err(|error| format!("CUDA graph instantiation failed: {error}"))?
                     .ok_or("CUDA graph capture produced no graph")?;
-                capture_fence.active = false;
-                graph.launch().map_err(|error| error.to_string())?;
-                if graph_trace {
-                    self.device.stream.synchronize().map_err(|error| {
-                        format!(
-                            "CUDA captured graph {}..{} failed: {error}",
-                            key.start, key.end
-                        )
-                    })?;
+                    capture_fence.active = false;
+                    graph.launch().map_err(|error| error.to_string())?;
+                    if graph_trace {
+                        self.device.stream.synchronize().map_err(|error| {
+                            format!(
+                                "CUDA captured graph {}..{} failed: {error}",
+                                key.start, key.end
+                            )
+                        })?;
+                    }
+                    if let Some(stats) = graph_diagnostics.as_mut() {
+                        stats.record_capture(key.end - key.start);
+                    }
+                    graph_runtime
+                        .as_mut()
+                        .ok_or("execute: CUDA graph cache unavailable")?
+                        .cache
+                        .insert(key, CapturedGraph(graph));
+                    if let Some(stats) = graph_diagnostics.as_mut() {
+                        stats.cache_end = graph_runtime
+                            .as_ref()
+                            .map(|r| r.cache.len())
+                            .unwrap_or_default();
+                    }
+                    graph_runtime
+                        .as_mut()
+                        .ok_or("execute: CUDA graph cache unavailable")?
+                        .captures += 1;
                 }
-                graph_runtime
-                    .as_mut()
-                    .ok_or("execute: CUDA graph cache unavailable")?
-                    .cache
-                    .insert(key, CapturedGraph(graph));
-                graph_runtime
-                    .as_mut()
-                    .ok_or("execute: CUDA graph cache unavailable")?
-                    .captures += 1;
             }
-        }
-        let failure = if let Some(status) = deferred_status {
-            let status = self.buffer(&resources, status)?.cast::<u64>(1)?;
-            self.device
-                .stream
-                .clone_dtoh(&status)
-                .map_err(|e| e.to_string())?[0]
-        } else {
-            self.device
-                .stream
-                .synchronize()
-                .map_err(|e| e.to_string())?;
-            0
-        };
-        fence.complete = true;
-        self.status_result(failure)?;
-        if cancelled.is_cancelled() {
-            return Err("operation aborted".into());
-        }
-        if let Some(path) = grouped_profile_path {
-            let mut phases = BTreeMap::<&str, (usize, f64)>::new();
-            for (phase, start, end) in grouped_profile {
-                let elapsed = start.elapsed_ms(&end).map_err(|error| error.to_string())? as f64;
-                let total = phases.entry(phase).or_default();
-                total.0 += 1;
-                total.1 += elapsed;
+            if !dense_completed.is_empty() || active_dense_branches != 0 {
+                return Err("execute: dense overlap branch has no join".into());
             }
-            let mut gemms =
-                BTreeMap::<(usize, usize, usize, usize, bool, bool), (usize, f64)>::new();
-            for (m, n, k, batch, weight_transposed, out_f32, start, end) in gemm_profile {
-                let elapsed = start.elapsed_ms(&end).map_err(|error| error.to_string())? as f64;
-                let total = gemms
-                    .entry((m, n, k, batch, weight_transposed, out_f32))
-                    .or_default();
-                total.0 += 1;
-                total.1 += elapsed;
+            let failure = if let Some(status) = deferred_status {
+                let status = self.buffer(&resources, status)?.cast::<u64>(1)?;
+                self.device
+                    .stream
+                    .clone_dtoh(&status)
+                    .map_err(|e| e.to_string())?[0]
+            } else {
+                self.device
+                    .stream
+                    .synchronize()
+                    .map_err(|e| e.to_string())?;
+                0
+            };
+            fence.complete = true;
+            self.status_result(failure)?;
+            if cancelled.is_cancelled() {
+                return Err("operation aborted".into());
             }
-            let record = serde_json::json!({
-                "program": format!("{self:p}"),
-                "run": run,
-                "phases": phases.into_iter().map(|(phase, (count, milliseconds))| {
-                    serde_json::json!({
-                        "phase": phase,
-                        "count": count,
-                        "milliseconds": milliseconds
-                    })
-                }).collect::<Vec<_>>(),
-                "gemms": gemms.into_iter().map(|
-                    ((m, n, k, batch, weight_transposed, out_f32), (count, milliseconds))
-                | {
-                    serde_json::json!({
-                        "m": m,
-                        "n": n,
-                        "k": k,
-                        "batch": batch,
-                        "weightTransposed": weight_transposed,
-                        "outF32": out_f32,
-                        "count": count,
-                        "milliseconds": milliseconds
-                    })
-                }).collect::<Vec<_>>(),
-                "controlReadbackAndWait": {
-                    "count": grouped_control_wait_ms.len(),
-                    "milliseconds": grouped_control_wait_ms.iter().sum::<f64>()
+            if let Some(path) = &grouped_profile_path {
+                let mut phases = BTreeMap::<&str, (usize, f64)>::new();
+                for (phase, start, end) in grouped_profile {
+                    let elapsed = start.elapsed_ms(&end).map_err(|error| error.to_string())? as f64;
+                    let total = phases.entry(phase).or_default();
+                    total.0 += 1;
+                    total.1 += elapsed;
                 }
-            });
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|error| format!("execute: CUDA grouped profile file: {error}"))?;
-            std::io::Write::write_all(&mut file, format!("{record}\n").as_bytes())
-                .map_err(|error| format!("execute: CUDA grouped profile write: {error}"))?;
-        }
-        if graph_trace {
-            if let Some(runtime) = graph_runtime.as_ref() {
+                let mut gemms =
+                    BTreeMap::<(usize, usize, usize, usize, bool, bool), (usize, f64)>::new();
+                for (m, n, k, batch, weight_transposed, out_f32, start, end) in gemm_profile {
+                    let elapsed = start.elapsed_ms(&end).map_err(|error| error.to_string())? as f64;
+                    let total = gemms
+                        .entry((m, n, k, batch, weight_transposed, out_f32))
+                        .or_default();
+                    total.0 += 1;
+                    total.1 += elapsed;
+                }
+                let record = serde_json::json!({
+                    "program": format!("{self:p}"),
+                    "run": run,
+                    "phases": phases.into_iter().map(|(phase, (count, milliseconds))| {
+                        serde_json::json!({
+                            "phase": phase,
+                            "count": count,
+                            "milliseconds": milliseconds
+                        })
+                    }).collect::<Vec<_>>(),
+                    "gemms": gemms.into_iter().map(|
+                        ((m, n, k, batch, weight_transposed, out_f32), (count, milliseconds))
+                    | {
+                        serde_json::json!({
+                            "m": m,
+                            "n": n,
+                            "k": k,
+                            "batch": batch,
+                            "weightTransposed": weight_transposed,
+                            "outF32": out_f32,
+                            "count": count,
+                            "milliseconds": milliseconds
+                        })
+                    }).collect::<Vec<_>>(),
+                    "controlReadbackAndWait": {
+                        "count": grouped_control_wait_ms.len(),
+                        "milliseconds": grouped_control_wait_ms.iter().sum::<f64>()
+                    },
+                    "groupedShapes": grouped_shapes.into_iter().map(|
+                        ((second, m, n, k), count)
+                    | serde_json::json!({
+                        "secondProjection": second, "m": m, "n": n, "k": k, "count": count
+                    })).collect::<Vec<_>>(),
+                    // Host submission can overlap GPU execution. Neither this nor
+                    // controlReadbackAndWait is an additive request cost.
+                    "groupedHostSubmission": grouped_submission_ms.into_iter().map(|
+                        (second, (count, milliseconds))
+                    | serde_json::json!({
+                        "secondProjection": second, "count": count, "milliseconds": milliseconds
+                    })).collect::<Vec<_>>()
+                });
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| format!("execute: CUDA grouped profile file: {error}"))?;
+                std::io::Write::write_all(&mut file, format!("{record}\n").as_bytes())
+                    .map_err(|error| format!("execute: CUDA grouped profile write: {error}"))?;
+            }
+            if graph_trace {
+                if let Some(runtime) = graph_runtime.as_ref() {
+                    eprintln!(
+                        "CUDA graph run={run} cache={} hits={} captures={}",
+                        runtime.cache.len(),
+                        runtime.hits,
+                        runtime.captures
+                    );
+                }
+            }
+            let outputs = self
+                .program
+                .outputs
+                .iter()
+                .map(|id| {
+                    values[id.index()]
+                        .clone()
+                        .ok_or_else(|| "execute: CUDA output unavailable".into())
+                })
+                .collect::<Result<Vec<_>, String>>();
+            if let Some(stats) = graph_diagnostics.as_mut() {
+                stats.emit(outputs.is_ok())?;
+            }
+            outputs
+        })();
+        if result.is_err() && whole_submitted {
+            let drained = (|| -> Result<(), String> {
+                if whole_runtime
+                    .as_ref()
+                    .and_then(|r| r.frame.as_ref())
+                    .is_some_and(|frame| frame.quarantined)
+                {
+                    return Err("whole-read71 graph teardown could not be confirmed".into());
+                }
+                if whole_capturing {
+                    // Discard a cancelled/failed capture without instantiation.
+                    let mut graph = std::ptr::null_mut();
+                    let ended = unsafe {
+                        sys::cuStreamEndCapture(self.device.stream.cu_stream(), &mut graph)
+                    }
+                    .result();
+                    if !graph.is_null() {
+                        unsafe { sys::cuGraphDestroy(graph) }
+                            .result()
+                            .map_err(|e| e.to_string())?;
+                    }
+                    ended.map_err(|e| e.to_string())?;
+                }
+                // Covers primary, dense and both device59 worker streams even
+                // when submission failed before a worker's normal join event.
+                self.device
+                    .stream
+                    .context()
+                    .synchronize()
+                    .map_err(|e| e.to_string())?;
+                if whole_status_private {
+                    if let (Some(plan), Some(storage)) = (
+                        whole_plan.as_ref(),
+                        whole_runtime
+                            .as_ref()
+                            .and_then(|r| r.frame.as_ref())
+                            .and_then(|f| f.storage.as_ref()),
+                    ) {
+                        let source = self.buffer(&storage.resources, plan.status)?;
+                        let target = self.buffer(&ordinary_resources, plan.status)?;
+                        whole_read71::copy(
+                            &self.device.stream,
+                            source.address(),
+                            target.address(),
+                            source.len(),
+                        )?;
+                        self.device
+                            .stream
+                            .synchronize()
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = drained {
                 eprintln!(
-                    "CUDA graph run={run} cache={} hits={} captures={}",
-                    runtime.cache.len(),
-                    runtime.hits,
-                    runtime.captures
+                    "whole-read71 drain failed: {error}; quarantining invocation and replay storage"
                 );
+                if let Some(frame) = whole_runtime.as_mut().and_then(|r| r.frame.take()) {
+                    std::mem::forget(frame);
+                }
+                std::mem::forget(bindings.to_vec());
+                if let Some(state) = state.as_ref() {
+                    std::mem::forget(state.cache.clone());
+                }
+                std::mem::forget(whole_payload);
+                std::mem::forget(ordinary_resources);
+                return result;
+            }
+            fence.complete = true;
+            // Failed calls cannot warm or retain a replay graph.
+            if let Some(runtime) = whole_runtime.as_mut() {
+                runtime.frame.take();
             }
         }
-        self.program
-            .outputs
-            .iter()
-            .map(|id| {
-                values[id.index()]
-                    .clone()
-                    .ok_or_else(|| "execute: CUDA output unavailable".into())
-            })
-            .collect()
+        if result.is_err() && last_skipped_validation.is_some() {
+            // Keep leases and the invocation fence alive through this drain.
+            // A failed drain/read must never replace the original host error.
+            let failure = (|| -> Result<u64, String> {
+                if let Some(dense) = &fence.dense_stream {
+                    dense.synchronize().map_err(|e| e.to_string())?;
+                }
+                self.device
+                    .stream
+                    .synchronize()
+                    .map_err(|e| e.to_string())?;
+                #[cfg(test)]
+                if crate::expert_device::fail_status_read() {
+                    return Err("injected device expert status read failure".into());
+                }
+                let status = deferred_status.ok_or("execute: missing device expert status")?;
+                let status = self.buffer(&resources, status)?.cast::<u64>(1)?;
+                Ok(self
+                    .device
+                    .stream
+                    .clone_dtoh(&status)
+                    .map_err(|e| e.to_string())?[0])
+            })();
+            if let Ok(failure) = failure {
+                if crate::expert_device::earlier_status(failure, last_skipped_validation) {
+                    if let Err(error) = self.status_result(failure) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        result
     }
     fn launch(&self, name: &str, args: &CudaKernelArgs) -> Result<(), String> {
+        self.launch_on(&self.device.stream, name, args)
+    }
+    fn launch_on(
+        &self,
+        stream: &Arc<CudaStream>,
+        name: &str,
+        args: &CudaKernelArgs,
+    ) -> Result<(), String> {
+        if matches!(
+            name,
+            "et_expert_device_metadata59" | "et_expert_device_sanitize59"
+        ) {
+            let mut launch = stream.launch_builder(self.device.kernel(name)?);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (
+                        if name == "et_expert_device_metadata59" {
+                            1
+                        } else {
+                            32
+                        },
+                        1,
+                        1,
+                    ),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         if name == "et_expert_linear_rows" {
             // One warp per output, or one per route when O=0. Bounded launch
             // dimensions; the kernel loops over remaining work with u64 offsets.
@@ -3354,7 +5245,7 @@ impl CudaExecutable {
                 return Ok(());
             }
             let function = self.device.kernel(name)?;
-            let mut launch = self.device.stream.launch_builder(function);
+            let mut launch = stream.launch_builder(function);
             launch.arg(args);
             unsafe {
                 launch.launch(LaunchConfig {
@@ -3383,7 +5274,7 @@ impl CudaExecutable {
                 .checked_mul(inner.div_ceil(256))
                 .ok_or("scatterAdd: compact launch overflow")?;
             let function = self.device.kernel(name)?;
-            let mut launch = self.device.stream.launch_builder(function);
+            let mut launch = stream.launch_builder(function);
             launch.arg(args);
             unsafe {
                 launch.launch(LaunchConfig {
@@ -3400,10 +5291,151 @@ impl CudaExecutable {
             .map_err(|e| e.to_string())?;
             return Ok(());
         }
-        if name == "et_rms_norm_f32" && args.integers[0] >= 1024 {
-            let rows = args.elements / args.integers[0];
-            let function = self.device.kernel("et_rms_norm_wide_f32")?;
-            let mut launch = self.device.stream.launch_builder(function);
+        if name == crate::sampler83::KERNEL {
+            let rows = args.integers[2];
+            let width = args.integers[1];
+            if !(1..=65535).contains(&rows)
+                || !(4096..=i32::MAX as u64).contains(&width)
+                || rows
+                    .checked_mul(width)
+                    .is_none_or(|n| n > u32::MAX as u64 || n != args.elements)
+                || args.integers[3] > 1
+                || args.compute_dtype != 1
+                || args.output_dtype != 3
+                || args.input_dtypes[..2] != [1, 1]
+            {
+                return Err("sampler83: invalid geometry or dtype descriptor".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == crate::rng_arg80::KERNEL {
+            let rows = u32::try_from(args.integers[2]).map_err(|_| "RNG80: rows exceed u32")?;
+            if rows == 0
+                || rows > 65535
+                || args.elements != u64::from(rows) * 2
+                || !(4096..=u32::MAX as u64).contains(&args.integers[1])
+                || u64::from(rows)
+                    .checked_mul(args.integers[1])
+                    .is_none_or(|n| n > u32::MAX as u64)
+            {
+                return Err("RNG80: invalid geometry".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_dual_argmax" {
+            let rows =
+                u32::try_from(args.integers[0]).map_err(|_| "dual argmax: rows exceed u32")?;
+            if rows == 0
+                || rows > 65535
+                || args.elements != u64::from(rows) * 2
+                || !(4096..=u32::MAX as u64).contains(&args.integers[1])
+            {
+                return Err("dual argmax: invalid geometry".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_router_tail" {
+            let rows =
+                u32::try_from(args.integers[0]).map_err(|_| "router tail: rows exceed u32")?;
+            if rows == 0 || rows > 65535 || args.elements != u64::from(rows) * 16 {
+                return Err("router tail: invalid packed output geometry".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_small_softmax_f32" {
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: ((args.elements / 128).div_ceil(4).min(65535) as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == crate::entropy81::KERNEL {
+            let config = crate::entropy81::geometry(args.integers[1], args.integers[0])?;
+            if args.compute_dtype != 1
+                || args.output_dtype != 1
+                || args.input_dtypes[..2] != [1, 1]
+                || args.elements != args.integers[1]
+                || args.inputs[0] == 0
+                || args.inputs[1] == 0
+                || args.output == 0
+            {
+                return Err("entropy81: invalid dense F32 input/output descriptor".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe { launch.launch(config) }.map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_bf16_softmax_prepare" || name.starts_with("et_entropy_") {
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (args.integers[1].min(65535) as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_shared_rms_norm_f32" {
+            let rows = args.integers[1] / args.integers[0];
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
             launch.arg(args);
             unsafe {
                 launch.launch(LaunchConfig {
@@ -3415,19 +5447,180 @@ impl CudaExecutable {
             .map_err(|e| e.to_string())?;
             return Ok(());
         }
+        if name == "et_rms_norm_f32" && args.integers[0] >= 1024 {
+            let rows = args.elements / args.integers[0];
+            let specialized = rms_static2816_kernel(args);
+            let function = self.device.kernel(if let Some(specialized) = specialized {
+                specialized
+            } else if args.operation & 1 != 0 {
+                "et_rms_norm_wide_vector_f32"
+            } else {
+                "et_rms_norm_wide_f32"
+            })?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows.min(65535) as u32, 1, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_expert_route_rank" {
+            let rows = args.integers[0];
+            let routes = args.integers[1];
+            if rows == 0
+                || !(1..=32).contains(&routes)
+                || rows.checked_mul(routes) != Some(args.elements)
+            {
+                return Err("CUDA expert rank geometry invalid".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (
+                        u32::try_from(rows.div_ceil(8))
+                            .map_err(|_| "CUDA expert rank grid overflow")?,
+                        1,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_attention_ffn_entrance_bf16" {
+            let rows = args.integers[0];
+            if !matches!(rows, 64 | 256) || args.elements != rows * 2816 * 4 {
+                return Err("execute: attention FFN entrance violates four-output extent".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        if name == "et_rms_residual_bf16" {
+            let rows = args.elements / 2816;
+            if !matches!(rows, 64 | 256) || args.elements % 2816 != 0 {
+                return Err("execute: RMS residual row geometry violates its compile plan".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        if matches!(name, "et_ffn_tail_bf16" | "et_ffn_next_norm63_bf16") {
+            let rows = if name == "et_ffn_next_norm63_bf16" {
+                args.integers[0]
+            } else {
+                args.elements / 2816
+            };
+            if name == "et_ffn_next_norm63_bf16"
+                && (!matches!(rows, 64 | 256) || args.elements != rows * 2816 * 2)
+            {
+                return Err("execute: FFN next norm packed geometry invalid".into());
+            }
+            if rows == 0 || rows > 65535 || args.elements % 2816 != 0 {
+                return Err("execute: FFN tail row geometry violates its compile plan".into());
+            }
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        if name == "et_grouped_rows_inverse" {
+            if args.integers[0] == 0 || args.elements == 0 {
+                return Ok(());
+            }
+            let block = args.integers[3] == 1;
+            let function = self.device.kernel(if block {
+                "et_grouped_rows_inverse_block"
+            } else {
+                "et_grouped_rows_inverse_warp"
+            })?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (
+                        (if block {
+                            args.integers[0]
+                        } else {
+                            args.integers[0].div_ceil(8)
+                        })
+                        .min(65535) as u32,
+                        1,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if name == "et_grouped_rows" && args.integers[3] == 1 {
+            if args.integers[0] == 0 || args.elements == 0 {
+                return Ok(());
+            }
+            let function = self.device.kernel("et_grouped_rows_block")?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (args.integers[0].min(65535) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
         if matches!(name, "et_grouped_gather" | "et_grouped_scatter") {
             let width = args.integers[0];
             if width == 0 || args.elements % width != 0 {
                 return Err("groupedExpertLinearRows: invalid copy geometry".into());
             }
             let rows = args.elements / width;
+            let (name, threads) = grouped_copy_launch(name, args);
             let function = self.device.kernel(name)?;
-            let mut launch = self.device.stream.launch_builder(function);
+            let mut launch = stream.launch_builder(function);
             launch.arg(args);
             unsafe {
                 launch.launch(LaunchConfig {
                     grid_dim: (rows.min(65535) as u32, 1, 1),
-                    block_dim: (256, 1, 1),
+                    block_dim: (threads, 1, 1),
                     shared_mem_bytes: 0,
                 })
             }
@@ -3444,12 +5637,54 @@ impl CudaExecutable {
             && args.integers[1] >= 4096;
         if wide_arg_index {
             let function = self.device.kernel("et_arg_index_last_wide")?;
-            let mut launch = self.device.stream.launch_builder(function);
+            let mut launch = stream.launch_builder(function);
             launch.arg(args);
             unsafe {
                 launch.launch(LaunchConfig {
                     grid_dim: (args.elements.min(65535) as u32, 1, 1),
                     block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if ordered_scatter_route_map_eligible(name, args)
+            && std::env::var("EFFECT_TORCH_CUDA_ORDERED_SCATTER_ROUTE_MAP")
+                .is_ok_and(|value| value == "1")
+        {
+            let mut args = *args;
+            args.integers[7] = 1;
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(&args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (
+                        u32::try_from(args.elements / 256)
+                            .map_err(|_| "CUDA ordered scatter grid overflow")?,
+                        1,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        let small_max = small_max_eligible(name, args, true)
+            && std::env::var("EFFECT_TORCH_CUDA_SMALL_MAX").is_ok_and(|value| value == "1");
+        if small_max {
+            let mut args = *args;
+            args.integers[7] = 1;
+            let function = self.device.kernel(name)?;
+            let mut launch = stream.launch_builder(function);
+            launch.arg(&args);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (args.elements.div_ceil(8).min(65535) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })
             }
@@ -3466,7 +5701,7 @@ impl CudaExecutable {
                 "et_reduce_last_wide_f32"
             };
             let function = self.device.kernel(kernel)?;
-            let mut launch = self.device.stream.launch_builder(function);
+            let mut launch = stream.launch_builder(function);
             launch.arg(args);
             unsafe {
                 launch.launch(LaunchConfig {
@@ -3482,18 +5717,18 @@ impl CudaExecutable {
             args.elements
                 .checked_mul(32)
                 .ok_or("CUDA Sum grid overflow")?
-        } else if name == "et_rms_norm_f32" {
+        } else if name == "et_rms_norm_f32" || name == "et_norm_rope_bf16" {
             (args.elements / args.integers[0])
                 .checked_mul(32)
                 .ok_or("CUDA RMS grid overflow")?
         } else if name == "et_grouped_rows" {
             args.integers[0] * 32
         } else if name == "et_kv_attention" {
-            self.launch("et_kv_store", args)?;
+            self.launch_on(stream, "et_kv_store", args)?;
             (args.elements / args.integers[10])
                 .checked_mul(32)
                 .ok_or("CUDA KV grid overflow")?
-        } else if name == "et_kv_store" {
+        } else if name == "et_kv_store" || name == "et_vnorm_store56" {
             args.integers[5]
                 .checked_mul(args.integers[2])
                 .and_then(|n| n.checked_mul(args.integers[7]))
@@ -3511,7 +5746,7 @@ impl CudaExecutable {
             u32::try_from(work_items.div_ceil(256)).map_err(|_| "CUDA grid overflow")?
         };
         let function = self.device.kernel(name)?;
-        let mut launch = self.device.stream.launch_builder(function);
+        let mut launch = stream.launch_builder(function);
         launch.arg(args);
         unsafe {
             launch.launch(LaunchConfig {
@@ -3527,8 +5762,8 @@ impl CudaExecutable {
 
 /// Counts backend submissions and required host completion points on the
 /// successful path. Transfers count as commands; cuBLAS internals do not.
-/// Compilation uploads, output readback by callers, and driver-dependent
-/// implicit stalls are outside these invocation diagnostics.
+/// Native foreign-library internals, compilation uploads, caller output readback,
+/// and driver-dependent implicit stalls are outside these invocation diagnostics.
 pub(super) fn physical_counts(
     program: &CudaLoweredProgram,
     commands: &[Command],
@@ -3538,15 +5773,38 @@ pub(super) fn physical_counts(
     let mut has_checked_kernel = false;
     for command in commands {
         match &command.kind {
-            CommandKind::Gemm { .. } | CommandKind::Cursor { .. } => submissions += 1,
+            CommandKind::Gemm { .. }
+            | CommandKind::GemmPair { .. }
+            | CommandKind::Cursor { .. } => submissions += 1,
+            CommandKind::PackedProjection77 { skip_split, .. } => {
+                submissions += if *skip_split { 1 } else { 2 }
+            }
+            CommandKind::Norm98Entrance { .. } => submissions += 2,
+            CommandKind::Norm98Tail { .. } => submissions += 1,
+            CommandKind::NormRope101 { .. } => submissions += 4,
+            CommandKind::Softmax100 { .. } => submissions += 5,
+            CommandKind::FusedMoe75 { .. } => {
+                submissions += 2; // Route guard plus native bridge submission.
+                has_checked_kernel = true;
+            }
             CommandKind::GroupedExpert {
                 rows,
                 columns,
                 inner,
                 experts,
                 reuse_routing,
+                input_sorted,
+                output_sorted,
+                device_control,
                 ..
             } => {
+                if device_control.is_some() {
+                    submissions += 4
+                        + usize::from(!*input_sorted)
+                        + usize::from(!*output_sorted)
+                        + if *reuse_routing { 0 } else { 4 };
+                    continue;
+                }
                 if *rows != 0 {
                     if !*reuse_routing {
                         // Reset/count/prefix/readback. An initialized deferred
@@ -3558,7 +5816,10 @@ pub(super) fn physical_counts(
                         submissions += if *inner == 0 {
                             1
                         } else {
-                            2 + usize::from(!*reuse_routing) + rows.min(experts)
+                            usize::from(!*input_sorted)
+                                + usize::from(!*output_sorted)
+                                + usize::from(!*reuse_routing)
+                                + rows.min(experts)
                         };
                     }
                 }
@@ -3620,7 +5881,8 @@ pub(super) fn physical_counts(
             CommandKind::Prepare
             | CommandKind::Value(_)
             | CommandKind::Input { .. }
-            | CommandKind::Alias { .. } => {}
+            | CommandKind::Alias { .. }
+            | CommandKind::PlannedAlias => {}
         }
     }
     submissions += 2 * usize::from(has_checked_kernel);
@@ -3693,33 +5955,117 @@ fn compile_inner(
     let device = CudaDevice::get(ordinal)?;
     let capabilities = CudaCapabilities::for_device(&device)?;
     let random_seed = options.random_seed;
+    let allow_fused_moe75 = options.constant_weights();
     let mut request = ProgramRequest::from_roots(roots, options);
     if let Some((slot, tensor)) = state_cursor {
         request = request.with_state_cursor(StateCursorSlot::new(slot, tensor));
     }
     let prepared = request.prepare()?;
     let mut driver = CompilerDriver::new(&prepared, &capabilities)?;
-    let mut builder =
-        CudaProgramBuilder::new(&prepared.index, state_layout.clone(), driver.legalization())?;
-    driver.lower(|unit, index, optimization, plan| match unit {
-        LoweringUnit::Node(dense) => {
+    let literal88 = crate::lowering::literal_leaf88::admitted(
+        &prepared.source_roots,
+        state_cursor.is_none() && state_layout.is_none(),
+        std::env::var(crate::lowering::literal_leaf88::ENV).as_deref() == Ok("1"),
+    );
+    let (program, commands) = if literal88 {
+        let mut builder = crate::lowering::literal_leaf88::Builder::new(&prepared.index);
+        let mut commands = Vec::with_capacity(prepared.index.order.len());
+        driver.lower(|unit, index, _, _| {
+            let LoweringUnit::Node(dense) = unit else {
+                return Err("compile: literal88 received a region".into());
+            };
             let node = index.node(dense).ok_or("compile: CUDA node missing")?;
-            let instruction = semantic_instruction(
-                node,
-                index,
-                &device,
-                ordinal,
-                state_cursor,
-                random_seed.is_some(),
-            )?;
-            builder.add(dense, node, index, optimization, instruction, plan)
+            let Instruction::Value(value) =
+                semantic_instruction(node, index, &device, ordinal, None, random_seed.is_some())?
+            else {
+                return Err("compile: literal88 received a non-value instruction".into());
+            };
+            let output = builder.add(dense, node)?;
+            commands.push(Command {
+                output: Some(output),
+                kind: CommandKind::Value(value),
+                overlap: CommandOverlap::Primary,
+            });
+            Ok(())
+        })?;
+        (builder.finish(&prepared.index)?, commands)
+    } else {
+        let mut builder =
+            CudaProgramBuilder::new(&prepared.index, state_layout.clone(), driver.legalization())?;
+        builder.allow_fused_moe75 = allow_fused_moe75;
+        if std::env::var_os(crate::triton_softmax100::DIRECTORY_ENV).is_some()
+            && driver
+                .optimization()
+                .regions
+                .iter()
+                .any(|region| match region {
+                    effect_torch_compiler::NativeRegion::Bf16Softmax(region) => {
+                        region.width == crate::triton_softmax100::WIDTH
+                            && region
+                                .shape
+                                .iter()
+                                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                                == Some(
+                                    crate::triton_softmax100::ROWS
+                                        * crate::triton_softmax100::WIDTH,
+                                )
+                    }
+                    _ => false,
+                })
+        {
+            builder.softmax100 =
+                crate::triton_softmax100::Softmax100::from_env(device.stream.context())?;
         }
-        LoweringUnit::Region(region) => {
-            builder.add_region(index, optimization, region, plan, &device)
+        if std::env::var_os(crate::triton_norm98::DIRECTORY_ENV).is_some()
+            && driver
+                .optimization()
+                .regions
+                .iter()
+                .any(|region| match region {
+                    effect_torch_compiler::NativeRegion::AttentionFfnEntrance(entrance) => {
+                        crate::norm98_pair::find_pair(
+                            &prepared.index,
+                            driver.optimization(),
+                            entrance,
+                        )
+                        .is_some()
+                    }
+                    _ => false,
+                })
+        {
+            builder.norm98 = crate::triton_norm98::Norm98::from_env(device.stream.context())?
+                .map(|plan| (plan, device.clone()));
         }
-    })?;
-    driver.record_materialized_conversions(builder.conversion_count, builder.conversion_bytes);
-    let (program, commands) = builder.finish(&prepared.index)?;
+        let mut rotary_reuse66 = crate::lowering::rotary_reuse66::RotaryReuse66::new(
+            &prepared.index,
+            driver.optimization(),
+            driver.legalization(),
+        );
+        driver.lower(|unit, index, optimization, plan| {
+            if rotary_reuse66.lower(unit, index, &mut builder)? {
+                return Ok(());
+            }
+            match unit {
+                LoweringUnit::Node(dense) => {
+                    let node = index.node(dense).ok_or("compile: CUDA node missing")?;
+                    let instruction = semantic_instruction(
+                        node,
+                        index,
+                        &device,
+                        ordinal,
+                        state_cursor,
+                        random_seed.is_some(),
+                    )?;
+                    builder.add(dense, node, index, optimization, instruction, plan)
+                }
+                LoweringUnit::Region(region) => {
+                    builder.add_region(index, optimization, region, plan, &device)
+                }
+            }
+        })?;
+        driver.record_materialized_conversions(builder.conversion_count, builder.conversion_bytes);
+        builder.finish(&prepared.index)?
+    };
     let memory = driver
         .plan_memory(
             &program,
@@ -3788,6 +6134,16 @@ fn compile_inner(
     })?;
     diagnostics.legalization = driver.legalization_diagnostics();
     let work = driver.finish_with_phase(&program, PUBLICATION_PHASE, std::time::Instant::now());
+    let request_rng99_sources = commands
+        .iter()
+        .filter_map(|command| match &command.kind {
+            CommandKind::Kernel { name, args, .. } if name.starts_with("et_random_") => {
+                Some(args.integers[0])
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let request_rng99_eligible = random_seed == Some(0) && request_rng99_sources == [0];
     let mut executable = CudaExecutable {
         state_layout,
         device,
@@ -3799,9 +6155,13 @@ fn compile_inner(
         diagnostics,
         compiler_work: work,
         random_seed,
+        request_rng99_eligible,
         runs: AtomicU64::new(0),
         graph_runtime: Mutex::new(GraphRuntime::default()),
+        whole_read71: Mutex::new(whole_read71::Runtime::default()),
+        pair61: expert_pair61::Runtime::default(),
     };
+    executable.pair61 = expert_pair61::Runtime::plan(&executable)?;
     executable.diagnostics.compile_phases = executable.compiler_work.compile_phases.clone();
     Ok(executable)
 }
@@ -3955,6 +6315,7 @@ impl CudaExecutable {
         transactions: &[Option<CudaBuffer<u8>>],
         state: Option<&mut CudaStateInvocation>,
         kv_ranges: &mut Vec<(usize, usize, usize)>,
+        mut uploads: Option<&mut Vec<whole_read71::StateUpload>>,
     ) -> Result<(), String> {
         match access {
             StateAccess::None => {}
@@ -3986,7 +6347,11 @@ impl CudaExecutable {
                             .ok_or("execute: cursor overflow")?;
                     }
                 }
-                self.upload_scratch(&scratch[0], &cursors)?;
+                if let Some(uploads) = uploads.as_deref_mut() {
+                    uploads.push(whole_read71::StateUpload::u32(&scratch[0], &cursors)?);
+                } else {
+                    self.upload_scratch(&scratch[0], &cursors)?;
+                }
             }
             StateAccess::Kv {
                 layer,
@@ -4120,16 +6485,22 @@ impl CudaExecutable {
                         }
                     }
                 }
-                self.upload_scratch(&scratch[0], &valid)?;
-                self.upload_scratch(&scratch[1], &cursors)?;
                 let target = scratch[2]
                     .as_ref()
                     .ok_or("execute: KV pointer staging missing")?;
                 let mut target = target.slice(0..table.len() * 8)?.cast::<u64>(table.len())?;
-                self.device
-                    .stream
-                    .memcpy_htod(&table, &mut target)
-                    .map_err(|e| e.to_string())?;
+                if let Some(uploads) = uploads.as_deref_mut() {
+                    uploads.push(whole_read71::StateUpload::u32(&scratch[0], &valid)?);
+                    uploads.push(whole_read71::StateUpload::u32(&scratch[1], &cursors)?);
+                    uploads.push(whole_read71::StateUpload::u64(&scratch[2], &table)?);
+                } else {
+                    self.upload_scratch(&scratch[0], &valid)?;
+                    self.upload_scratch(&scratch[1], &cursors)?;
+                    self.device
+                        .stream
+                        .memcpy_htod(&table, &mut target)
+                        .map_err(|e| e.to_string())?;
+                }
                 args.inputs[3] = target.address();
                 args.inputs[4] = args.scratch[2] + args.integers[12];
                 args.inputs[7] = args.scratch[1];
@@ -4231,3 +6602,203 @@ impl CudaExecutable {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod primary_graph_tests {
+    use super::*;
+
+    fn work(overlap: CommandOverlap) -> Command {
+        Command {
+            output: Some(ValueId::new(0)),
+            kind: CommandKind::Kernel {
+                name: "et_test_static",
+                args: CudaKernelArgs::default(),
+                inputs: [None; 8],
+                scratch: [None; 3],
+                status: None,
+                checked: false,
+                metadata: Vec::new(),
+                state: StateAccess::None,
+                state_buffers: [None; 4],
+                kv_matmul: None,
+            },
+            overlap,
+        }
+    }
+
+    #[test]
+    fn primary_graph_islands_preserve_every_overlap_boundary() {
+        for boundary in [
+            CommandOverlap::Worker {
+                branch: 0,
+                start: true,
+                finish: false,
+            },
+            CommandOverlap::Worker {
+                branch: 0,
+                start: false,
+                finish: false,
+            },
+            CommandOverlap::Worker {
+                branch: 0,
+                start: false,
+                finish: true,
+            },
+            CommandOverlap::Join { branch: 0 },
+        ] {
+            let commands = vec![
+                work(CommandOverlap::Primary),
+                work(CommandOverlap::Primary),
+                work(boundary),
+                work(CommandOverlap::Primary),
+                work(CommandOverlap::Primary),
+            ];
+            assert_eq!(
+                CudaExecutable::graph_segment_end(&commands, 0, true),
+                Some(2)
+            );
+            assert_eq!(CudaExecutable::graph_segment_end(&commands, 2, true), None);
+            assert_eq!(
+                CudaExecutable::graph_segment_end(&commands, 3, true),
+                Some(5)
+            );
+            // Without actual overlap, the original serial segmentation remains.
+            assert_eq!(
+                CudaExecutable::graph_segment_end(&commands, 0, false),
+                Some(5)
+            );
+        }
+    }
+
+    #[test]
+    fn primary_graph_islands_do_not_bridge_foreign_alias_or_checked_work() {
+        let mut alias = work(CommandOverlap::Worker {
+            branch: 0,
+            start: false,
+            finish: false,
+        });
+        alias.kind = CommandKind::Alias {
+            source: ValueId::new(0),
+        };
+        let commands = vec![
+            work(CommandOverlap::Primary),
+            alias,
+            work(CommandOverlap::Primary),
+        ];
+        assert_eq!(CudaExecutable::graph_segment_end(&commands, 0, true), None);
+        assert_eq!(
+            CudaExecutable::graph_segment_end(&commands, 0, false),
+            Some(3)
+        );
+        let mut checked = work(CommandOverlap::Primary);
+        if let CommandKind::Kernel { checked: flag, .. } = &mut checked.kind {
+            *flag = true;
+        }
+        let commands = vec![
+            work(CommandOverlap::Primary),
+            checked,
+            work(CommandOverlap::Primary),
+        ];
+        assert_eq!(CudaExecutable::graph_segment_end(&commands, 0, true), None);
+    }
+}
+
+#[cfg(test)]
+mod graph_diagnostic_tests {
+    use super::GraphDiagnostics;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn graph_diagnostics_are_bounded_per_invocation_and_emit_once() {
+        let path = std::env::temp_dir().join(format!(
+            "effect-torch-graph-stats-{}-{}.jsonl",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        {
+            let mut stats = GraphDiagnostics::open(path.as_os_str(), 17, 3, true, 2, 5).unwrap();
+            stats.record_attempt(2);
+            stats.record_attempt(63);
+            stats.record_attempt(64);
+            stats.record_hit(63);
+            stats.record_capture(64);
+            stats.first_seen_misses = 1;
+            stats.emit(true).unwrap();
+            stats.emit(false).unwrap();
+        }
+        {
+            let mut stats = GraphDiagnostics::open(path.as_os_str(), 17, 4, false, 0, 0).unwrap();
+            stats.record_attempt(usize::MAX);
+            stats.record_attempt(1);
+            // Drop models an early error/interruption, without masking it.
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let records = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        let first = &records[0];
+        assert_eq!(first["completed"], true);
+        assert_eq!(first["addsStreamSynchronization"], false);
+        assert_eq!(first["attempts"], 3);
+        assert_eq!(first["hits"], 1);
+        assert_eq!(first["captures"], 1);
+        assert_eq!(first["attemptedCommands"], 129);
+        assert_eq!(first["hitCommands"], 63);
+        assert_eq!(first["capturedCommands"], 64);
+        assert_eq!(
+            first["attemptLengthHistogram"].as_array().unwrap().len(),
+            65
+        );
+        assert_eq!(first["attemptLengthHistogram"][2], 1);
+        assert_eq!(first["attemptLengthHistogram"][6], 1);
+        assert_eq!(first["attemptLengthHistogram"][7], 1);
+        assert_eq!(records[1]["completed"], false);
+        assert_eq!(records[1]["graphsEnabled"], false);
+        assert_eq!(GraphDiagnostics::length_bucket(0), 0);
+        assert_eq!(
+            GraphDiagnostics::length_bucket(usize::MAX),
+            usize::BITS as usize
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "graph_planned_keys_tests.rs"]
+mod graph_planned_keys_tests;
+
+#[cfg(test)]
+mod kv_pair_graph_tests {
+    use super::*;
+    #[test]
+    fn kv_pair_remains_a_graph_segment_barrier() {
+        let commands = vec![Command {
+            output: Some(ValueId::new(3)),
+            overlap: CommandOverlap::Primary,
+            kind: CommandKind::GemmPair {
+                x: ValueId::new(0),
+                weights: [ValueId::new(1), ValueId::new(2)],
+                second_output: ValueId::new(4),
+                plan: crate::cublas::Bf16GemmPlan {
+                    m: 256,
+                    n: 2048,
+                    k: 2816,
+                    batch: 1,
+                    stride_x: 256 * 2816,
+                    stride_weight: 2048 * 2816,
+                    stride_out: 256 * 2048,
+                },
+                workspaces: [ValueId::new(5), ValueId::new(6)],
+            },
+        }];
+        assert_eq!(CudaExecutable::graph_segment_end(&commands, 0, false), None);
+        assert_eq!(CudaExecutable::graph_segment_end(&commands, 0, true), None);
+    }
+}
+
+#[cfg(test)]
+#[path = "request_rng99_tests.rs"]
+mod request_rng99_tests;

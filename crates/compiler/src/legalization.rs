@@ -1656,8 +1656,10 @@ pub fn operation_name(operation: &NodeKind) -> &'static str {
 
 pub(crate) fn region_expressions(region: &NativeRegion) -> Vec<&KernelExpr> {
     match region {
+        NativeRegion::GroupedExpertGated(region) => vec![&region.expression],
         NativeRegion::Elementwise(region) => vec![&region.output.expression],
         NativeRegion::ElementwiseReduce(region) => vec![&region.expression],
+        NativeRegion::ElementwiseArgReduce(region) => vec![&region.expression],
         NativeRegion::MultiOutput(region) => region
             .outputs
             .iter()
@@ -1666,7 +1668,22 @@ pub(crate) fn region_expressions(region: &NativeRegion) -> Vec<&KernelExpr> {
         NativeRegion::AdamW(region) => region.expressions.iter().collect(),
         NativeRegion::AdamWGroup(region) => region.expressions.iter().collect(),
         NativeRegion::Sgd(region) => region.expressions.iter().collect(),
-        NativeRegion::LinearResidual(_) | NativeRegion::LinearGelu(_) => Vec::new(),
+        NativeRegion::DualArgmax(_)
+        | NativeRegion::RouterTail(_)
+        | NativeRegion::AttentionFfnEntrance(_)
+        | NativeRegion::RmsResidual(_)
+        | NativeRegion::FfnNextNorm(_)
+        | NativeRegion::FfnTail(_)
+        | NativeRegion::VNormKvAttention(_)
+        | NativeRegion::NormRope(_)
+        | NativeRegion::SmallSoftmax(_)
+        | NativeRegion::Entropy(_)
+        | NativeRegion::Bf16Softmax(_)
+        | NativeRegion::SharedRmsNorm(_)
+        | NativeRegion::ExpertRouteRank(_)
+        | NativeRegion::OrderedScatterReduce(_)
+        | NativeRegion::LinearResidual(_)
+        | NativeRegion::LinearGelu(_) => Vec::new(),
     }
 }
 

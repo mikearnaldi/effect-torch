@@ -125,6 +125,462 @@ const ownTensor = <E, R>(effect: Effect.Effect<Tensor.Concrete, E, R>) =>
   Effect.acquireRelease(effect, Tensor.clear, { interruptible: true })
 
 onDevices("Diffusion", () => (it) => {
+  it.effect("processed evaluation falls back before execution and preserves device and host outputs", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters } = yield* fixture
+      const program = yield* Diffusion.compile(definition, parameters, config)
+      const prefix = yield* ownPrefix(program, program.encode(ids([1, 2])))
+      const logits = yield* ownTensor(program.evaluate(prefix, ids([0, 3]), initial))
+      const input = yield* Tensor.makeInput(0, logits)
+      const scalar = yield* Tensor.makeScalarInput(1, "f32")
+      const processor = yield* Tensor.freezeProgram([
+        yield* Tensor.mul(input, scalar),
+        yield* Tensor.reshape(input, [8])
+      ])
+      const expected = yield* Tensor.toNumberArray(logits)
+      const runtime = yield* Runtime.Runtime
+      let admissions = 0
+      let bodyExecutions = 0
+      const tracked: Runtime.RuntimeService = {
+        ...runtime,
+        extensions: {
+          ...runtime.extensions,
+          decode: {
+            ...runtime.extensions.decode,
+            prepareProcessedReadOnly: () =>
+              Effect.sync(() => {
+                admissions++
+                return undefined
+              })
+          }
+        },
+        execute: (executable, invocation) => {
+          if (invocation.state?.access === "ReadOnly") bodyExecutions++
+          return runtime.execute(executable, invocation)
+        }
+      }
+      const result = yield* Effect.acquireRelease(
+        program.evaluateProcessed(prefix, ids([0, 3]), initial, processor, 2).pipe(
+          Effect.provideService(Runtime.Runtime, tracked)
+        ),
+        (value) => Tensor.clear(value.device),
+        { interruptible: true }
+      )
+      expect(admissions).toBe(1)
+      expect(bodyExecutions).toBe(1)
+      deep(Array.from(result.host), expected)
+      deep(yield* Tensor.toNumberArray(result.device), expected.map((value) => value * 2))
+      const refined = yield* Effect.acquireRelease(
+        program.evaluateProcessed(prefix, ids([0, 3]), { _tag: "Refinement", logits: result.device }, processor, 0.5),
+        (value) => Tensor.clear(value.device),
+        { interruptible: true }
+      )
+      expect(refined.host).toHaveLength(8)
+      deep(Array.from(result.host), expected)
+    })))
+
+  it.effect("processed output is reclaimed if input finalization is interrupted", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters } = yield* fixture
+      const program = yield* Diffusion.compile(definition, parameters, { ...config, cachePositions: false })
+      const prefix = yield* ownPrefix(program, program.encode(ids([1, 2])))
+      const input = yield* Tensor.makeInput(0, yield* Tensor.zeros([1, 2, 4]))
+      const scalar = yield* Tensor.makeScalarInput(1, "f32")
+      const processor = yield* Tensor.freezeProgram([
+        yield* Tensor.mul(input, scalar),
+        yield* Tensor.reshape(input, [8])
+      ])
+      const [device] = yield* Tensor.compute([yield* Tensor.zeros([1, 2, 4])])
+      const runtime = yield* Runtime.Runtime
+      const releasing = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      let position: Tensor.Concrete | undefined
+      let cleared = false
+      const tracked: Runtime.RuntimeService = {
+        ...runtime,
+        extensions: {
+          ...runtime.extensions,
+          decode: {
+            ...runtime.extensions.decode,
+            prepareProcessedReadOnly: () =>
+              Effect.succeed({
+                execute: (request) =>
+                  Effect.sync(() => {
+                    position = request.bindings[0]
+                    return { device: device!, host: new Float32Array(8) }
+                  })
+              })
+          }
+        },
+        release: (value) =>
+          Effect.gen(function*() {
+            if (value === position) {
+              yield* Deferred.succeed(releasing, undefined)
+              yield* Deferred.await(resume)
+            }
+            yield* runtime.release(value)
+            if (value === device) cleared = true
+          })
+      }
+      const fiber = yield* program.evaluateProcessed(prefix, ids([0, 3]), initial, processor, 1).pipe(
+        Effect.provideService(Runtime.Runtime, tracked),
+        Effect.forkChild
+      )
+      yield* Effect.raceFirst(Deferred.await(releasing), Fiber.join(fiber))
+      const interruption = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(resume, undefined)
+      yield* Fiber.join(interruption)
+      expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
+      expect(cleared).toBe(true)
+    })))
+
+  it.effect("processed fallback readback failure releases both processor outputs", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters } = yield* fixture
+      const program = yield* Diffusion.compile(definition, parameters, config)
+      const prefix = yield* ownPrefix(program, program.encode(ids([1, 2])))
+      const input = yield* Tensor.makeInput(0, yield* Tensor.zeros([1, 2, 4]))
+      const scalar = yield* Tensor.makeScalarInput(1, "f32")
+      const processor = yield* Tensor.freezeProgram([
+        yield* Tensor.mul(input, scalar),
+        yield* Tensor.reshape(input, [8])
+      ])
+      const runtime = yield* Runtime.Runtime
+      let outputs: ReadonlyArray<Tensor.Concrete> = []
+      const released = new Set<Tensor.Concrete>()
+      const tracked: Runtime.RuntimeService = {
+        ...runtime,
+        extensions: {
+          ...runtime.extensions,
+          decode: { ...runtime.extensions.decode, prepareProcessedReadOnly: undefined }
+        },
+        execute: (handle, invocation) =>
+          runtime.execute(handle, invocation).pipe(Effect.tap((values) =>
+            Effect.sync(() => {
+              if (handle === processor.handle) outputs = values
+            })
+          )),
+        readback: () =>
+          Effect.fail(
+            new Runtime.BackendError({
+              backend: "test",
+              operation: "readback",
+              phase: "execute",
+              reason: "execution-failed",
+              message: "injected"
+            })
+          ),
+        release: (value) =>
+          runtime.release(value).pipe(Effect.tap(() =>
+            Effect.sync(() => {
+              released.add(value)
+            })
+          ))
+      }
+      const exit = yield* Effect.exit(
+        program.evaluateProcessed(prefix, ids([0, 3]), initial, processor, 1).pipe(
+          Effect.provideService(Runtime.Runtime, tracked)
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(outputs).toHaveLength(2)
+      expect(outputs.every((value) => released.has(value))).toBe(true)
+    })))
+
+  it.effect("processed execution failure never retries the body", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters } = yield* fixture
+      const program = yield* Diffusion.compile(definition, parameters, config)
+      const prefix = yield* ownPrefix(program, program.encode(ids([1, 2])))
+      const exemplar = yield* Tensor.zeros([1, 2, 4])
+      const input = yield* Tensor.makeInput(0, exemplar)
+      const scalar = yield* Tensor.makeScalarInput(1, "f32")
+      const processor = yield* Tensor.freezeProgram([
+        yield* Tensor.mul(input, scalar),
+        yield* Tensor.reshape(input, [8])
+      ])
+      const runtime = yield* Runtime.Runtime
+      let attempts = 0
+      let bodyExecutions = 0
+      const tracked: Runtime.RuntimeService = {
+        ...runtime,
+        extensions: {
+          ...runtime.extensions,
+          decode: {
+            ...runtime.extensions.decode,
+            prepareProcessedReadOnly: () =>
+              Effect.succeed({
+                execute: () => {
+                  attempts++
+                  return Effect.fail(
+                    new Runtime.BackendError({
+                      backend: "test",
+                      operation: "processed",
+                      phase: "execute",
+                      reason: "execution-failed",
+                      message: "injected"
+                    })
+                  )
+                }
+              })
+          }
+        },
+        execute: (executable, invocation) => {
+          if (invocation.state?.access === "ReadOnly") bodyExecutions++
+          return runtime.execute(executable, invocation)
+        }
+      }
+      const exit = yield* Effect.exit(
+        program.evaluateProcessed(prefix, ids([0, 3]), initial, processor, 1).pipe(
+          Effect.provideService(Runtime.Runtime, tracked)
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(attempts).toBe(1)
+      expect(bodyExecutions).toBe(0)
+    })))
+
+  it.effect("shares concrete prefix positions across concurrent reads and isolates committed prefixes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters, reference } = yield* fixture
+      const program = yield* Diffusion.compile(definition, parameters, { ...config, cachePositions: true })
+      const runtime = yield* Runtime.Runtime
+      const reads: Array<Tensor.Concrete> = []
+      const tracked: Runtime.RuntimeService = {
+        ...runtime,
+        execute: (executable, invocation) => {
+          if (invocation.state?.access === "ReadOnly") reads.push(invocation.bindings[1]!)
+          return runtime.execute(executable, invocation)
+        }
+      }
+      const prefix = yield* program.encode(ids([1, 2]))
+      const outputs = yield* Effect.all(
+        [ids([0, 3]), ids([1, 0]), ids([3, 2])].map((canvas) =>
+          ownTensor(program.evaluate(prefix, canvas, initial).pipe(Effect.provideService(Runtime.Runtime, tracked)))
+        ),
+        { concurrency: "unbounded" }
+      )
+      expect(reads).toHaveLength(3)
+      expect(reads[0]).toBe(reads[1])
+      expect(reads[0]).toBe(reads[2])
+      expect(yield* Tensor.toNumberArray(reads[0]!)).toEqual([2, 3])
+      const expected = yield* ownTensor(reference(ids([1, 2]), ids([0, 3])))
+      deep(yield* Tensor.toNumberArray(outputs[0]!), yield* Tensor.toNumberArray(expected))
+      yield* ownTensor(
+        program.score(prefix, ids([0, 3]), [0], [0]).pipe(Effect.provideService(Runtime.Runtime, tracked))
+      )
+      expect(reads[3]).toBe(reads[0])
+      yield* ownTensor(
+        program.evaluate(prefix, ids([0, 3, 1]), initial).pipe(Effect.provideService(Runtime.Runtime, tracked))
+      )
+      expect(reads[4]).not.toBe(reads[0])
+      expect(yield* Tensor.toNumberArray(reads[4]!)).toEqual([2, 3, 4])
+      const next = yield* ownPrefix(program, program.commit(prefix, ids([1])))
+      yield* ownTensor(
+        program.evaluate(next, ids([0, 3]), initial).pipe(Effect.provideService(Runtime.Runtime, tracked))
+      )
+      expect(reads[5]).not.toBe(reads[0])
+      expect(yield* Tensor.toNumberArray(reads[5]!)).toEqual([3, 4])
+      yield* program.release(prefix)
+      for (const positions of [reads[0]!, reads[4]!]) {
+        expect((yield* Effect.flip(runtime.readback(positions))).reason).toBe("invalid-handle")
+      }
+      expect((yield* Effect.flip(program.evaluate(prefix, ids([0, 3]), initial)))._tag).toBe("TensorError")
+      expect(yield* Tensor.toNumberArray(reads[5]!)).toEqual([3, 4])
+      deep(yield* Tensor.toNumberArray(outputs[0]!), yield* Tensor.toNumberArray(expected))
+    })))
+
+  for (const interrupted of [false, true]) {
+    it.effect(`cleans a partially constructed position cache after ${interrupted ? "interruption" : "failure"}`, () =>
+      Effect.scoped(Effect.gen(function*() {
+        const { definition, parameters } = yield* fixture
+        const program = yield* Diffusion.compile(definition, parameters, { ...config, cachePositions: true })
+        const runtime = yield* Runtime.Runtime
+        const reached = yield* Deferred.make<void>()
+        let snapshot: Runtime.KvPrefixHandle | undefined
+        let releasedSnapshot: Runtime.KvPrefixHandle | undefined
+        const cached: Array<Tensor.Concrete> = []
+        const tracked: Runtime.RuntimeService = {
+          ...runtime,
+          compile: (request) => {
+            if (snapshot !== undefined && cached.length > 0) {
+              return interrupted
+                ? Deferred.succeed(reached, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.fail(
+                  new Runtime.BackendError({
+                    backend: runtime.backend.name,
+                    operation: "position-cache",
+                    phase: "compile",
+                    reason: "execution-failed",
+                    message: "injected position cache failure"
+                  })
+                )
+            }
+            return runtime.compile(request)
+          },
+          execute: (executable, invocation) =>
+            runtime.execute(executable, invocation).pipe(Effect.tap((outputs) =>
+              Effect.sync(() => {
+                if (snapshot !== undefined && invocation.state === undefined) cached.push(...outputs)
+              })
+            )),
+          extensions: {
+            ...runtime.extensions,
+            decode: {
+              ...runtime.extensions.decode,
+              snapshot: (sequence) =>
+                runtime.extensions.decode.snapshot(sequence).pipe(Effect.tap((value) =>
+                  Effect.sync(() => {
+                    snapshot = value
+                  })
+                )),
+              releasePrefix: (value) =>
+                runtime.extensions.decode.releasePrefix(value).pipe(Effect.tap(() =>
+                  Effect.sync(() => {
+                    releasedSnapshot = value
+                  })
+                ))
+            }
+          }
+        }
+        const acquire = program.encode(ids([1, 2])).pipe(Effect.provideService(Runtime.Runtime, tracked))
+        if (interrupted) {
+          const fiber = yield* Effect.forkChild(acquire)
+          yield* Effect.raceFirst(Deferred.await(reached), Fiber.join(fiber))
+          yield* Fiber.interrupt(fiber)
+          expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
+        } else {
+          expect(Exit.isFailure(yield* Effect.exit(acquire))).toBe(true)
+        }
+        expect(snapshot).toBeDefined()
+        expect(releasedSnapshot).toBe(snapshot)
+        expect(cached).toHaveLength(1)
+        expect((yield* Effect.flip(runtime.readback(cached[0]!))).reason).toBe("invalid-handle")
+        const usable = yield* ownPrefix(program, program.encode(ids([1, 2])))
+        yield* ownTensor(program.evaluate(usable, ids([0, 3]), initial))
+      })))
+  }
+
+  it.effect("clears cached positions when native prefix release fails without masking the error", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters } = yield* fixture
+      const program = yield* Diffusion.compile(definition, parameters, { ...config, cachePositions: true })
+      const runtime = yield* Runtime.Runtime
+      const prefix = yield* program.encode(ids([1, 2]))
+      let positions: Tensor.Concrete | undefined
+      const tracked: Runtime.RuntimeService = {
+        ...runtime,
+        execute: (executable, invocation) => {
+          if (invocation.state?.access === "ReadOnly") positions = invocation.bindings[1]
+          return runtime.execute(executable, invocation)
+        },
+        extensions: {
+          ...runtime.extensions,
+          decode: {
+            ...runtime.extensions.decode,
+            releasePrefix: (value) =>
+              runtime.extensions.decode.releasePrefix(value).pipe(Effect.andThen(
+                Effect.fail(
+                  new Runtime.BackendError({
+                    backend: runtime.backend.name,
+                    operation: "release-prefix",
+                    phase: "shutdown",
+                    reason: "execution-failed",
+                    message: "injected prefix release failure"
+                  })
+                )
+              ))
+          }
+        }
+      }
+      yield* ownTensor(
+        program.evaluate(prefix, ids([0, 3]), initial).pipe(Effect.provideService(Runtime.Runtime, tracked))
+      )
+      const error = yield* Effect.flip(program.release(prefix).pipe(Effect.provideService(Runtime.Runtime, tracked)))
+      expect(error.message).toContain("injected prefix release failure")
+      expect((yield* Effect.flip(runtime.readback(positions!))).reason).toBe("invalid-handle")
+    })))
+
+  it.effect("fuses full readout while preserving refinement, selected reads, and retained outputs", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters } = yield* fixture
+      const baseline = yield* Diffusion.compile(definition, parameters, config)
+      const fused = yield* Diffusion.compile(definition, parameters, { ...config, fuseFullReadout: true })
+      const prompt = ids([0, 1, 2])
+      const left = yield* ownPrefix(baseline, baseline.encode(prompt))
+      const right = yield* ownPrefix(fused, fused.encode(prompt))
+      const canvas = ids([2, 3])
+      const expected = yield* ownTensor(baseline.evaluate(left, canvas, initial))
+      const actual = yield* ownTensor(fused.evaluate(right, canvas, initial))
+      const values = yield* Tensor.toNumberArray(expected)
+      expect(yield* Tensor.toNumberArray(actual)).toEqual(values)
+      const prediction: Diffusion.Prediction = { _tag: "Refinement", logits: expected }
+      const expectedRefined = yield* ownTensor(baseline.evaluate(left, canvas, prediction))
+      const actualRefined = yield* ownTensor(fused.evaluate(right, canvas, prediction))
+      expect(yield* Tensor.toNumberArray(actualRefined)).toEqual(yield* Tensor.toNumberArray(expectedRefined))
+      const selected = yield* ownTensor(fused.score(right, canvas, [1, 0], [3, 1, 1]))
+      const expectedSelected = yield* ownTensor(baseline.score(left, canvas, [1, 0], [3, 1, 1]))
+      expect(yield* Tensor.toNumberArray(selected)).toEqual(yield* Tensor.toNumberArray(expectedSelected))
+      yield* ownPrefix(fused, fused.commit(right, ids([1, 3])))
+      expect(right.tokenCount).toBe(3)
+      expect(yield* Tensor.toNumberArray(actual)).toEqual(values)
+    })))
+
+  for (const fuseFullReadout of [false, true]) {
+    it.effect(`reclaims interrupted read outputs with fused readout ${fuseFullReadout}`, () =>
+      Effect.scoped(Effect.gen(function*() {
+        const { definition, parameters } = yield* fixture
+        const program = yield* Diffusion.compile(definition, parameters, {
+          ...config,
+          selectedReadouts: [],
+          fuseFullReadout
+        })
+        const prefix = yield* ownPrefix(program, program.encode(ids([1, 2])))
+        const runtime = yield* Runtime.Runtime
+        const completed = yield* Deferred.make<void>()
+        const resume = yield* Deferred.make<void>()
+        let logits: Tensor.Concrete | undefined
+        let input: Tensor.Concrete | undefined
+        const released = new Set<Tensor.Concrete>()
+        const tracked: Runtime.RuntimeService = {
+          ...runtime,
+          execute: (executable, invocation) =>
+            runtime.execute(executable, invocation).pipe(
+              Effect.tap((outputs) =>
+                Effect.sync(() => {
+                  if (invocation.state?.access === "ReadOnly") {
+                    logits = outputs[0]
+                    input = invocation.bindings[0]
+                  }
+                })
+              )
+            ),
+          release: (tensor) =>
+            Effect.gen(function*() {
+              if (tensor === input) {
+                yield* Deferred.succeed(completed, undefined)
+                yield* Deferred.await(resume)
+              }
+              yield* runtime.release(tensor)
+              released.add(tensor)
+            })
+        }
+        const fiber = yield* program.evaluate(prefix, ids([0, 3]), initial).pipe(
+          Effect.provideService(Runtime.Runtime, tracked),
+          Effect.forkChild
+        )
+        yield* Effect.raceFirst(Deferred.await(completed), Fiber.join(fiber))
+        const interruption = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.succeed(resume, undefined)
+        yield* Fiber.join(interruption)
+        expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
+        expect(logits).toBeDefined()
+        expect(released.has(logits!)).toBe(true)
+        const next = yield* ownTensor(program.evaluate(prefix, ids([0, 3]), initial))
+        expect((yield* Tensor.toNumberArray(next)).length).toBe(8)
+      })))
+  }
+
   it.effect("reuses shape programs for concurrent independent reads and retained outputs", () =>
     Effect.scoped(Effect.gen(function*() {
       const { definition, parameters, reference } = yield* fixture
@@ -529,6 +985,73 @@ onDevices("Diffusion", () => (it) => {
       expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
       expect(snapshot).toBeDefined()
       expect(released).toBe(snapshot)
+      const next = yield* ownTensor(program.evaluate(prefix, ids([0, 3]), initial))
+      expect((yield* Tensor.toNumberArray(next)).length).toBe(8)
+      expect((yield* program.inspect(prefix)).cursor).toBe(2)
+    })))
+
+  it.effect("interruption after the final cached position compute reclaims the unpublished prefix and every position", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { definition, parameters } = yield* fixture
+      const program = yield* Diffusion.compile(definition, parameters, { ...config, cachePositions: true })
+      const prefix = yield* ownPrefix(program, program.encode(ids([1, 2])))
+      const runtime = yield* Runtime.Runtime
+      const releasing = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      let snapshot: Runtime.KvPrefixHandle | undefined
+      let released: Runtime.KvPrefixHandle | undefined
+      const cached: Array<Tensor.Concrete> = []
+
+      const tracked: Runtime.RuntimeService = {
+        ...runtime,
+        execute: (executable, invocation) =>
+          runtime.execute(executable, invocation).pipe(Effect.tap((outputs) =>
+            Effect.sync(() => {
+              if (snapshot !== undefined && invocation.state === undefined) cached.push(...outputs)
+            })
+          )),
+        extensions: {
+          ...runtime.extensions,
+          decode: {
+            ...runtime.extensions.decode,
+            snapshot: (sequence) =>
+              runtime.extensions.decode.snapshot(sequence).pipe(Effect.tap((value) =>
+                Effect.sync(() => {
+                  snapshot = value
+                })
+              )),
+            releaseSequence: (sequence) =>
+              Effect.gen(function*() {
+                yield* Deferred.succeed(releasing, undefined)
+                yield* Deferred.await(resume)
+                yield* runtime.extensions.decode.releaseSequence(sequence)
+              }),
+            releasePrefix: (value) =>
+              runtime.extensions.decode.releasePrefix(value).pipe(Effect.tap(() =>
+                Effect.sync(() => {
+                  released = value
+                })
+              ))
+          }
+        }
+      }
+
+      const fiber = yield* program.commit(prefix, ids([0, 3])).pipe(
+        Effect.provideService(Runtime.Runtime, tracked),
+        Effect.forkChild
+      )
+
+      yield* Effect.raceFirst(Deferred.await(releasing), Fiber.join(fiber))
+      const interruption = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(resume, undefined)
+      yield* Fiber.join(interruption)
+      expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
+      expect(snapshot).toBeDefined()
+      expect(released).toBe(snapshot)
+      expect(cached).toHaveLength(config.canvasLengths!.length)
+      for (const positions of cached) {
+        expect((yield* Effect.flip(runtime.readback(positions))).reason).toBe("invalid-handle")
+      }
       const next = yield* ownTensor(program.evaluate(prefix, ids([0, 3]), initial))
       expect((yield* Tensor.toNumberArray(next)).length).toBe(8)
       expect((yield* program.inspect(prefix)).cursor).toBe(2)

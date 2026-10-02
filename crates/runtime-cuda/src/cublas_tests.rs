@@ -19,6 +19,40 @@ fn bf16_round(value: f32) -> f64 {
     bf16::from_f32(value).to_f64()
 }
 
+#[test]
+fn grouped_submission_preserves_ordinary_gemv_and_split_k_boundaries() {
+    use crate::cublas::{supports_exact_grouped_expert, Bf16GemmPlan};
+    let plan = |m, n, k| Bf16GemmPlan {
+        m,
+        n,
+        k,
+        batch: 1,
+        stride_x: m * k,
+        stride_weight: 0,
+        stride_out: m * n,
+    };
+    for m in 2..=16 {
+        assert!(supports_exact_grouped_expert(plan(m, 1408, 2816)));
+    }
+    for m in 2..=128 {
+        assert!(supports_exact_grouped_expert(plan(m, 2816, 704)));
+    }
+    for shape in [
+        (1, 1408, 2816),
+        (17, 1408, 2816),
+        (1, 2816, 704),
+        (129, 2816, 704),
+        (16, 1408, 2817),
+    ] {
+        assert!(!supports_exact_grouped_expert(plan(
+            shape.0, shape.1, shape.2
+        )));
+    }
+    let mut batched = plan(2, 1408, 2816);
+    batched.batch = 2;
+    assert!(!supports_exact_grouped_expert(batched));
+}
+
 // Dense, signed BF16 operands spanning nine exponents. The independent
 // PyTorch 2.10.0+cu128 fixture uses linear(x, weight), default BF16 reduction,
 // TF32 disabled, and CUBLAS_WORKSPACE_CONFIG=:4096:8. Sample i is flat output
@@ -104,6 +138,61 @@ fn bf16_dense_projections_match_pinned_torch_reductions() {
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("; "));
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn bf16_reduction_mode_survives_alternating_bias_and_ordinary_invocations() {
+    let device = device();
+    let (m, n, k) = (16, 128, 2816);
+    let x = input(0, &[m, k]);
+    let weight = Node::new(NodeKind::Permute {
+        a: input(1, &[n, k]),
+        dims: vec![1, 0],
+    })
+    .unwrap();
+    let ordinary = crate::compile(
+        vec![Node::new(NodeKind::Matmul {
+            a: x.clone(),
+            b: weight.clone(),
+        })
+        .unwrap()],
+        0,
+    )
+    .unwrap();
+    let biased = crate::compile(
+        vec![Node::new(NodeKind::Linear {
+            x,
+            weight,
+            bias: input(2, &[n]),
+        })
+        .unwrap()],
+        0,
+    )
+    .unwrap();
+    let bindings = vec![
+        host(&device, vec![m, k], &dense_bf16_fixture(m * k, 17)),
+        host(&device, vec![n, k], &dense_bf16_fixture(n * k, 29)),
+        host(&device, vec![n], &vec![0.; n]),
+    ];
+    let read = |executable: &crate::CudaExecutable, inputs: &[CudaValue]| {
+        executable
+            .execute(inputs, &[], &CancellationFlag::new())
+            .unwrap()[0]
+            .read_storage_bytes()
+            .unwrap()
+    };
+    let expected = read(&ordinary, &bindings[..2]);
+    let expected_bias = read(&biased, &bindings);
+    // Zero bias still selects the stricter F32 accumulator contract. This
+    // dense input makes a stale math-mode setting numerically observable.
+    assert_ne!(expected, expected_bias);
+    for _ in 0..3 {
+        assert_eq!(read(&ordinary, &bindings[..2]), expected);
+        assert_eq!(read(&ordinary, &bindings[..2]), expected);
+        assert_eq!(read(&biased, &bindings), expected_bias);
+        assert_eq!(read(&biased, &bindings), expected_bias);
+    }
 }
 
 fn input(slot: u32, shape: &[usize]) -> Arc<Node> {
@@ -729,5 +818,252 @@ fn linear_bf16_status_free_epilogues_and_late_cancellation() {
     drop(bindings);
     for output in [retained, next] {
         assert_eq!(output[0].readback().unwrap(), vec![2., 1., 5., 5., 4., 8.]);
+    }
+}
+
+#[test]
+#[ignore = "requires pinned CUDA and EFFECT_TORCH_CUDA_ORDINARY_K16_PTX"]
+fn ordinary_k16_actual_matmul_plans_match_both_cublas_weight_strides() {
+    use crate::cublas::{
+        ordinary_k16, plan_row_bf16_gemm, CudaBlas, RowGemmKind, CUBLAS_WORKSPACE_BYTES,
+    };
+    use cudarc::driver::DevicePtr;
+
+    let device = device();
+    let path = std::env::var(ordinary_k16::PATH_ENV).expect("ordinary K16 PTX must be configured");
+    assert!(ordinary_k16::fingerprint_matches(
+        device.stream.context().compute_capability().unwrap(),
+        &device.stream.context().name().unwrap(),
+        device.cublas.version,
+    ));
+    // Explicit PTX invocation additionally proves numerical specialization even
+    // if a runtime dispatch regression were to silently fall back to cuBLAS.
+    let kernel = ordinary_k16::OrdinaryK16::load(device.stream.context(), &path).unwrap();
+    let exact_bits = |actual: &[u8], expected: &[u8], context: &str| {
+        assert_eq!(actual.len(), expected.len(), "{context}: storage length");
+        if let Some(index) = actual.iter().zip(expected).position(|(a, b)| a != b) {
+            panic!(
+                "{context}: byte {index} differs: actual={} expected={}",
+                actual[index], expected[index]
+            );
+        }
+    };
+    // CudaBlas::new never installs ordinary_k16, regardless of the environment.
+    // These reference calls therefore bypass the specialization being tested.
+    let reference = CudaBlas::new(device.stream.clone()).unwrap();
+    let workspace = unsafe { device.stream.alloc::<u8>(CUBLAS_WORKSPACE_BYTES) }.unwrap();
+    let (workspace_address, _guard) = workspace.device_ptr(&device.stream);
+    for n in [2048usize, 2112] {
+        for rank_three in [false, true] {
+            let xs = if rank_three {
+                vec![1, 256, 2816]
+            } else {
+                vec![256, 2816]
+            };
+            let os = if rank_three {
+                vec![1, 256, n]
+            } else {
+                vec![256, n]
+            };
+            let plan = plan_row_bf16_gemm(RowGemmKind::Matmul, &xs, &[2816, n], &os).unwrap();
+            assert_eq!(plan.stride_weight, n * 2816);
+            let transposed = Node::new(NodeKind::Permute {
+                a: input(1, &[n, 2816]),
+                dims: vec![1, 0],
+            })
+            .unwrap();
+            let root = Node::new(NodeKind::Matmul {
+                a: input(0, &xs),
+                b: transposed,
+            })
+            .unwrap();
+            let executable = crate::compile(vec![root], 0).unwrap();
+            for pattern in 0..6 {
+                let values = |count: usize, weight: bool| {
+                    (0..count)
+                        .map(|i| {
+                            let mut h = (i as u32).wrapping_add(if weight { 313 } else { 17 });
+                            h = (h ^ (h >> 16)).wrapping_mul(0x7feb352d);
+                            h = (h ^ (h >> 15)).wrapping_mul(0x846ca68b);
+                            h ^= h >> 16;
+                            let bits = match pattern {
+                                0 => {
+                                    (((h >> 16) & 0x8000)
+                                        | ((((h >> 24) % 9) + 120) << 7)
+                                        | ((h >> 8) & 127))
+                                        as u16
+                                }
+                                1 => (((h >> 16) & 0x807f) | ((87 + (h % 81)) << 7)) as u16,
+                                2 => [
+                                    0u16, 0x8000, 1, 0x8001, 0x7f, 0x807f, 0x80, 0x8080, 0x3f80,
+                                    0xbf80,
+                                ][i % 10],
+                                3 => {
+                                    if weight {
+                                        0x7180
+                                    } else {
+                                        if i % 2 == 0 {
+                                            1
+                                        } else {
+                                            0x8001
+                                        }
+                                    }
+                                }
+                                4 => {
+                                    if weight {
+                                        [0x3f80, 0xbf80, 0x3b80, 0xbb80][i % 4]
+                                    } else {
+                                        0x3f80
+                                    }
+                                }
+                                _ => [0x7f80, 0xff80, 0x7fc1, 0xffc1, 0x7f7f, 0xff7f, 0x8000, 0]
+                                    [i % 8],
+                            };
+                            bf16::from_bits(bits).to_f64()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let x = host(&device, xs.clone(), &values(256 * 2816, false));
+                let weight = host(&device, vec![n, 2816], &values(n * 2816, true));
+                let bindings = [x, weight];
+                let actual = executable
+                    .execute(&bindings, &[], &CancellationFlag::new())
+                    .unwrap();
+                let actual_bits = actual[0].read_storage_bytes().unwrap();
+                assert!(ordinary_k16::supports(
+                    plan,
+                    true,
+                    false,
+                    [
+                        bindings[0].storage_address(),
+                        bindings[1].storage_address(),
+                        actual[0].storage_address()
+                    ]
+                ));
+                let direct = host(&device, os.clone(), &vec![0.; 256 * n]);
+                unsafe {
+                    kernel
+                        .launch(
+                            &device.stream,
+                            plan,
+                            bindings[0].storage_address(),
+                            bindings[1].storage_address(),
+                            direct.storage_address(),
+                        )
+                        .unwrap();
+                }
+                exact_bits(
+                    &direct.read_storage_bytes().unwrap(),
+                    &actual_bits,
+                    &format!(
+                        "direct PTX versus actual compiled Matmul n={n} rank3={rank_three} pattern={pattern}"
+                    ),
+                );
+                for stride_weight in [0, n * 2816] {
+                    let expected = host(&device, os.clone(), &vec![0.; 256 * n]);
+                    unsafe {
+                        reference
+                            .gemm_bf16(
+                                crate::cublas::Bf16GemmPlan {
+                                    stride_weight,
+                                    ..plan
+                                },
+                                true,
+                                bindings[0].storage_address(),
+                                bindings[1].storage_address(),
+                                expected.storage_address(),
+                                false,
+                                workspace_address,
+                            )
+                            .unwrap();
+                    }
+                    exact_bits(
+                        &actual_bits,
+                        &expected.read_storage_bytes().unwrap(),
+                        &format!(
+                            "actual Matmul n={n} rank3={rank_three} pattern={pattern} reference weight stride={stride_weight}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires pinned CUDA and EFFECT_TORCH_CUDA_ORDINARY_K16_PTX"]
+fn ordinary_k16_matmul_late_error_cancel_concurrent_and_retained_outputs() {
+    assert!(!std::env::var(crate::cublas::ordinary_k16::PATH_ENV)
+        .unwrap()
+        .is_empty());
+    let device = device();
+    let n = 2048;
+    let weight = Node::new(NodeKind::Permute {
+        a: input(1, &[n, 2816]),
+        dims: vec![1, 0],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::Matmul {
+        a: input(0, &[1, 256, 2816]),
+        b: weight,
+    })
+    .unwrap();
+    let executable = Arc::new(crate::compile(vec![root, input(2, &[1])], 0).unwrap());
+    let bindings = vec![
+        host(&device, vec![1, 256, 2816], &vec![1.; 256 * 2816]),
+        host(&device, vec![n, 2816], &vec![1.; n * 2816]),
+        host(&device, vec![1], &[0.]),
+    ];
+    let retained = executable
+        .execute(&bindings, &[], &CancellationFlag::new())
+        .unwrap();
+    let retained_bits = retained[0].read_storage_bytes().unwrap();
+    let mut invalid = bindings.clone();
+    invalid[2] = host(&device, vec![2], &[0., 0.]);
+    assert!(executable
+        .execute(&invalid, &[], &CancellationFlag::new())
+        .is_err());
+    let cancelled = CancellationFlag::new();
+    let count = std::cell::Cell::new(0);
+    let result = executable.execute_with_gemm_hook(&bindings, &cancelled, &|| {
+        count.set(count.get() + 1);
+        cancelled.cancel();
+    });
+    assert_eq!(count.get(), 1);
+    assert!(matches!(result,Err(ref e) if e=="operation aborted"));
+    let workers = (1..=3)
+        .map(|factor| {
+            let executable = executable.clone();
+            let mut bindings = bindings.clone();
+            bindings[0] = host(
+                &device,
+                vec![1, 256, 2816],
+                &vec![factor as f64; 256 * 2816],
+            );
+            std::thread::spawn(move || {
+                let output = executable
+                    .execute(&bindings, &[], &CancellationFlag::new())
+                    .unwrap();
+                assert_eq!(
+                    output[0].readback().unwrap(),
+                    vec![2816. * factor as f64; 256 * n]
+                );
+                output
+            })
+        })
+        .collect::<Vec<_>>();
+    let outputs = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    drop(executable);
+    drop(bindings);
+    drop(invalid);
+    assert_eq!(retained[0].read_storage_bytes().unwrap(), retained_bits);
+    for (index, output) in outputs.into_iter().enumerate() {
+        assert_eq!(
+            output[0].readback().unwrap(),
+            vec![2816. * (index + 1) as f64; 256 * n]
+        );
     }
 }

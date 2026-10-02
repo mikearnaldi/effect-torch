@@ -108,6 +108,10 @@ export interface CompileOptions {
   readonly canvasLengths?: ReadonlyArray<number>
   /** Default is no selected readouts. Counts do not constrain index order. */
   readonly selectedReadouts?: ReadonlyArray<SelectedReadoutShape>
+  /** Compile full logits into the denoiser invocation. Defaults to false. */
+  readonly fuseFullReadout?: boolean
+  /** Retain immutable position inputs per prefix and configured canvas width. Defaults to false. */
+  readonly cachePositions?: boolean
   readonly compile?: { readonly optimize?: boolean }
 }
 
@@ -139,6 +143,7 @@ export interface Prefix {
   readonly [PrefixTypeId]: {
     readonly owner: object
     readonly snapshot: Tensor.KvSnapshot
+    readonly positions: ReadonlyMap<number, Tensor.Concrete>
   }
 }
 
@@ -175,6 +180,18 @@ export interface Artifact {
     canvas: Uint32Array,
     prediction: Prediction
   ) => Effect.Effect<Tensor.Concrete, InferenceError | Tensor.TensorError, Runtime.Runtime>
+  /** Executes a stateless processor after evaluation and reads its second output as F32. */
+  readonly evaluateProcessed: (
+    prefix: Prefix,
+    canvas: Uint32Array,
+    prediction: Prediction,
+    processor: Tensor.CompiledProgram,
+    scalar: number
+  ) => Effect.Effect<
+    { readonly device: Tensor.Concrete; readonly host: Float32Array },
+    InferenceError | Tensor.TensorError,
+    Runtime.Runtime
+  >
   readonly score: (
     prefix: Prefix,
     canvas: Uint32Array,
@@ -200,7 +217,8 @@ const selectionKey = (shape: SelectedReadoutShape) => `${shape.rows}:${shape.lab
 interface CanvasPrograms {
   readonly initial: Tensor.DecodeProgram
   readonly refinement: Tensor.DecodeProgram
-  readonly full: Tensor.CompiledProgram
+  readonly full: Tensor.CompiledProgram | undefined
+  readonly scoringInitial: Tensor.DecodeProgram
   readonly selected: ReadonlyMap<string, Tensor.CompiledProgram>
 }
 
@@ -210,8 +228,10 @@ const input = (slot: number, shape: ReadonlyArray<number>, dtype: Tensor.DType) 
 /**
  * Materializes one parameter generation and eagerly compiles all configured
  * encoder and initial/refinement denoiser through Tensor.compileDecodeProgram.
- * Full and selected stateless readouts use Tensor.freezeProgram. All native
- * programs retain the same parameter generation.
+ * By default full and selected stateless readouts use Tensor.freezeProgram.
+ * With fuseFullReadout, full logits are part of the read-only denoiser program;
+ * selected reads keep a separate hidden-state entry point and stateless readout.
+ * All native programs retain the same parameter generation.
  *
  * @since 0.1.0
  * @category compilation
@@ -321,7 +341,6 @@ export const compile = (
           const tokens = yield* input(0, [1, width], "u32")
           const positions = yield* input(1, [1, width], "u32")
           const initialHidden = yield* definition.denoise(parameters, tokens, positions, { _tag: "Initial" })
-          const initial = yield* compile(initialHidden, "ReadOnly")
           const previous = yield* input(2, [1, width, definition.vocabSize], definition.predictionDtype)
 
           const refined = yield* definition.denoise(parameters, tokens, positions, {
@@ -333,7 +352,6 @@ export const compile = (
             return yield* invalid("inference", "refinement hidden state must match the initial hidden state")
           }
 
-          const refinement = yield* compile(refined, "ReadOnly")
           const hidden = yield* input(0, initialHidden.shape, initialHidden.dtype)
           const fullLogits = yield* definition.readout(parameters, hidden, { _tag: "Full" })
 
@@ -341,7 +359,28 @@ export const compile = (
             return yield* invalid("inference", "full readout must return f32 [1, canvasLength, vocabSize]")
           }
 
-          const full = yield* Tensor.freezeProgram([fullLogits], { ...config.compile, constantWeights: true })
+          const fullRoot = (hidden: Tensor.Any) =>
+            Effect.gen(function*() {
+              const logits = yield* definition.readout(parameters, hidden, { _tag: "Full" })
+              if (logits.dtype !== "f32" || !shapeMatches(logits.shape, [1, width, definition.vocabSize])) {
+                return yield* invalid("inference", "full readout must return f32 [1, canvasLength, vocabSize]")
+              }
+              return logits
+            })
+          const initial = yield* compile(
+            config.fuseFullReadout ? yield* fullRoot(initialHidden) : initialHidden,
+            "ReadOnly"
+          )
+          const refinement = yield* compile(
+            config.fuseFullReadout ? yield* fullRoot(refined) : refined,
+            "ReadOnly"
+          )
+          const full = config.fuseFullReadout
+            ? undefined
+            : yield* Tensor.freezeProgram([fullLogits], { ...config.compile, constantWeights: true })
+          const scoringInitial = config.fuseFullReadout && selectedReadouts.length > 0
+            ? yield* compile(initialHidden, "ReadOnly")
+            : initial
           const selected = new Map<string, Tensor.CompiledProgram>()
 
           for (const shape of selectedReadouts) {
@@ -359,7 +398,7 @@ export const compile = (
             )
           }
 
-          canvases.set(width, { initial, refinement, full, selected })
+          canvases.set(width, { initial, refinement, full, scoringInitial, selected })
         }
 
         const geometry = schema!
@@ -399,18 +438,19 @@ export const compile = (
         const inputs = (
           tokens: Uint32Array,
           width: number,
-          offset: number
+          offset: number,
+          cachedPositions?: Tensor.Concrete
         ): Effect.Effect<Array<Tensor.Any>, Tensor.TensorError, Runtime.Runtime> =>
           Effect.gen(function*() {
             const padded = new Uint32Array(width)
             padded.set(tokens)
 
-            const positions = Uint32Array.from({ length: width }, (_, row) =>
-              Math.min(offset + row, definition.maxPositions - 1))
-
             return [
               yield* Tensor.fromTypedArray(padded, [1, width]),
-              yield* Tensor.fromTypedArray(positions, [1, width])
+              cachedPositions ?? (yield* Tensor.fromTypedArray(
+                Uint32Array.from({ length: width }, (_, row) => Math.min(offset + row, definition.maxPositions - 1)),
+                [1, width]
+              ))
             ]
           })
 
@@ -421,6 +461,8 @@ export const compile = (
         ) =>
           Effect.suspend(() => {
             let acquired: Tensor.KvSnapshot | undefined
+            const cachedPositions = new Map<number, Tensor.Concrete>()
+            const ownedPositions: Array<Tensor.Concrete> = []
 
             return Effect.scoped(Effect.gen(function*() {
               const sequence = yield* Effect.acquireRelease(
@@ -451,21 +493,43 @@ export const compile = (
                 })
               ))
 
+              // Finish the immutable cache before publishing the prefix. Concurrent
+              // first reads therefore borrow the same already-owned concrete inputs.
+              if (config.cachePositions === true) {
+                for (const width of canvasLengths) {
+                  const positions = yield* Tensor.fromTypedArray(
+                    Uint32Array.from({ length: width }, (_, row) =>
+                      Math.min(retained.tokenCount + row, definition.maxPositions - 1)),
+                    [1, width]
+                  )
+                  yield* Tensor.compute([positions]).pipe(Effect.onExit((exit) =>
+                    Effect.sync(() => {
+                      if (Exit.isSuccess(exit)) {
+                        ownedPositions.push(...exit.value)
+                        cachedPositions.set(width, exit.value[0]!)
+                      }
+                    })
+                  ))
+                }
+              }
+
               return {
                 tokenCount: retained.tokenCount,
                 bytes: retained.retainedBytes,
-                [PrefixTypeId]: { owner, snapshot: retained }
+                [PrefixTypeId]: { owner, snapshot: retained, positions: cachedPositions }
               }
             })).pipe(Effect.onExit((exit) =>
-              Exit.isFailure(exit) && acquired !== undefined
-                ? Effect.orDie(Tensor.releaseKvPrefix(acquired))
+              Exit.isFailure(exit)
+                ? (acquired === undefined ? Effect.void : Effect.orDie(Tensor.releaseKvPrefix(acquired))).pipe(
+                  Effect.ensuring(Tensor.clearAll(ownedPositions))
+                )
                 : Effect.void
             ))
           })
 
         const run = (
           program: Tensor.DecodeProgram,
-          readout: Tensor.CompiledProgram,
+          readout: Tensor.CompiledProgram | undefined,
           bindings: ReadonlyArray<Tensor.Any>,
           selection: ReadonlyArray<Tensor.Any>,
           prefix: Tensor.KvSnapshot,
@@ -475,6 +539,16 @@ export const compile = (
             let acquired: ReadonlyArray<Tensor.Concrete> = []
 
             return Effect.scoped(Effect.gen(function*() {
+              if (readout === undefined) {
+                const outputs = yield* Tensor.runReadOnlyDecodeProgram(program, bindings, prefix, width).pipe(
+                  Effect.onExit((exit) =>
+                    Effect.sync(() => {
+                      if (Exit.isSuccess(exit)) acquired = exit.value
+                    })
+                  )
+                )
+                return outputs[0]!
+              }
               const hidden = yield* Effect.acquireRelease(
                 Tensor.runReadOnlyDecodeProgram(program, bindings, prefix, width),
                 Tensor.clearAll,
@@ -524,7 +598,12 @@ export const compile = (
                 return yield* invalid("evaluate", "canvas length has no compiled bucket")
               }
 
-              const bindings = yield* inputs(canvas, canvas.length, prefix.tokenCount)
+              const bindings = yield* inputs(
+                canvas,
+                canvas.length,
+                prefix.tokenCount,
+                prefix[PrefixTypeId].positions.get(canvas.length)
+              )
 
               if (prediction._tag === "Refinement") {
                 if (
@@ -549,6 +628,79 @@ export const compile = (
                 canvas.length
               )
             }),
+          evaluateProcessed: (prefix, canvas, prediction, processor, scalar) =>
+            Effect.suspend(() => {
+              let acquired: ReadonlyArray<Tensor.Concrete> = []
+              return Effect.scoped(Effect.gen(function*() {
+                const retained = yield* snapshot(prefix, "evaluateProcessed")
+                yield* validateTokens(canvas, prefix.tokenCount, "evaluateProcessed")
+                const bucket = canvases.get(canvas.length)
+                if (bucket === undefined) {
+                  return yield* invalid("evaluateProcessed", "canvas length has no compiled bucket")
+                }
+                if (processor.outputs.length !== 2 || processor.outputs[1]!.dtype !== "f32") {
+                  return yield* invalid("evaluateProcessed", "processor requires a device output and F32 host output")
+                }
+                const hostInput = new Uint32Array(canvas)
+                const positions = prefix[PrefixTypeId].positions.get(canvas.length) ?? (yield* Tensor.fromTypedArray(
+                  Uint32Array.from({ length: canvas.length }, (_, row) =>
+                    Math.min(prefix.tokenCount + row, definition.maxPositions - 1)),
+                  [1, canvas.length]
+                ))
+                const bindings: Array<Tensor.Any> = [positions]
+                if (prediction._tag === "Refinement") {
+                  if (
+                    prediction.logits.dtype !== definition.predictionDtype ||
+                    !shapeMatches(prediction.logits.shape, [1, canvas.length, definition.vocabSize])
+                  ) {
+                    return yield* invalid("evaluateProcessed", "refinement logits metadata mismatch")
+                  }
+                  bindings.push(prediction.logits)
+                }
+                const body = prediction._tag === "Initial" ? bucket.initial : bucket.refinement
+                const fused = yield* Tensor.runProcessedReadOnlyDecodeProgram(
+                  body,
+                  bucket.full,
+                  processor,
+                  hostInput,
+                  [1, canvas.length],
+                  bindings,
+                  retained,
+                  canvas.length,
+                  scalar
+                )
+                  .pipe(Effect.onExit((exit) =>
+                    Effect.sync(() => {
+                      if (Exit.isSuccess(exit) && exit.value !== undefined) {
+                        acquired = [exit.value.device]
+                      }
+                    })
+                  ))
+                if (fused !== undefined) {
+                  return fused
+                }
+                const tokens = yield* Tensor.fromTypedArray(hostInput, [1, canvas.length])
+                const logits = yield* Effect.acquireRelease(
+                  run(body, bucket.full, [tokens, ...bindings], [], retained, canvas.length),
+                  Tensor.clear,
+                  { interruptible: true }
+                )
+                const outputs = yield* Effect.acquireRelease(
+                  Tensor.runProgram(processor, [logits], [scalar]).pipe(Effect.onExit((exit) =>
+                    Effect.sync(() => {
+                      if (Exit.isSuccess(exit)) {
+                        acquired = exit.value
+                      }
+                    })
+                  )),
+                  (values) =>
+                    Tensor.clearAll(values.slice(1)),
+                  { interruptible: true }
+                )
+                const host = Float32Array.from(yield* Tensor.toNumberArray(outputs[1]!))
+                return { device: outputs[0]!, host }
+              })).pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? Tensor.clearAll(acquired) : Effect.void))
+            }),
           score: (prefix, canvas, rows, labels) =>
             Effect.gen(function*() {
               const retained = yield* snapshot(prefix, "score")
@@ -567,16 +719,25 @@ export const compile = (
                 return yield* invalid("score", "row or label index is out of bounds")
               }
 
-              const bindings = yield* inputs(canvas, canvas.length, prefix.tokenCount)
+              const bindings = yield* inputs(
+                canvas,
+                canvas.length,
+                prefix.tokenCount,
+                prefix[PrefixTypeId].positions.get(canvas.length)
+              )
 
               const selection = [
                 yield* Tensor.fromTypedArray(new Uint32Array(rows), [rows.length]),
                 yield* Tensor.fromTypedArray(new Uint32Array(labels), [labels.length])
               ]
 
-              return yield* run(bucket.initial, selected, bindings, selection, retained, canvas.length)
+              return yield* run(bucket.scoringInitial, selected, bindings, selection, retained, canvas.length)
             }),
-          release: (prefix) => Effect.flatMap(snapshot(prefix, "release"), Tensor.releaseKvPrefix),
+          release: (prefix) =>
+            Effect.flatMap(snapshot(prefix, "release"), (retained) =>
+              Tensor.releaseKvPrefix(retained).pipe(
+                Effect.ensuring(Tensor.clearAll(prefix[PrefixTypeId].positions.values()))
+              )),
           inspect: (prefix) => Effect.flatMap(snapshot(prefix, "inspect"), Tensor.inspectKvPrefix)
         }
 
@@ -786,6 +947,12 @@ export interface GenerationOptions<Prefix, F, P, S, E, R> {
 export interface GenerationRequest<P, S, E = never, R = never>
   extends Omit<GenerationOptions<Prefix, Tensor.Any, P, S, E, R>, "callbacks">
 {
+  /** Optional compiled processing; selection precedes model execution. */
+  readonly processed?: {
+    readonly processor: Tensor.CompiledProgram
+    readonly scalar: (step: Step) => number
+    readonly decode: (host: Float32Array, block: Block, step: Step) => P
+  } | undefined
   readonly initialize: (
     block: Block
   ) => Effect.Effect<Owned<InitialCanvas<Tensor.Any>, R | Runtime.Runtime>, E, R | Runtime.Runtime>
@@ -976,6 +1143,30 @@ const generateWithProgram = <P, S, E, R>(
           ),
         evaluate: ({ prefix, canvas, feedback, block, step }) =>
           Effect.suspend(() => {
+            if (options.processed !== undefined) {
+              const processing = options.processed
+              let acquired: Tensor.Concrete | undefined
+              return program.evaluateProcessed(
+                prefix,
+                canvas,
+                feedback._tag === "Initial" ? { _tag: "Initial" } : { _tag: "Refinement", logits: feedback.value },
+                processing.processor,
+                processing.scalar(step)
+              ).pipe(
+                Effect.tap((result) =>
+                  Effect.sync(() => {
+                    acquired = result.device
+                  })
+                ),
+                Effect.map((result) => ({
+                  value: { prediction: processing.decode(result.host, block, step), feedback: result.device },
+                  release: Tensor.clear(result.device)
+                })),
+                Effect.onExit((exit) =>
+                  Exit.isFailure(exit) && acquired !== undefined ? Tensor.clear(acquired) : Effect.void
+                )
+              )
+            }
             let processed: Owned<Evaluation<P, Tensor.Any>, R | Runtime.Runtime> | undefined
 
             return Effect.scoped(Effect.gen(function*() {

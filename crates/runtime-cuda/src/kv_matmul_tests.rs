@@ -328,7 +328,11 @@ fn kv_gemm_full_canvas_changing_lengths_and_capture_rejection() {
                                     )
                                     .to_f64()
                                 };
-                                assert_eq!(actual[(h*tokens+t)*dim+d],expected,"D{dim} Q{tokens}/{valid} prefix{cursor} window{window:?} h{h} t{t} d{d}");
+                                assert_eq!(
+                                    actual[(h * tokens + t) * dim + d],
+                                    expected,
+                                    "D{dim} Q{tokens}/{valid} prefix{cursor} window{window:?} h{h} t{t} d{d}"
+                                );
                             }
                         }
                     }
@@ -508,7 +512,11 @@ fn kv_gemm_timing_full_geometries_after_exactness_checks() {
                     _ => None,
                 })
                 .unwrap();
-            eprintln!("KV_TIMING D={dim} Q={tokens} P={} causal={} workspaceBytes={scratch} candidateHostWallMs={candidate_ms:?} legacyHostWallMs={legacy_ms:?}",cursor+tokens,!bidirectional);
+            eprintln!(
+                "KV_TIMING D={dim} Q={tokens} P={} causal={} workspaceBytes={scratch} candidateHostWallMs={candidate_ms:?} legacyHostWallMs={legacy_ms:?}",
+                cursor + tokens,
+                !bidirectional
+            );
         }
     }
 }
@@ -601,7 +609,11 @@ fn kv_gemm_exact_lengths_padding_gqa_windows_and_retention() {
                                         )
                                         .to_f64()
                                     };
-                                    assert_eq!(output[((slot*heads+h)*tokens+t)*dim+d],expected,"D={dim} {access:?} retention={retention:?} window={window:?} slot={slot} head={h} token={t} dim={d}");
+                                    assert_eq!(
+                                        output[((slot * heads + h) * tokens + t) * dim + d],
+                                        expected,
+                                        "D={dim} {access:?} retention={retention:?} window={window:?} slot={slot} head={h} token={t} dim={d}"
+                                    );
                                 }
                             }
                         }
@@ -734,3 +746,9 @@ fn kv_gemm_captured_context_matches_independent_oracle_and_old_witness() {
         }
     }
 }
+
+#[path = "kv_bf16_input_tests.rs"]
+mod kv_bf16_input_tests;
+
+#[path = "vnorm_store_tests.rs"]
+mod vnorm_store_tests;
