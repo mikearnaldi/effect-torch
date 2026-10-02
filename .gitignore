@@ -11,3 +11,7 @@ bench-results/
 .bench/
 __pycache__/
 *.py[cod]
+
+# Local session handoffs
+/CONTINUATION*.md
+/HANDOFF*.md

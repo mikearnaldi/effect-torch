@@ -1176,8 +1176,9 @@ The program reports compilation and execution phases, random-input preparation,
 and sampler costs. Set `evidenceDirectory` to a fresh directory to retain
 partial execution records. Recorded-reference replay uses `generationReference`
 and verifies random-file hashes, refinement argmax tokens, and final output.
-See [RFC 0027 progress](docs/rfcs/0027-implementation.md) for backend and
-full-checkpoint validation results.
+See the [DiffusionGemma benchmarks](packages/bench/diffusion-gemma/README.md)
+and [reproduction bundle](packages/bench/diffusion-gemma/reproduction/README.txt)
+for measured CUDA results, validation evidence, and reproduction instructions.
 
 ## Chat
 

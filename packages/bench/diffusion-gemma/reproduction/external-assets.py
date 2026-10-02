@@ -51,7 +51,7 @@ def main():
         print(json.dumps({'status': 'verified' if args.command == 'verify-archive' else 'restored',
                           'sha256': expected['sha256'], 'sizeBytes': expected['sizeBytes']}))
         return
-    plan = json.loads((HERE / 'external-assets-plan.json').read_text())
+    plan = json.loads((HERE / 'external-assets.json').read_text())
     def mapped(remote):
         path = Path(remote)
         if not path.is_absolute() or '..' in path.parts:

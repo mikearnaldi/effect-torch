@@ -1,7 +1,6 @@
 {
   "schemaVersion": 1,
-  "kind": "diffusion-gemma-pre-destruction-dependency-plan",
-  "authority": "read-only local audit; root ownsremote backup/destruction",
+  "kind": "diffusion-gemma-reproduction-dependencies",
   "evidenceSources": [
     "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/natural/provenance.json",
     "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/timing128/provenance.json",
@@ -258,87 +257,6 @@
     "download": {
       "repo": "google/diffusiongemma-26B-A4B-it",
       "revision": "f7f5b7f5fa82ffc52addd066915886d497f5517b"
-    },
-    "mustCapture": [
-      "resolvedsnapshotpath",
-      "tokenizer/configSHA256",
-      "model.safetensors.index.json",
-      "checkpoint-manifest ifpresent",
-      "HFfileLFSsha256/size inventory to verifyredownload"
-    ]
-  },
-  "captureRemoteMetadata": [
-    "nvidia-smi GPU/driver",
-    "nvcc --version",
-    "Rust/cargo/Node/pnpm versions",
-    "pip freeze fromvllm0.24 andoracleenv",
-    "ldd andreadelf -d forbridge+cachedfusedmoe+tvmffi+releaseaddon+baselineaddon+tokenizeraddon",
-    "recursively captureanynonstandard absoluteELFdeps reportedbyldd",
-    "resolveandincludeallbank/oracle/modelmetadata symlinktargets"
-  ],
-  "archiveRequirements": {
-    "memberPaths": "relative root/... hierarchy restored under/",
-    "dereferenceDataSymlinks": true,
-    "perFileManifest": [
-      "relativePath",
-      "sizeBytes",
-      "sha256"
-    ],
-    "compressedArchiveManifest": [
-      "archivePath",
-      "sizeBytes",
-      "sha256"
-    ],
-    "verifyAfterDownload": "extractlocallyorstreamarchive, verifyallmemberdigests AND guardpins beforepoddestruction",
-    "neverInclude": [
-      ".env",
-      ".cuda-devbox.env",
-      "SSHprivatekeys",
-      "HFtokens",
-      "RunPodcredentials"
-    ]
-  },
-  "knownSizes": {
-    "/root/oracle-eager-20260930": {
-      "localTotalBytes": 1614908784,
-      "scope": "localcopy only; remote actual size must be measured"
-    },
-    "/root/triton-normrope101-fulltables-screen-v2": {
-      "localTotalBytes": 420887,
-      "scope": "localcopy only; remote actual size must be measured"
-    },
-    "/root/triton-softmax100-screen-v1": {
-      "localTotalBytes": 265351,
-      "scope": "localcopy only; remote actual size must be measured"
-    },
-    "/root/triton-normalization98-screen-v1": {
-      "localTotalBytes": 229758,
-      "scope": "localcopy only; remote actual size must be measured"
-    },
-    "/root/combined97-100-101-release-entry-v1": {
-      "localTotalBytes": 147639,
-      "scope": "localcopy only; remote actual size must be measured"
-    },
-    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-runner-v1/source-v1.tar.gz": {
-      "bytes": 1622638,
-      "sha256": "54979d50b5cb2e5ae68ece16540d26150957210dc42c4cbfb74508067a3e337e"
-    },
-    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-entry-v1.tar.gz": {
-      "bytes": 54130,
-      "sha256": "69809aa47b5bdf6361e8e0c33821a3b4040ac483c3b2be4e1a3b891df69ab599"
     }
-  },
-  "skipRebuildableLargeCaches": [
-    "modelweightblobs atpinnedHFrevision",
-    "Cargo target",
-    "node_modules",
-    "entirePythonvenvs",
-    "generalvLLM/torchcompilecache beyondselectedPTX/cubin/SO"
-  ],
-  "remainingRemoteChecks": [
-    "bank payload size fromactualfiles; localinventoryhas14cases butnopayloadbytes",
-    "ELFdependencyclosure andexactSONAMEs",
-    "modelredownloadmanifest fromsnapshotmetadata",
-    "unknown files inselectedinputbankmanifests"
-  ]
+  }
 }

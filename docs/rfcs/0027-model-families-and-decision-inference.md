@@ -1,6 +1,8 @@
 # RFC 0027: Model families and decision inference
 
-- **Status**: Implementation in progress. See [implementation progress](0027-implementation.md).
+- **Status**: Implemented API and runtime contracts. See the
+  [migration guide](../autoregressive-model-migration.md) and
+  [benchmark reproduction instructions](../../packages/bench/diffusion-gemma/reproduction/README.txt).
 - **Created**: 2026-09-20
 - **Depends on**: [RFC 0005](0005-models.md), [RFC 0010](0010-inference.md),
   [RFC 0013](0013-batched-decode.md),
