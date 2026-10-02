@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "verifiedAt": "2026-10-02T07:07:54.769165+00:00",
+  "archivePath": "bench-results/devbox-archive-20261001/remote-root.tar.zst",
+  "sizeBytes": 33327808155,
+  "sha256": "6c16c512ad75ecf59058de5a72a433a783f1662c4fd4505dc9def4caaff833bc",
+  "format": "Concatenated zstd frames/tar streams; GNU tar --ignore-zeros required",
+  "storage": "Local private backup outside Git; copy this directory to durable storage before removing this workspace.",
+  "sourceCommit": "52c290b",
+  "inventoryVerification": {
+    "status": "passed",
+    "inventoryEntries": 296044,
+    "archiveEntries": 296044,
+    "counts": {
+      "regularFiles": 236879,
+      "hardlinks": 0,
+      "symlinks": 5204,
+      "directories": 53961
+    },
+    "payloadBytes": 59118287624,
+    "logicalFileBytes": 59118287624,
+    "verifiedFiles": 236879
+  },
+  "requiredGuardVerification": {
+    "status": "passed",
+    "guardedFiles": 123,
+    "mandatoryFiles": 7,
+    "requiredDirectories": 14
+  },
+  "companions": {
+    "inventory.jsonl": {
+      "path": "bench-results/devbox-archive-20261001/inventory.jsonl",
+      "sizeBytes": 69690575,
+      "sha256": "bde8afbe66b570f04c27020539a1a51e5072ea531bdfcca47063e344043bfdad"
+    },
+    "inventory-verification.json": {
+      "path": "bench-results/devbox-archive-20261001/inventory-verification.json",
+      "sizeBytes": 452,
+      "sha256": "43f81bd2017038006a2215f8c4c0412b4754736fe15ec02d344bedeeee81fb98"
+    },
+    "inventory-guards.json": {
+      "path": "bench-results/devbox-archive-20261001/inventory-guards.json",
+      "sizeBytes": 100,
+      "sha256": "62bb5f4c7bfe7ec5d832b6672b9e986ffa8308223dfd4137e008a011023549ed"
+    },
+    "environment.json": {
+      "path": "bench-results/devbox-archive-20261001/environment.json",
+      "sizeBytes": 44239,
+      "sha256": "065b1f3b6c5088ef8b828915f28c34a41b54823775c401060537a4905dee0b3d"
+    },
+    "toolchain.txt": {
+      "path": "bench-results/devbox-archive-20261001/toolchain.txt",
+      "sizeBytes": 360,
+      "sha256": "1dda6bda4accc3667d97924c9b2c06b7ae7e78ad0008c0a12b1972eb723a8b41"
+    },
+    "container-image.txt": {
+      "path": "bench-results/devbox-archive-20261001/container-image.txt",
+      "sizeBytes": 148,
+      "sha256": "279a73955fc274557fb4fc28b298a59651b2742cd8c17c995f236e37cb68cf77"
+    },
+    "nix-registration.txt": {
+      "path": "bench-results/devbox-archive-20261001/nix-registration.txt",
+      "sizeBytes": 1111093,
+      "sha256": "fd260a19f157186a05ddd6308cc28b7df27858e224f31f928081a405a3930475"
+    },
+    "dependency-plan.json": {
+      "path": "bench-results/devbox-archive-20261001/dependency-plan.json",
+      "sizeBytes": 24879,
+      "sha256": "fc28032c393076801876cf6810ea15d86247145e3da42bdbb2a1e80682d04c39"
+    },
+    "prepare-reproduction-backup.py": {
+      "path": "bench-results/devbox-archive-20261001/prepare-reproduction-backup.py",
+      "sizeBytes": 5022,
+      "sha256": "d57440f1d52d0993cb1fc06ce11fe3bb4a3f15879a072ff53e381981ad4a8677"
+    }
+  },
+  "localHistory": {
+    "path": "bench-results/devbox-archive-20261001/local-history.tar.zst",
+    "sizeBytes": 4042013199,
+    "sha256": "5a02bbf9842cbd5eb6c5e9d877d81654c61dd561d70c5473ca3e0a89b2199e65"
+  },
+  "preserved": [
+    "14 sealed feedback-bank cases and initialized oracle state",
+    "accepted and baseline native addons, exact guarded baseline sources and harnesses",
+    "selected PTX and FlashInfer bridge/modules",
+    "reference and vLLM Python environments, Nix store and registration",
+    "model metadata with pinned weight SHA256 values",
+    "historical scripts, receipts and local optimization evidence"
+  ],
+  "excluded": [
+    "credentials and private SSH keys",
+    "model weight blobs (download pinned revision and verify saved SHA256)",
+    "root workspace node_modules and Cargo target directories"
+  ],
+  "model": {
+    "repo": "google/diffusiongemma-26B-A4B-it",
+    "revision": "f7f5b7f5fa82ffc52addd066915886d497f5517b"
+  },
+  "containerImage": "ghcr.io/mikearnaldi/effect-torch:cuda-devbox@sha256:d0dea24ff0a4ed7119a34d17cb03ee9375a37f3a8e7a04f9fcd9e437ae56af66"
+}

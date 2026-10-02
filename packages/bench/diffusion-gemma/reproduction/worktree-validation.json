@@ -6,12 +6,14 @@
     "cargo fmt --all -- --check": "passed after formatting-only corrections",
     "cargo check -p effect-torch-runtime-cuda --features napi-addon": "passed (two unused-constant warnings)",
     "reproduce.py verify": "measured-goal-achieved",
-    "verify-inventory.py fixtures": "one positive and nine negative passed"
+    "verify-inventory.py fixtures": "one positive and nine negative passed",
+    "concatenated-archive-test.py": "passed: both tar/zstd streams verified and restored"
   },
   "frozenCandidateValidation": {
     "hostTestsPassed": 230,
     "gpuChecksPassed": 10,
     "naturalQuality": "12/12"
   },
-  "scope": "Frozen GPU candidate and raw receipts were verified previously on the pod; final local checks do not claim another inference measurement."
+  "scope": "Frozen GPU candidate and raw receipts were verified previously on the pod; final local checks do not claim another inference measurement.",
+  "preservation": "Complete remote inventory verified before provider-confirmed pod deletion; see external-backup.json and teardown.json."
 }

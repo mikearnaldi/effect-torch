@@ -119,8 +119,9 @@ shared table preparation are unimplemented proposals; no savings claims.
 ## Infrastructure and authorization
 
 Local `/home/michaelarnaldi/effect-torch`; remote `/root/effect-torch`.
-RunPod `ctdfyl5lyv09eg`, RTX PRO6000 Blackwell96GB.
-SSH root@103.196.86.151:12168, key `.cuda-devbox-ssh-key`.
+Former RunPod `ctdfyl5lyv09eg`, RTX PRO6000 Blackwell96GB, is **destroyed**.
+RunPod acknowledged deletion; the follow-up query returned404 `pod not found`.
+Paths below refer to the preserved archive, not a live machine.
 Model `/root/models/diffusiongemma`; oracle `/root/oracle-eager-20260930`;
 initialized RoPE `initialized-state/initialized-rope.safetensors`;
 sealed bank `/root/native66-fresh-distinct-v1`.
@@ -131,8 +132,20 @@ reproduction assets, committing the complete work on a branch, pushing and creat
 a PR. This supersedes the earlier no-commit/no-destruction handoff. Credentials
 and generated large dependencies remain outside Git. Never commit env files.
 
-Branch: `perf/diffusion-gemma-bf16-reproduction`. Teardown and verified archive
-receipts are recorded in the reproduction bundle when complete.
+Branch: `perf/diffusion-gemma-bf16-reproduction`. Implementation commit: `52c290b`.
+The branch is pushed; final preservation receipts accompany the PR.
+
+Backup: `bench-results/devbox-archive-20261001/remote-root.tar.zst`, with full
+`inventory.jsonl`, environment/toolchain/Nix registration metadata and a separate
+`local-history.tar.zst`. All296,044 entries and236,879 regular files passed
+size/hash verification before deletion; all123 required guard hashes matched.
+The archive preserves59,118,287,624 uncompressed file bytes. Large assets remain
+outside Git; model weights are downloaded at the pinned revision and checked
+against preserved hashes. Keep the complete backup directory.
+
+Committed reproduction tools and receipts:
+`packages/bench/diffusion-gemma/reproduction/README.txt`,
+`external-backup.json`, `teardown.json` and `worktree-validation.json`.
 
 Earlier history, including all original failed attempts and artifact references,
 is archived in `bench-results/diffusion-gemma-20260930/continuation-history-through101-release-v1.md`

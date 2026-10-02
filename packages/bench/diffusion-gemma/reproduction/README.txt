@@ -70,3 +70,9 @@ For manual restoration with GNU tar, --ignore-zeros is mandatory:
 tar --zstd --extract --ignore-zeros --file /path/to/remote-root.tar.zst --directory /fresh/restore-root --no-same-owner --keep-old-files
 
 Verify the final whole-archive checksum and merged inventory before extraction. concatenated-archive-test.py exercises two tiny zstd/tar frames through both the actual verifier and checksum-gated restore helper, including a supplemental nix/store/.../node_modules entry. It does not read or modify the real backup.
+
+Preserved environment companions
+
+The backup directory includes environment.json (GPU/driver, ELF dependency reports, Python package versions and model weight hashes), toolchain.txt, container-image.txt, and nix-registration.txt. Their byte sizes and SHA256 values are recorded in external-backup.json. After restoring the complete /nix/store on a dedicated matching machine, the saved registration can be imported with `nix-store --load-db < /path/to/nix-registration.txt`; review compatibility with the installed Nix version first. Nine system-library snapshots under usr/... are retained for dependency inspection; use the recorded container image rather than blindly replacing libraries on an unrelated host.
+
+The separately checksummed local-history.tar.zst contains the prior local diffusion-gemma-20260930 evidence/history directory. It is supplementary to the remote-root archive and is not needed by the exact final runner. Keep the complete backup directory together; its large archives are local assets outside Git.

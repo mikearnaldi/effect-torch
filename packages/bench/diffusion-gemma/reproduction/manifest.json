@@ -7,6 +7,7 @@
     "combined97-100-101-release-entry-v1.tar.gz": "69809aa47b5bdf6361e8e0c33821a3b4040ac483c3b2be4e1a3b891df69ab599",
     "combined97-100-101-release-runner-v1.tar.gz": "b0f8bbfec8176d2aafe18bcbebf3cccb4908e5146246daa8cd1ee5fb6f660c7d"
   },
-  "externalAssets": "external-assets-plan.json describes required remote-root dependencies; external-backup.json will pin the completed backup archive.",
-  "generationSources": "generation-sources.json"
+  "externalAssets": "external-assets-plan.json describes dependencies; external-backup.json pins the verified archive and companion metadata.",
+  "generationSources": "generation-sources.json",
+  "teardown": "teardown.json records provider-confirmed deletion after complete backup verification."
 }
