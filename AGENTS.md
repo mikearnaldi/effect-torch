@@ -2,7 +2,8 @@
 
 ## Structure
 
-- `packages/core`: backend-neutral TypeScript API for tensors, compilation, models, training, and inference.
+- `packages/core`: backend-neutral TypeScript API for tensors, compilation, training, and inference.
+- `packages/models`: concrete model definitions, checkpoint interpretation, and serving integrations.
 - `packages/backend-cpu`: CPU Effect layer, TypeScript adapter, native loader, and packaged addon.
 - `packages/backend-apple-native`: Metal equivalent. Builds and runtime tests require macOS.
 - `packages/tokenizers`: independent TypeScript API and Rust Node addon. It exchanges host-owned `Uint32Array` values with core.

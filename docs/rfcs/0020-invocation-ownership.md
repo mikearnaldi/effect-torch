@@ -43,6 +43,39 @@ Specialized ownership remains explicit:
 
 ## Decision
 
+### Layer-at-a-time execution and read-only prefixes
+
+`Model.executeLayers` uses ordinary invocations to materialize one layer at a
+time. Each layer returns the next hidden state and optional retained outputs.
+Execution releases the preceding hidden state after its last use. The final
+hidden state and retained outputs transfer to the caller; failure or interruption
+releases all partial results. Input tensors and model parameters remain borrowed.
+
+Cleanup is installed before execution starts. Each materialization records its
+owned handles from the success Exit in an onExit callback. Effect protects that
+callback from interruption, so registration does not depend on the awaiting
+generator continuing. An enclosing failure handler releases the recorded handles
+on failure or interruption. Execution inherits the caller's interruptibility.
+
+`Model.PrefixModel` defines embedding, prefill-layer, read-layer, and readout
+graphs. `Model.executor` supplies token validation, absolute positions, layer
+execution, observation, and output ownership. Model modules provide graph
+definitions; compiler options and diagnostic observers belong to the executor.
+DiffusionGemma uses this shared path through `Model.executor(DiffusionGemma.define(loaded))`.
+
+The shared prefill handoff records outputs and releases the final hidden state
+in execution's onExit success callback. Its enclosing failure handler releases
+the recorded outputs if interruption prevents the prefix from being returned.
+
+`Tensor.KvPrefix` groups caller-owned K/V tensors for read-only reuse. Layers
+may have different head counts, widths, dtypes, and retained lengths. Its
+`tokenCount` records the original prefix length independently of retained
+storage. Concurrent reads borrow the prefix, and `Tensor.clearKvPrefix` releases
+it after those reads finish. This uses ordinary tensor ownership rather than a
+mutable paged sequence. `KvPool` and `KvSequence` continue to own paged decode state.
+
+### Ownership boundaries
+
 Effect Torch adopts the following ownership model:
 
 | Concern | Owner | Reuse boundary |
@@ -603,7 +636,7 @@ outputs do not expire when the warm set is busy.
 
 Caller-bound outputs and donation require explicit APIs because both change
 ownership assumptions. They can begin as runtime-internal facilities for
-`Trainer` and `InferenceProgram` before becoming general public operations.
+`Trainer` and `Artifact` before becoming general public operations.
 
 ### Concurrency
 
@@ -670,7 +703,7 @@ general API must specify:
 Inference separates three layers:
 
 ```text
-InferenceProgram
+Artifact
   immutable plans and shared weights
 
 InferenceContext

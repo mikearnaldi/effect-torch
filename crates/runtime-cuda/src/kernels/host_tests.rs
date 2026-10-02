@@ -9,12 +9,62 @@ fn production_registry_matches_descriptor_entrypoints() {
     let mut names = HashSet::new();
     for name in TYPED_KERNELS {
         assert!(names.insert(name.to_string()));
-        assert!(TYPED_SOURCE.contains(&format!("void {name}(CudaKernelArgs a)")));
+        let signature = match *name {
+            "et_grouped_pointer_banks" => "EtGroupedPointerBanks a",
+            "et_expert_partial_pointer_banks" => "EtGroupedPointerBanks a, unsigned int first",
+            _ => "CudaKernelArgs a",
+        };
+        assert!(
+            [
+                TYPED_SOURCE,
+                TYPED_BINARY_SOURCE,
+                GROUPED_COPY_SOURCE,
+                GROUPED_ROWS_SOURCE,
+                EXPERT_ROUTE_RANK_SOURCE,
+                ORDERED_SORTED_SOURCE,
+                GROUPED_INVERSE_SOURCE,
+                FFN_TAIL_SOURCE,
+                FFN_NEXT_NORM63_SOURCE,
+                ROUTER_TAIL_SOURCE,
+                DUAL_ARGMAX_SOURCE,
+                RMS_RESIDUAL_SOURCE,
+                ATTN_FFN_ENTRANCE_SOURCE
+            ]
+            .iter()
+            .any(|source| source.contains(&format!("void {name}({signature})"))),
+            "missing typed entrypoint {name}"
+        );
     }
     for module in COMPUTE_MODULES {
         assert!(COMPUTE_WRAPPERS.contains(module.define.trim_start_matches("#define ")));
+        // Match the source set passed to compile_module in device.rs. Some
+        // entrypoints live beside their implementation rather than in the
+        // common wrappers; each registered name must still have one definition.
+        let sources = [
+            TYPED_HEADER,
+            F32_PRELUDE,
+            COMMON_SOURCE,
+            module.define,
+            module.source,
+            RNG_ARG80_SOURCE,
+            SAMPLER83_SOURCE,
+            COMPUTE_WRAPPERS,
+            ENTROPY_SOURCE,
+            ENTROPY81_SOURCE,
+            SMALL_SOFTMAX_SOURCE,
+            NORM_ROPE_SOURCE,
+        ];
         for name in module.kernels {
-            assert!(COMPUTE_WRAPPERS.contains(&format!("void {name}(CudaKernelArgs a)")));
+            let signature = format!("void {name}(CudaKernelArgs a)");
+            assert_eq!(
+                sources
+                    .iter()
+                    .map(|source| source.matches(&signature).count())
+                    .sum::<usize>(),
+                1,
+                "expected exactly one {} module entrypoint {name}",
+                module.name
+            );
             for suffix in ["f32", "f64"] {
                 assert!(names.insert(format!("{name}_{suffix}")));
             }
@@ -24,6 +74,58 @@ fn production_registry_matches_descriptor_entrypoints() {
         assert!(QUANTIZED_SOURCE.contains(&format!("void {name}(CudaKernelArgs a)")));
     }
     assert!(CACHE_SOURCE.contains("void et_kv_attention(CudaKernelArgs a)"));
+    assert!(COMPUTE_WRAPPERS.contains("void et_mean256_f32(CudaKernelArgs a)"));
+}
+
+fn run_host_kernel_test(argument: &str) {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory =
+        std::env::temp_dir().join(format!("cuda-binary-host-{}-{unique}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels/host-tests.cpp");
+    for f32_compute in [false, true] {
+        let executable = directory.join(if f32_compute { "host-f32" } else { "host-f64" });
+        let mut command = Command::new(&compiler);
+        command.args(["-std=c++17", "-O2", "-ffp-contract=off"]);
+        if f32_compute {
+            command.arg("-DET_TEST_F32");
+        }
+        let output = command
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&executable).arg(argument).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires a C++17 compiler with _Float16; does not require CUDA"]
+fn host_binary_broadcast_and_scalar_coercion() {
+    run_host_kernel_test("--binary-broadcast");
+}
+
+#[test]
+#[ignore = "requires a C++17 compiler with _Float16; does not require CUDA"]
+fn host_top_k_bitonic_matches_stable_order() {
+    run_host_kernel_test("--top-k");
 }
 
 #[test]
@@ -113,4 +215,10 @@ fn host_scalar_abi_and_canonical_packed_fixtures() {
         );
     }
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "requires a C++17 compiler with _Float16; does not require CUDA"]
+fn attention82_fallback_store_preserves_rounding_layout_and_redzones() {
+    run_host_kernel_test("--attention82-round");
 }

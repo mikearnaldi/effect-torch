@@ -260,6 +260,7 @@ impl From<NativeDType> for DType {
 #[napi(object)]
 pub struct NativeCompileOptions {
     pub optimize: Option<bool>,
+    pub random_seed: Option<u32>,
     pub constant_weights: Option<bool>,
 }
 
@@ -341,8 +342,100 @@ pub struct NativePackedCausalChainsLayout {
     pub rows_per_sequence: u32,
 }
 
+use effect_torch_runtime::{KvLayerDescriptor, StateAccessMode};
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeKvLayerDescriptor {
+    pub layer_id: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub dtype: NativeDType,
+    pub retention_window: Option<u32>,
+}
+
+impl From<KvLayerDescriptor> for NativeKvLayerDescriptor {
+    fn from(layer: KvLayerDescriptor) -> Self {
+        Self {
+            layer_id: layer.layer_id,
+            kv_heads: layer.kv_heads as u32,
+            head_dim: layer.head_dim as u32,
+            dtype: match layer.dtype {
+                DType::F16 => NativeDType::F16,
+                DType::BF16 => NativeDType::BF16,
+                DType::U8 => NativeDType::U8,
+                _ => NativeDType::F32,
+            },
+            retention_window: layer.retention.map(|value| value as u32),
+        }
+    }
+}
+
+fn state_access(access: Option<&str>) -> Result<StateAccessMode> {
+    match access {
+        None | Some("Append") | Some("append") => Ok(StateAccessMode::Append),
+        Some("ReadOnly") | Some("readOnly") | Some("read-only") => Ok(StateAccessMode::ReadOnly),
+        _ => Err(Error::new(
+            Status::InvalidArg,
+            "compile: invalid state access",
+        )),
+    }
+}
+
+fn pool_layers(
+    descriptors: Option<Vec<NativeKvLayerDescriptor>>,
+    layers: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    dtype: DType,
+) -> Result<Vec<KvLayerDescriptor>> {
+    let layers = descriptors.map_or_else(
+        || {
+            (0..layers)
+                .map(|layer_id| KvLayerDescriptor {
+                    layer_id: layer_id as u32,
+                    kv_heads,
+                    head_dim,
+                    dtype,
+                    retention: None,
+                })
+                .collect()
+        },
+        |layers| {
+            layers
+                .into_iter()
+                .map(|layer| KvLayerDescriptor {
+                    layer_id: layer.layer_id,
+                    kv_heads: layer.kv_heads as usize,
+                    head_dim: layer.head_dim as usize,
+                    dtype: layer.dtype.into(),
+                    retention: layer.retention_window.map(|value| value as usize),
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    for (index, layer) in layers.iter().enumerate() {
+        if layer.kv_heads == 0
+            || layer.head_dim == 0
+            || !matches!(
+                layer.dtype,
+                DType::F32 | DType::F16 | DType::BF16 | DType::U8
+            )
+            || layer.row_bytes().is_none()
+            || layer.layer_id as usize != index
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv pool: invalid layer descriptor",
+            ));
+        }
+    }
+    Ok(layers)
+}
+
 #[napi(object)]
 pub struct NativeKvStateSchema {
+    pub access: Option<String>,
     pub max_tokens: u32,
     pub block_size: u32,
     pub kv_dtype: NativeDType,
@@ -1385,6 +1478,14 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn top_k_indices(&self, k: u32) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::TopKIndices {
+            a: self.node.clone(),
+            k: k as usize
+        }))
+    }
+
+    #[napi]
     pub fn argmin(&self, dim: u32) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Argmin {
             a: self.node.clone(),
@@ -1449,6 +1550,71 @@ impl LazyTensor {
             scale,
             causal,
             window: attention_window(window)?,
+        }))
+    }
+
+    #[napi]
+    pub fn scaled_dot_product_attention_configured(
+        &self,
+        k: &LazyTensor,
+        v: &LazyTensor,
+        scale: f64,
+        causal: bool,
+        window: i64,
+        rounding: String,
+        layer_id: Option<u32>,
+        retention_window: Option<i64>,
+    ) -> Result<Self> {
+        let rounding = match rounding.as_str() {
+            "fused" => effect_torch_graph::AttentionRounding::Fused,
+            "stepwise" => effect_torch_graph::AttentionRounding::Stepwise,
+            _ => {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "unsupported attention rounding",
+                ))
+            }
+        };
+        let retention = match retention_window {
+            None => AttentionWindow::Inherit,
+            Some(-1) => AttentionWindow::Full,
+            Some(value) if value >= 0 => {
+                AttentionWindow::Local(usize::try_from(value).map_err(|_| {
+                    Error::new(Status::InvalidArg, "retention window is out of range")
+                })?)
+            }
+            _ => {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "retention window must be non-negative or -1 for full",
+                ))
+            }
+        };
+        lazy_ctor!(Node::new(NodeKind::SdpaConfigured {
+            q: self.node.clone(),
+            k: k.node.clone(),
+            v: v.node.clone(),
+            scale,
+            causal,
+            window: attention_window(window)?,
+            rounding,
+            layer_id,
+            retention,
+        }))
+    }
+
+    #[napi]
+    pub fn rotary_embedding_explicit(
+        &self,
+        positions: &LazyTensor,
+        inverse_frequencies: &LazyTensor,
+        layout: String,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::RotaryEmbeddingExplicit {
+            x: self.node.clone(),
+            positions: positions.node.clone(),
+            inverse_frequencies: inverse_frequencies.node.clone(),
+            layout: rotary_layout(&layout)?,
         }))
     }
 
@@ -1532,6 +1698,28 @@ impl LazyTensor {
             x: self.node.clone(),
             weight: weight.node.clone(),
             bias: bias.map(|value| value.node.clone()),
+        }))
+    }
+
+    #[napi]
+    pub fn grouped_expert_linear_rows(
+        &self,
+        weight: &LazyTensor,
+        indexes: &LazyTensor,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::GroupedExpertLinearRows {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+            indexes: indexes.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn expert_linear_rows(&self, weight: &LazyTensor, indexes: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::ExpertLinearRows {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+            indexes: indexes.node.clone(),
         }))
     }
 
@@ -1982,6 +2170,7 @@ struct ProgramCache {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ProgramCacheKey {
+    state: Option<KvStateSchema>,
     semantic_program: String,
     options: CompileOptions,
     target: TargetFingerprint,
@@ -2065,8 +2254,10 @@ pub struct Executable {
     state: Option<KvStateSchema>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct KvStateSchema {
+    access: StateAccessMode,
+    kv_layers: Vec<KvLayerDescriptor>,
     max_tokens: usize,
     block_size: usize,
     kv_dtype: DType,
@@ -2132,6 +2323,15 @@ impl KvStateSchema {
             None
         };
         Ok(Self {
+            access: state_access(schema.access.as_deref())?,
+            kv_layers: geometry
+                .kv_layers
+                .into_iter()
+                .map(|mut layer| {
+                    layer.dtype = kv_dtype;
+                    layer
+                })
+                .collect(),
             max_tokens,
             block_size,
             kv_dtype,
@@ -2156,30 +2356,20 @@ impl KvStateSchema {
                 .try_fold(1usize, |total, value| total.checked_mul(*value))
                 .ok_or_else(|| format!("compile: {label} byte size overflow"))
         };
-        let kv_elements = checked(
-            &[
-                self.layers,
-                self.max_tokens,
-                self.kv_heads,
-                self.head_dim,
-                2,
-            ],
-            "KV slab",
-        )?;
-        let mut bytes = kv_elements
-            .checked_mul(self.kv_dtype.size_in_bytes())
-            .ok_or_else(|| "compile: KV slab byte size overflow".to_string())?;
-        if self.kv_dtype == DType::U8 {
+        let mut bytes = 0usize;
+        for layer in &self.kv_layers {
+            let row = layer.row_bytes().ok_or("compile: KV row size overflow")?;
+            let scales = if layer.dtype == DType::U8 {
+                checked(&[layer.kv_heads, 2, 4], "KV scale")?
+            } else {
+                0
+            };
+            let row = row
+                .checked_add(scales)
+                .ok_or("compile: KV row size overflow")?;
             bytes = bytes
-                .checked_add(
-                    checked(
-                        &[self.layers, self.max_tokens, self.kv_heads, 2],
-                        "KV scale",
-                    )?
-                    .checked_mul(DType::F32.size_in_bytes())
-                    .ok_or_else(|| "compile: KV scale byte size overflow".to_string())?,
-                )
-                .ok_or_else(|| "compile: KV state byte size overflow".to_string())?;
+                .checked_add(checked(&[self.max_tokens, row], "KV slab")?)
+                .ok_or("compile: KV byte size overflow")?;
         }
         let kda_bytes = checked(
             &[
@@ -2302,6 +2492,7 @@ fn resolve_compile_options(native: Option<NativeCompileOptions>, stateful: bool)
         if let Some(optimize) = native.optimize {
             options.optimize = optimize;
         }
+        options.random_seed = native.random_seed.map(u64::from);
         if stateful || native.constant_weights.is_some() {
             options.inference = Some(InferenceOptions {
                 constant_weights: native.constant_weights.unwrap_or(false),
@@ -2409,20 +2600,23 @@ pub fn compile(
         .map(KvStateSchema::referenced_state_bytes)
         .transpose()
         .map_err(to_napi_err)?;
-    let state_plan = state
-        .zip(state_bytes)
-        .map(|(state, bytes)| executable::CpuStatePlan {
-            bytes,
-            cursor_slot: state.cursor_slot,
-            cursor_tensor: state.cursor_tensor,
-            batch: state
-                .packed_rows_per_sequence
-                .map_or(state.batch, |rows| state.batch * rows),
-        });
+    let state_plan =
+        state
+            .as_ref()
+            .zip(state_bytes)
+            .map(|(state, bytes)| executable::CpuStatePlan {
+                bytes,
+                cursor_slot: state.cursor_slot,
+                cursor_tensor: state.cursor_tensor,
+                batch: state
+                    .packed_rows_per_sequence
+                    .map_or(state.batch, |rows| state.batch * rows),
+            });
     let capabilities = CpuDTypeCapabilities::default();
     let effective_cache_key = cache_key
         .filter(|_| {
             std::env::var_os("EFFECT_TORCH_NO_EXECUTABLE_CACHE").is_none()
+                && program.options.random_seed.is_none()
                 && !program
                     .options
                     .inference
@@ -2430,6 +2624,7 @@ pub fn compile(
                     .is_some_and(|inference| inference.constant_weights)
         })
         .map(|semantic_program| ProgramCacheKey {
+            state: state.clone(),
             semantic_program,
             options: program.options.clone(),
             target: capabilities.fingerprint().clone(),
@@ -2688,6 +2883,11 @@ pub fn external_memory_bytes() -> i64 {
     EXTERNAL_MEMORY_BYTES.load(Ordering::Relaxed)
 }
 
+include!("prefix.rs");
+
+#[cfg(test)]
+mod prefix_tests;
+
 const HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -2818,10 +3018,11 @@ impl BlockStore {
 }
 
 struct PoolInner {
+    kv_layers: Vec<KvLayerDescriptor>,
+    explicit_layers: bool,
     k: Vec<pool::Slab>,
     v: Vec<pool::Slab>,
     scales: Vec<pool::Slab>,
-    kv_dtype: DType,
     kv_heads: usize,
     head_dim: usize,
     block_size: usize,
@@ -2978,6 +3179,9 @@ impl PoolInner {
 }
 
 struct SeqState {
+    // A serialized speculative shadow may reuse its exclusive source's unreachable tail.
+    transaction_tail: Option<u32>,
+    pub copied_bytes: usize,
     blocks: Vec<u32>,
     head: usize,
     cursor: usize,
@@ -3019,6 +3223,8 @@ impl SeqState {
 /// stages KV, KDA, and convolution updates during `run_command`, publishes
 /// them on `commit`, and drops staged work on `rollback`.
 struct KvContext {
+    access: StateAccessMode,
+    valid_lengths: Option<Vec<usize>>,
     pool: Arc<PoolInner>,
     slots: Vec<Option<Arc<Mutex<SeqState>>>>,
     advances: Vec<usize>,
@@ -3103,8 +3309,26 @@ impl KvContext {
     }
 }
 
+struct RetainedCpuBlock {
+    pool: Arc<PoolInner>,
+    index: usize,
+    block: u32,
+}
+
+impl Drop for RetainedCpuBlock {
+    fn drop(&mut self) {
+        self.pool.unref_block(self.block);
+    }
+}
+
+struct CpuSequenceFrontier {
+    blocks: usize,
+    copied_bytes: usize,
+    tail: Option<RetainedCpuBlock>,
+}
+
 struct CpuStateTransaction {
-    frontiers: Vec<Option<usize>>,
+    frontiers: Vec<Option<CpuSequenceFrontier>>,
     advances: Vec<usize>,
     cursors: Vec<usize>,
     eviction_starts: Vec<usize>,
@@ -3136,7 +3360,38 @@ impl executable::CpuState for Arc<KvContext> {
                 .div_ceil(self.pool.block_size)
                 .saturating_sub(state.blocks.len());
             state.blocks.reserve(additional);
-            frontiers.push(Some(state.blocks.len()));
+            let index = state.cursor / self.pool.block_size;
+            let tail = if self.access == StateAccessMode::Append
+                && state.cursor % self.pool.block_size != 0
+            {
+                state
+                    .blocks
+                    .get(index)
+                    .copied()
+                    .filter(|block| {
+                        self.pool
+                            .blocks
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .refcounts[*block as usize]
+                            > 1
+                    })
+                    .map(|block| {
+                        self.pool.ref_block(block);
+                        RetainedCpuBlock {
+                            pool: self.pool.clone(),
+                            index,
+                            block,
+                        }
+                    })
+            } else {
+                None
+            };
+            frontiers.push(Some(CpuSequenceFrontier {
+                blocks: state.blocks.len(),
+                copied_bytes: state.copied_bytes,
+                tail,
+            }));
             let advance = if self.advances.len() == self.slots.len() {
                 self.advances[lane]
             } else {
@@ -3290,7 +3545,8 @@ impl executable::CpuState for Arc<KvContext> {
                 layer,
                 window,
                 mode,
-            } => kv_attention_into(
+                rounding,
+            } => kv_attention_configured_into(
                 self,
                 *layer,
                 &inputs[0],
@@ -3299,6 +3555,7 @@ impl executable::CpuState for Arc<KvContext> {
                 *scale,
                 *window,
                 *mode,
+                *rounding,
                 &mut outputs[0],
                 &mut transaction.eviction_starts,
             ),
@@ -3321,6 +3578,10 @@ impl executable::CpuState for Arc<KvContext> {
         executable: &executable::CpuExecutable,
         values: &[Value],
     ) -> std::result::Result<(), String> {
+        if self.access == StateAccessMode::ReadOnly {
+            *self.transaction.lock().map_err(|error| error.to_string())? = None;
+            return Ok(());
+        }
         commit_recurrent_state(self, executable, values)?;
         {
             let transaction = self
@@ -3359,9 +3620,19 @@ impl executable::CpuState for Arc<KvContext> {
         for (slot, frontier) in self.slots.iter().zip(transaction.frontiers) {
             if let (Some(slot), Some(frontier)) = (slot, frontier) {
                 if let Ok(mut state) = slot.lock() {
-                    for block in state.blocks.split_off(frontier) {
+                    for block in state.blocks.split_off(frontier.blocks) {
                         self.pool.unref_block(block);
                     }
+                    if let Some(tail) = &frontier.tail {
+                        if state.blocks[tail.index] != tail.block {
+                            self.pool.ref_block(tail.block);
+                            self.pool.unref_block(std::mem::replace(
+                                &mut state.blocks[tail.index],
+                                tail.block,
+                            ));
+                        }
+                    }
+                    state.copied_bytes = frontier.copied_bytes;
                 }
             }
         }
@@ -3815,276 +4086,7 @@ fn commit_recurrent_state(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn kv_attention_into(
-    context: &KvContext,
-    layer: u32,
-    q: &Value,
-    k: &Value,
-    v: &Value,
-    scale: f64,
-    window: Option<usize>,
-    mode: KvAttentionMode,
-    output: &mut CpuDestination<'_>,
-    eviction_starts: &mut [usize],
-) -> err::Res<()> {
-    let dimensions = q.shape();
-    let rank = dimensions.len();
-    if rank < 4
-        || q.dtype() != DType::F32
-        || k.dtype() != DType::F32
-        || v.dtype() != DType::F32
-        || k.shape().len() != rank
-        || v.shape().len() != rank
-        || output.shape() != dimensions
-        || output.dtype() != DType::F32
-    {
-        return Err("kv attention: expected matching rank-4-or-higher f32 tensors".to_string());
-    }
-    let batch = dimensions[..rank - 3].iter().product::<usize>();
-    let (query_heads, tokens, width) = (
-        dimensions[rank - 3],
-        dimensions[rank - 2],
-        dimensions[rank - 1],
-    );
-    let kv_heads = k.shape()[rank - 3];
-    if k.shape()[..rank - 3] != dimensions[..rank - 3]
-        || v.shape()[..rank - 3] != dimensions[..rank - 3]
-        || v.shape()[rank - 3] != kv_heads
-        || kv_heads == 0
-        || !query_heads.is_multiple_of(kv_heads)
-        || k.shape()[rank - 2] != tokens
-        || v.shape()[rank - 2] != tokens
-        || k.shape()[rank - 1] != width
-        || v.shape()[rank - 1] != width
-    {
-        return Err("kv attention: incompatible grouped-query q/k/v shapes".to_string());
-    }
-    if batch != context.graph_rows() {
-        return Err(format!(
-            "kv attention: batch {batch} does not match {} graph rows",
-            context.graph_rows()
-        ));
-    }
-    let layer_index = layer as usize;
-    let scale = scale as f32;
-    let query_values: &[f32] = f32::storage_of(&q.tensor().buffer)
-        .ok_or_else(|| "kv attention: expected f32 query storage".to_string())?;
-    let query_stride = q.tensor().layout.strides()[rank - 1];
-    output.write::<f32, _>("kv attention output", &dimensions, |out| -> err::Res<()> {
-        out.fill(0.0);
-        for batch_index in 0..batch {
-            let Some((physical_lane, explicit_position)) = context.graph_row(batch_index) else {
-                continue;
-            };
-            let Some(slot) = &context.slots[physical_lane] else {
-                return Err(
-                    "kv attention: packed row maps to an inactive physical lane".to_string()
-                );
-            };
-            let mut state = slot
-                .lock()
-                .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
-            let planned_tokens = if context.packed.is_some() {
-                state.advance
-            } else {
-                tokens
-            };
-            let (cursor, needed, start) = kv_prepare(
-                &context.pool,
-                &mut state,
-                layer_index,
-                context.window,
-                mode,
-                kv_heads,
-                width,
-                planned_tokens,
-            )?;
-            let advance = state.advance;
-            let row_advance = if context.packed.is_some() { 1 } else { advance };
-            let row_position = if context.packed.is_some() {
-                if explicit_position < cursor || explicit_position >= needed {
-                    return Err(
-                        "kv attention: packed row position is outside its sequence advance"
-                            .to_string(),
-                    );
-                }
-                explicit_position
-            } else {
-                cursor
-            };
-            let physical = |position: usize| -> u32 {
-                state.blocks[position / context.pool.block_size] * context.pool.block_size as u32
-                    + (position % context.pool.block_size) as u32
-            };
-
-            let input_value =
-                |value: &Value, token: usize, head: usize, column: usize| -> err::Res<f32> {
-                    let logical =
-                        ((batch_index * kv_heads + head) * tokens + token) * width + column;
-                    tensor_element::<f32>(value.tensor(), logical, "kv attention input")
-                };
-            if context.pool.k[layer_index].dtype == DType::U8 {
-                for (value, slab, scales) in [
-                    (
-                        k,
-                        &context.pool.k[layer_index],
-                        &context.pool.scales[2 * layer_index],
-                    ),
-                    (
-                        v,
-                        &context.pool.v[layer_index],
-                        &context.pool.scales[2 * layer_index + 1],
-                    ),
-                ] {
-                    scales.write(|mut scale_values| {
-                        slab.write(|mut quantized| -> err::Res<()> {
-                            for token in 0..row_advance {
-                                let row = physical(row_position + token) as usize;
-                                for head in 0..kv_heads {
-                                    let mut maximum = 0.0f32;
-                                    for column in 0..width {
-                                        maximum = maximum
-                                            .max(input_value(value, token, head, column)?.abs());
-                                    }
-                                    let scale = maximum / 127.0 + 1e-12;
-                                    scale_values.set_f32(row * kv_heads + head, scale);
-                                    for column in 0..width {
-                                        let value = (input_value(value, token, head, column)?
-                                            / scale)
-                                            .round()
-                                            .clamp(-127.0, 127.0)
-                                            + 128.0;
-                                        quantized.set_u8(
-                                            (row * kv_heads + head) * width + column,
-                                            value as u8,
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(())
-                        })
-                    })?;
-                }
-            } else {
-                for (value, slab) in [
-                    (k, &context.pool.k[layer_index]),
-                    (v, &context.pool.v[layer_index]),
-                ] {
-                    slab.write(|mut destination| -> err::Res<()> {
-                        for token in 0..row_advance {
-                            let row = physical(row_position + token) as usize;
-                            for head in 0..kv_heads {
-                                for column in 0..width {
-                                    destination.set_f32(
-                                        (row * kv_heads + head) * width + column,
-                                        input_value(value, token, head, column)?,
-                                    );
-                                }
-                            }
-                        }
-                        Ok(())
-                    })?;
-                }
-            }
-
-            let mut attend = |keys: &pool::SlabReader<'_>,
-                              values: &pool::SlabReader<'_>,
-                              key_scales: Option<&pool::SlabReader<'_>>,
-                              value_scales: Option<&pool::SlabReader<'_>>|
-             -> err::Res<()> {
-                let cached = |reader: &pool::SlabReader<'_>,
-                              scales: Option<&pool::SlabReader<'_>>,
-                              position: usize,
-                              head: usize,
-                              column: usize|
-                 -> f32 {
-                    let row = physical(position) as usize;
-                    let raw = reader.get_f32((row * kv_heads + head) * width + column);
-                    scales.map_or(raw, |scales| {
-                        (raw - 128.0) * scales.get_f32(row * kv_heads + head)
-                    })
-                };
-                for head in 0..query_heads {
-                    let kv_head = head / (query_heads / kv_heads);
-                    for query in 0..row_advance {
-                        let end = if mode == KvAttentionMode::BidirectionalBlock {
-                            needed
-                        } else {
-                            (row_position + query + 1).min(needed)
-                        };
-                        let begin = window.map_or(start, |window| {
-                            if mode == KvAttentionMode::BidirectionalBlock {
-                                row_position.saturating_sub(window).max(start)
-                            } else {
-                                end.saturating_sub(window).max(start)
-                            }
-                        });
-                        // Resolve the row once. The inner dot products reuse its
-                        // base and column stride without rescanning the layout.
-                        let query_base = crate::tensor::source_index(
-                            &q.tensor().layout,
-                            ((batch_index * query_heads + head) * tokens + query) * width,
-                        );
-                        let mut maximum = f32::NEG_INFINITY;
-                        for position in begin..end {
-                            let mut score = 0.0f32;
-                            for column in 0..width {
-                                score += query_values[query_base + column * query_stride]
-                                    * cached(keys, key_scales, position, kv_head, column);
-                            }
-                            maximum = maximum.max(score * scale);
-                        }
-                        let mut denominator = 0.0f32;
-                        for position in begin..end {
-                            let mut score = 0.0f32;
-                            for column in 0..width {
-                                score += query_values[query_base + column * query_stride]
-                                    * cached(keys, key_scales, position, kv_head, column);
-                            }
-                            denominator += (score * scale - maximum).exp();
-                        }
-                        for column in 0..width {
-                            let mut result = 0.0f32;
-                            for position in begin..end {
-                                let mut score = 0.0f32;
-                                for depth in 0..width {
-                                    score += query_values[query_base + depth * query_stride]
-                                        * cached(keys, key_scales, position, kv_head, depth);
-                                }
-                                result += (score * scale - maximum).exp()
-                                    * cached(values, value_scales, position, kv_head, column);
-                            }
-                            out[((batch_index * query_heads + head) * tokens + query) * width
-                                + column] = result / denominator;
-                        }
-                    }
-                }
-                Ok(())
-            };
-            context.pool.k[layer_index].read(|keys| {
-                context.pool.v[layer_index].read(|values| {
-                    if context.pool.k[layer_index].dtype == DType::U8 {
-                        context.pool.scales[2 * layer_index].read(|key_scales| {
-                            context.pool.scales[2 * layer_index + 1].read(|value_scales| {
-                                attend(&keys, &values, Some(&key_scales), Some(&value_scales))
-                            })
-                        })
-                    } else {
-                        attend(&keys, &values, None, None)
-                    }
-                })
-            })?;
-            eviction_starts[physical_lane] = if eviction_starts[physical_lane] == usize::MAX {
-                start
-            } else {
-                eviction_starts[physical_lane].max(start)
-            };
-        }
-        Ok(())
-    })??;
-    Ok(())
-}
+include!("attention_state.rs");
 
 #[allow(clippy::too_many_arguments)]
 fn kv_prepare(
@@ -4103,7 +4105,7 @@ fn kv_prepare(
             pool.k.len()
         ));
     }
-    if heads != pool.kv_heads || width != pool.head_dim {
+    if heads != pool.kv_layers[layer].kv_heads || width != pool.kv_layers[layer].head_dim {
         return Err(format!(
             "kv attention: layer {layer} shape [{heads}, {width}] does not match pool geometry [{}, {}]",
             pool.kv_heads, pool.head_dim
@@ -4116,14 +4118,21 @@ fn kv_prepare(
             "kv attention: advance {advance} out of range for chunk length {tokens}"
         ));
     }
-    let needed = cursor + advance;
-    let start = window.map_or(0, |window| {
-        if mode == KvAttentionMode::BidirectionalBlock {
-            cursor.saturating_sub(window)
-        } else {
-            needed.saturating_sub(window)
-        }
-    });
+    let needed = cursor
+        .checked_add(advance)
+        .filter(|needed| *needed <= u32::MAX as usize)
+        .ok_or("kv attention: cursor overflow")?;
+    let start = if pool.explicit_layers {
+        pool.retention_start(cursor)
+    } else {
+        window.map_or(0, |window| {
+            if mode == KvAttentionMode::BidirectionalBlock {
+                cursor.saturating_sub(window)
+            } else {
+                needed.saturating_sub(window)
+            }
+        })
+    };
     if needed.saturating_sub(start) > pool.max_tokens {
         return Err(format!(
             "kv attention: live context {} exceeds pool capacity {}",
@@ -4131,6 +4140,7 @@ fn kv_prepare(
             pool.max_tokens
         ));
     }
+    pool.copy_shared_tail(state)?;
     while state.blocks.len() * pool.block_size < needed {
         let block = pool.alloc_block().ok_or_else(|| {
             format!(
@@ -4175,6 +4185,7 @@ impl NativeKvPool {
         block_size: Option<u32>,
         dtype: Option<NativeDType>,
         recurrent: Option<NativeRecurrentStateSchema>,
+        kv_layers: Option<Vec<NativeKvLayerDescriptor>>,
     ) -> Result<Self> {
         let dtype: DType = dtype.unwrap_or(NativeDType::F32).into();
         if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::U8) {
@@ -4214,13 +4225,13 @@ impl NativeKvPool {
             channels: recurrent.conv_channels as usize,
             kernel: recurrent.conv_kernel as usize,
         };
-        if layers == 0 && (kv_heads != 0 || head_dim != 0) {
+        if kv_layers.is_none() && layers == 0 && (kv_heads != 0 || head_dim != 0) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "kv pool: heads and head dim must be zero when layers is zero",
             ));
         }
-        if layers > 0 && (kv_heads == 0 || head_dim == 0) {
+        if kv_layers.is_none() && layers > 0 && (kv_heads == 0 || head_dim == 0) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "kv pool: layers, kv heads and head dim must be positive",
@@ -4250,23 +4261,40 @@ impl NativeKvPool {
                 "kv pool: convolution geometry must be entirely zero or entirely positive",
             ));
         }
-        let mut k = Vec::with_capacity(layers);
-        let mut v = Vec::with_capacity(layers);
-        let mut scales = Vec::with_capacity(layers * 2);
-        for _ in 0..layers {
-            k.push(pool::Slab::new(max_tokens, kv_heads * head_dim, dtype));
-            v.push(pool::Slab::new(max_tokens, kv_heads * head_dim, dtype));
-            if dtype == DType::U8 {
-                scales.push(pool::Slab::new(max_tokens, kv_heads, DType::F32));
-                scales.push(pool::Slab::new(max_tokens, kv_heads, DType::F32));
+        let explicit_layers = kv_layers.is_some();
+        let kv_layers = pool_layers(kv_layers, layers, kv_heads, head_dim, dtype)?;
+        let mut k = Vec::with_capacity(kv_layers.len());
+        let mut v = Vec::with_capacity(kv_layers.len());
+        let mut scales = Vec::with_capacity(kv_layers.len() * 2);
+        for layer in &kv_layers {
+            let width = layer
+                .kv_heads
+                .checked_mul(layer.head_dim)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "kv pool: layer size overflow"))?;
+            max_tokens
+                .checked_mul(width)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "kv pool: slab size overflow"))?;
+            k.push(pool::Slab::new(max_tokens, width, layer.dtype));
+            v.push(pool::Slab::new(max_tokens, width, layer.dtype));
+            for _ in 0..2 {
+                scales.push(pool::Slab::new(
+                    if layer.dtype == DType::U8 {
+                        max_tokens
+                    } else {
+                        0
+                    },
+                    layer.kv_heads,
+                    DType::F32,
+                ));
             }
         }
         Ok(Self {
             inner: Arc::new(PoolInner {
+                kv_layers,
+                explicit_layers,
                 k,
                 v,
                 scales,
-                kv_dtype: dtype,
                 kv_heads,
                 head_dim,
                 block_size,
@@ -4344,6 +4372,8 @@ impl NativeKvSequence {
             .collect();
         Self {
             state: Arc::new(Mutex::new(SeqState {
+                transaction_tail: None,
+                copied_bytes: 0,
                 blocks: Vec::with_capacity(pool.max_tokens / pool.block_size),
                 head: 0,
                 cursor: 0,
@@ -4572,10 +4602,7 @@ fn validate_pool_schema(schema: &KvStateSchema, pool: &PoolInner) -> Result<()> 
         .is_some_and(|window| window == 0 || window > schema.max_tokens)
         || pool.max_tokens != schema.max_tokens
         || pool.block_size != schema.block_size
-        || pool.kv_dtype != schema.kv_dtype
-        || pool.k.len() != schema.layers
-        || pool.kv_heads != schema.kv_heads
-        || pool.head_dim != schema.head_dim
+        || !pool.matches_layers(&schema.kv_layers)
         || pool.kda != schema.kda
         || pool.conv != schema.conv
     {
@@ -4828,6 +4855,18 @@ fn clone_speculative_state(
     let state = sequence_state
         .lock()
         .map_err(|error| format!("kv sequence lock poisoned: {error}"))?;
+    let transaction_tail = (state.cursor % pool.block_size != 0)
+        .then(|| state.blocks.get(state.cursor / pool.block_size).copied())
+        .flatten()
+        .filter(|block| {
+            state.transaction_tail == Some(*block)
+                || pool
+                    .blocks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .refcounts[*block as usize]
+                    == 1
+        });
     let mut blocks = Vec::with_capacity(state.blocks.len() + 1);
     for &block in &state.blocks {
         if !pool.ref_block(block) {
@@ -4839,6 +4878,8 @@ fn clone_speculative_state(
         blocks.push(block);
     }
     Ok(Arc::new(Mutex::new(SeqState {
+        transaction_tail,
+        copied_bytes: state.copied_bytes,
         blocks,
         head: state.head,
         cursor: state.cursor,
@@ -4877,12 +4918,14 @@ impl Executable {
 
     #[napi(getter)]
     pub fn batch(&self) -> u32 {
-        self.state.map_or(0, |state| state.batch as u32)
+        self.state.as_ref().map_or(0, |state| state.batch as u32)
     }
 
     #[napi(getter)]
     pub fn allows_window_eviction(&self) -> bool {
-        self.state.is_some_and(|state| state.allows_window_eviction)
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.allows_window_eviction)
     }
 
     #[napi(getter)]
@@ -4891,53 +4934,74 @@ impl Executable {
     }
 
     #[napi(getter)]
+    pub fn kv_layers(&self) -> Vec<NativeKvLayerDescriptor> {
+        self.state.as_ref().map_or_else(Vec::new, |state| {
+            state.kv_layers.iter().copied().map(Into::into).collect()
+        })
+    }
+
+    #[napi(getter)]
     pub fn layers(&self) -> u32 {
-        self.state.map_or(0, |state| state.layers as u32)
+        self.state.as_ref().map_or(0, |state| state.layers as u32)
     }
 
     #[napi(getter)]
     pub fn kv_heads(&self) -> u32 {
-        self.state.map_or(0, |state| state.kv_heads as u32)
+        self.state.as_ref().map_or(0, |state| state.kv_heads as u32)
     }
 
     #[napi(getter)]
     pub fn head_dim(&self) -> u32 {
-        self.state.map_or(0, |state| state.head_dim as u32)
+        self.state.as_ref().map_or(0, |state| state.head_dim as u32)
     }
 
     #[napi(getter)]
     pub fn kda_layers(&self) -> u32 {
-        self.state.map_or(0, |state| state.kda.layers as u32)
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.kda.layers as u32)
     }
 
     #[napi(getter)]
     pub fn kda_heads(&self) -> u32 {
-        self.state.map_or(0, |state| state.kda.heads as u32)
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.kda.heads as u32)
     }
 
     #[napi(getter)]
     pub fn kda_head_dim(&self) -> u32 {
-        self.state.map_or(0, |state| state.kda.head_dim as u32)
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.kda.head_dim as u32)
     }
 
     #[napi(getter)]
     pub fn kda_value_dim(&self) -> u32 {
-        self.state.map_or(0, |state| state.kda.value_dim as u32)
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.kda.value_dim as u32)
     }
 
     #[napi(getter)]
     pub fn conv_layers(&self) -> u32 {
-        self.state.map_or(0, |state| state.conv.layers as u32)
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.conv.layers as u32)
     }
 
     #[napi(getter)]
     pub fn conv_channels(&self) -> u32 {
-        self.state.map_or(0, |state| state.conv.channels as u32)
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.conv.channels as u32)
     }
 
     #[napi(getter)]
     pub fn conv_kernel(&self) -> u32 {
-        self.state.map_or(0, |state| state.conv.kernel as u32)
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.conv.kernel as u32)
     }
 
     /// Runs the program asynchronously on the worker pool.
@@ -4970,11 +5034,17 @@ impl Executable {
             advances.as_deref(),
             tokens.as_ref().map(Vec::len),
         )?;
-        let Some(schema) = self.state else {
+        let Some(schema) = self.state.clone() else {
             return self
                 .execute_stateless(inputs, scalars, cancellation_token)
                 .await;
         };
+        if schema.access != StateAccessMode::Append {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "execute: ReadOnly state requires executeReadOnly",
+            ));
+        }
         let sequences = sequences.expect("state invocation was validated");
         let slots = slots.expect("state invocation was validated");
         let active_mask = active_mask.expect("state invocation was validated");
@@ -5034,7 +5104,10 @@ impl Executable {
             .into_iter()
             .map(sampling_options)
             .collect::<Result<Vec<_>>>()?;
-        let schema = self.state.expect("sampled state invocation was validated");
+        let schema = self
+            .state
+            .clone()
+            .expect("sampled state invocation was validated");
         validate_fixed_lanes(
             &schema,
             sequences.len(),
@@ -5126,13 +5199,13 @@ impl Executable {
         eos_tokens: Vec<Vec<u32>>,
         cancellation_token: Option<&CancellationToken>,
     ) -> Result<SpeculativeExecution> {
-        let target_schema = self.state.ok_or_else(|| {
+        let target_schema = self.state.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
                 "executeSpeculative: target must be stateful",
             )
         })?;
-        let proposer_schema = proposer.state.ok_or_else(|| {
+        let proposer_schema = proposer.state.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
                 "executeSpeculative: proposer must be stateful",
@@ -5188,7 +5261,7 @@ impl Executable {
                     "executeSpeculative: target graph rows overflow",
                 )
             })?;
-        let token_slot = |executable: &Executable, schema: KvStateSchema, shape: [usize; 2]| {
+        let token_slot = |executable: &Executable, schema: &KvStateSchema, shape: [usize; 2]| {
             let slots = executable
                 .inner
                 .slots
@@ -5216,9 +5289,9 @@ impl Executable {
             }
             Ok(slots[0].dtype)
         };
-        let target_token_dtype = token_slot(self, target_schema, [target_graph_rows, 1])?;
+        let target_token_dtype = token_slot(self, &target_schema, [target_graph_rows, 1])?;
         let proposer_token_dtype =
-            token_slot(proposer, proposer_schema, [proposer_schema.batch, 1])?;
+            token_slot(proposer, &proposer_schema, [proposer_schema.batch, 1])?;
         if self.inner.executable.program.outputs.len() != 1
             || proposer.inner.executable.program.outputs.len() != proposer_schema.batch
         {
@@ -5468,6 +5541,8 @@ impl Executable {
                         1,
                     )?;
                     let context = Arc::new(KvContext {
+                        access: StateAccessMode::Append,
+                        valid_lengths: None,
                         pool: proposer_pool.clone(),
                         slots: lane_states,
                         advances,
@@ -5551,6 +5626,8 @@ impl Executable {
                     1,
                 )?;
                 let target_context = Arc::new(KvContext {
+                    access: StateAccessMode::Append,
+                    valid_lengths: None,
                     pool: target_pool.clone(),
                     slots: target_lanes,
                     advances: target_advances,
@@ -5713,6 +5790,8 @@ impl Executable {
                         1,
                     )?;
                     let context = Arc::new(KvContext {
+                        access: StateAccessMode::Append,
+                        valid_lengths: None,
                         pool: proposer_pool.clone(),
                         slots: lanes,
                         advances,
@@ -5793,6 +5872,8 @@ impl Executable {
                     };
                     let mut shadow = shadow.lock().map_err(|error| error.to_string())?;
                     let replacement = SeqState {
+                        transaction_tail: None,
+                        copied_bytes: 0,
                         blocks: std::mem::take(&mut shadow.blocks),
                         head: shadow.head,
                         cursor: shadow.cursor,
@@ -5864,7 +5945,7 @@ impl Executable {
         eos_tokens: Vec<Vec<u32>>,
         cancellation_token: Option<&CancellationToken>,
     ) -> Result<SpeculativeExecution> {
-        let schema = self.state.ok_or_else(|| {
+        let schema = self.state.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
                 "executeHistoryLookup: target must be stateful",
@@ -6096,6 +6177,8 @@ impl Executable {
                 }
                 let input = speculative_token_input(token_dtype, graph_rows, &verify_tokens, 1)?;
                 let context = Arc::new(KvContext {
+                    access: StateAccessMode::Append,
+                    valid_lengths: None,
                     pool: pool.clone(),
                     slots: lanes,
                     advances,
@@ -6242,6 +6325,8 @@ impl Executable {
                 for index in 0..count {
                     let mut staged = shadow[index].lock().map_err(|error| error.to_string())?;
                     let replacement = SeqState {
+                        transaction_tail: None,
+                        copied_bytes: 0,
                         blocks: std::mem::take(&mut staged.blocks),
                         head: staged.head,
                         cursor: staged.cursor,
@@ -6348,7 +6433,10 @@ impl Executable {
         token: Option<&CancellationToken>,
         prefix_metadata: Option<Arc<Mutex<DeferredPrefixMetadata>>>,
     ) -> Result<StatefulExecutionOutput> {
-        let schema = self.state.expect("stateful execution was validated");
+        let schema = self
+            .state
+            .clone()
+            .expect("stateful execution was validated");
         let batch = schema.batch;
         for (index, sequence) in sequences.iter().enumerate() {
             if sequence.released.load(Ordering::SeqCst) {
@@ -6414,6 +6502,8 @@ impl Executable {
             ));
         }
         let context = Arc::new(KvContext {
+            access: schema.access,
+            valid_lengths: None,
             pool: sequences[0].pool.clone(),
             slots: lane_states,
             advances: {
@@ -6479,7 +6569,10 @@ impl Executable {
                 validate_recurrent_state_schema(&schema, &state)?;
                 let frontier = state.cursor.checked_add(tokens[index].len());
                 if frontier.is_none()
-                    || (schema.window.is_none() && frontier.is_some_and(|value| value > max_tokens))
+                    || (schema.access == StateAccessMode::Append
+                        && schema.window.is_none()
+                        && context.pool.retention_start(state.cursor) == 0
+                        && frontier.is_some_and(|value| value > max_tokens))
                 {
                     return Err(Error::new(
                         Status::InvalidArg,
@@ -6577,6 +6670,9 @@ impl Executable {
                     return Err(to_napi_err(error));
                 }
             };
+            if schema.access == StateAccessMode::ReadOnly {
+                return Ok(output);
+            }
             if let Some(prefix_metadata) = &prefix_metadata {
                 let mut metadata = prefix_metadata.lock().map_err(|error| {
                     Error::new(
@@ -7232,15 +7328,14 @@ pub struct NativeInferenceDiagnostics {
     pub proposer_pool_high_water_blocks: Option<NativeU64>,
 }
 
-fn same_state(left: KvStateSchema, right: KvStateSchema) -> bool {
+fn same_state(left: &KvStateSchema, right: &KvStateSchema) -> bool {
     left.max_tokens == right.max_tokens
         && left.block_size == right.block_size
         && left.kv_dtype == right.kv_dtype
         && left.window == right.window
         && left.batch == right.batch
-        && left.layers == right.layers
-        && left.kv_heads == right.kv_heads
-        && left.head_dim == right.head_dim
+        && left.kv_layers == right.kv_layers
+        && left.access == right.access
         && left.kda == right.kda
         && left.conv == right.conv
 }
@@ -7248,6 +7343,7 @@ fn same_state(left: KvStateSchema, right: KvStateSchema) -> bool {
 fn inference_token_shape(executable: &Executable) -> Result<(usize, usize, DType)> {
     let schema = executable
         .state
+        .clone()
         .ok_or_else(|| inference_error("compile", "inference programs must be stateful"))?;
     let slots = executable
         .inner
@@ -7288,6 +7384,7 @@ fn validate_inference_program(
 ) -> Result<KvStateSchema> {
     let schema = executable
         .state
+        .clone()
         .ok_or_else(|| inference_error("compile", "inference program is stateless"))?;
     validate_pool_schema(&schema, &pool.inner)
         .map_err(|error| inference_error("compile", error.reason))?;
@@ -7316,6 +7413,7 @@ fn validate_replay_program(
 ) -> Result<KvStateSchema> {
     let schema = executable
         .state
+        .clone()
         .ok_or_else(|| inference_error("compile", "replay program is stateless"))?;
     validate_pool_schema(&schema, &pool.inner)
         .map_err(|error| inference_error("compile", error.reason))?;
@@ -7390,6 +7488,7 @@ fn validate_proposer_plan(
         let declared = ValueMetadata::native(&tap.value);
         let decode_output = target_decode
             .state
+            .as_ref()
             .map_or(root, |schema| dense_tap_output(schema.batch, root));
         if output_metadata(target_decode, decode_output).as_ref() != Some(&declared) {
             return Err(inference_error(
@@ -7515,7 +7614,7 @@ fn validate_proposer_plan(
             ));
         }
 
-        let schema = executable.state;
+        let schema = executable.state.clone();
         let tensor_slots = executable
             .inner
             .slots
@@ -7523,7 +7622,7 @@ fn validate_proposer_plan(
             .enumerate()
             .filter(|(slot, value)| {
                 !value.scalar
-                    && !schema.is_some_and(|state| {
+                    && !schema.as_ref().is_some_and(|state| {
                         state.cursor_tensor && *slot as u32 == state.cursor_slot
                     })
             })
@@ -7715,6 +7814,7 @@ fn validate_proposer_plan(
 fn batch_size_from(executable: &Executable) -> Result<usize> {
     executable
         .state
+        .as_ref()
         .map(|schema| schema.batch)
         .ok_or_else(|| inference_error("compile", "tap executable must be stateful"))
 }
@@ -7844,7 +7944,7 @@ pub fn compile_inference(
     )?;
     let decode_schema =
         validate_inference_program(target_decode, target_pool, batch_size, 1, token_dtype, None)?;
-    if !same_state(target_schema, decode_schema) {
+    if !same_state(&target_schema, &decode_schema) {
         return Err(inference_error(
             "compile",
             "target prefill/decode state schemas differ",
@@ -7892,7 +7992,7 @@ pub fn compile_inference(
             token_dtype,
             Some(width),
         )?;
-        if !same_state(target_schema, verify_schema) {
+        if !same_state(&target_schema, &verify_schema) {
             return Err(inference_error(
                 "compile",
                 "target verifier state schema differs",
@@ -7913,7 +8013,7 @@ pub fn compile_inference(
         )?;
         let proposer_decode_schema =
             validate_inference_program(decode, pool, batch_size, 1, token_dtype, None)?;
-        if !same_state(proposer_schema, proposer_decode_schema)
+        if !same_state(&proposer_schema, &proposer_decode_schema)
             || target_schema.max_tokens != proposer_schema.max_tokens
         {
             return Err(inference_error(
@@ -8059,10 +8159,10 @@ pub fn compile_inference(
             &plan.verify_taps,
             target_verify.expect("parallel bundle has verifier"),
         )?;
-        let stage_schema = plan.stages[0]
-            .executable
-            .state
-            .ok_or_else(|| inference_error("compile", "ParallelBlock stage must be stateful"))?;
+        let stage_schema =
+            plan.stages[0].executable.state.clone().ok_or_else(|| {
+                inference_error("compile", "ParallelBlock stage must be stateful")
+            })?;
         let stage_output = output_metadata(&plan.stages[0].executable, 0);
         let probability_output = output_metadata(&plan.stages[0].executable, 1);
         let expected_probability_output = has_probability_rows.then(|| ValueMetadata {
@@ -8073,9 +8173,9 @@ pub fn compile_inference(
                 schema.vocabulary as usize,
             ],
         });
-        if !same_state(prefill_schema, decode_replay_schema)
-            || !same_state(prefill_schema, verify_replay_schema)
-            || !same_state(prefill_schema, stage_schema)
+        if !same_state(&prefill_schema, &decode_replay_schema)
+            || !same_state(&prefill_schema, &verify_replay_schema)
+            || !same_state(&prefill_schema, &stage_schema)
             || stage_schema.packed_rows_per_sequence.is_some()
             || stage_output
                 != Some(ValueMetadata {
@@ -8498,7 +8598,10 @@ async fn prefill_sequences(
     prefix_metadata: Arc<Mutex<DeferredPrefixMetadata>>,
     replay: Option<PrefillReplay<'_>>,
 ) -> Result<Vec<Option<u32>>> {
-    let schema = executable.state.expect("inference prefill was validated");
+    let schema = executable
+        .state
+        .clone()
+        .expect("inference prefill was validated");
     let (_, chunk, _) = inference_token_shape(executable)?;
     let mut offsets = sequences
         .iter()
@@ -8650,10 +8753,15 @@ async fn execute_packed_shadow(
     input: Value,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<(Vec<Value>, DeferredPrefixMetadata)> {
-    let schema = executable.state.expect("packed verifier was validated");
+    let schema = executable
+        .state
+        .clone()
+        .expect("packed verifier was validated");
     let program = executable.inner.executable.clone();
     let generated_bindings = executable.inner.generated_bindings.clone();
     let context = Arc::new(KvContext {
+        access: StateAccessMode::Append,
+        valid_lengths: None,
         pool: pool.clone(),
         slots: {
             let mut lanes = vec![None; schema.batch];
@@ -9306,6 +9414,8 @@ async fn execute_parallel_block_detailed(
                             canonical.lock().unwrap_or_else(|error| error.into_inner());
                         let mut shadow = shadow.lock().unwrap_or_else(|error| error.into_inner());
                         let replacement = SeqState {
+                            transaction_tail: None,
+                            copied_bytes: 0,
                             blocks: std::mem::take(&mut shadow.blocks),
                             head: shadow.head,
                             cursor: shadow.cursor,
@@ -10337,6 +10447,7 @@ mod tests {
     fn cache_identity_includes_structural_target_and_policy() {
         let capabilities = CpuDTypeCapabilities::default();
         let key = ProgramCacheKey {
+            state: None,
             semantic_program: "same-program".into(),
             options: CompileOptions::default(),
             target: capabilities.fingerprint().clone(),
@@ -10545,6 +10656,7 @@ mod tests {
                 .map(|timing| timing.phase.as_str())
                 .collect::<Vec<_>>(),
             [
+                "semantic_preparation",
                 "graph_index",
                 "optimization",
                 "target_legalization",
@@ -10595,6 +10707,14 @@ mod tests {
 
     fn test_state_schema() -> KvStateSchema {
         KvStateSchema {
+            access: StateAccessMode::Append,
+            kv_layers: vec![KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 2,
+                head_dim: 4,
+                dtype: DType::F32,
+                retention: None,
+            }],
             max_tokens: 8,
             block_size: 4,
             kv_dtype: DType::F32,
@@ -10614,10 +10734,17 @@ mod tests {
 
     fn test_schema_pool() -> PoolInner {
         PoolInner {
+            kv_layers: vec![KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 2,
+                head_dim: 4,
+                dtype: DType::F32,
+                retention: None,
+            }],
+            explicit_layers: false,
             k: vec![pool::Slab::new(8, 8, DType::F32)],
             v: vec![pool::Slab::new(8, 8, DType::F32)],
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 2,
             head_dim: 4,
             block_size: 4,
@@ -10711,6 +10838,7 @@ mod tests {
         let second_root = graph(vec![3.0, 4.0]);
         let constant_options = || NativeCompileOptions {
             optimize: None,
+            random_seed: None,
             constant_weights: Some(true),
         };
         let key = Some("cpu-constant-weight-cache-suppression-test".to_string());
@@ -10871,31 +10999,40 @@ mod tests {
         let mismatches = [
             KvStateSchema {
                 max_tokens: 4,
-                ..schema
+                ..schema.clone()
             },
             KvStateSchema {
                 block_size: 2,
-                ..schema
+                ..schema.clone()
             },
             KvStateSchema {
-                kv_dtype: DType::F16,
-                ..schema
+                kv_layers: vec![KvLayerDescriptor {
+                    dtype: DType::F16,
+                    ..schema.kv_layers[0]
+                }],
+                ..schema.clone()
             },
             KvStateSchema {
-                layers: 2,
-                ..schema
+                kv_layers: vec![schema.kv_layers[0]; 2],
+                ..schema.clone()
             },
             KvStateSchema {
-                kv_heads: 1,
-                ..schema
+                kv_layers: vec![KvLayerDescriptor {
+                    kv_heads: 1,
+                    ..schema.kv_layers[0]
+                }],
+                ..schema.clone()
             },
             KvStateSchema {
-                head_dim: 2,
-                ..schema
+                kv_layers: vec![KvLayerDescriptor {
+                    head_dim: 2,
+                    ..schema.kv_layers[0]
+                }],
+                ..schema.clone()
             },
             KvStateSchema {
                 window: Some(9),
-                ..schema
+                ..schema.clone()
             },
         ];
         for mismatch in mismatches {
@@ -10903,6 +11040,8 @@ mod tests {
         }
 
         let mut state = SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 0,
@@ -10920,6 +11059,10 @@ mod tests {
     #[test]
     fn state_capacity_is_exact_and_propagated_to_the_plan() {
         let schema = KvStateSchema {
+            kv_layers: vec![KvLayerDescriptor {
+                dtype: DType::U8,
+                ..test_state_schema().kv_layers[0]
+            }],
             kv_dtype: DType::U8,
             kda: KdaGeometry {
                 layers: 1,
@@ -10986,10 +11129,17 @@ mod tests {
     #[test]
     fn packed_kv_scatter_uses_distinct_positions_and_padding_is_inactive() {
         let pool = Arc::new(PoolInner {
+            kv_layers: vec![KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 1,
+                head_dim: 1,
+                dtype: DType::F32,
+                retention: None,
+            }],
+            explicit_layers: false,
             k: vec![pool::Slab::new(4, 1, DType::F32)],
             v: vec![pool::Slab::new(4, 1, DType::F32)],
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 1,
             head_dim: 1,
             block_size: 4,
@@ -10999,6 +11149,8 @@ mod tests {
             blocks: Mutex::new(BlockStore::new(1)),
         });
         let state = Arc::new(Mutex::new(SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 0,
@@ -11010,6 +11162,8 @@ mod tests {
         }));
         let packed = PackedCausalRows::build(3, 1, &[0], &[0], &[2]).unwrap();
         let context = KvContext {
+            access: StateAccessMode::Append,
+            valid_lengths: None,
             pool: pool.clone(),
             slots: vec![Some(state.clone())],
             advances: vec![2],
@@ -11073,10 +11227,17 @@ mod tests {
             ),
         ] {
             let pool = Arc::new(PoolInner {
+                kv_layers: vec![KvLayerDescriptor {
+                    layer_id: 0,
+                    kv_heads: 1,
+                    head_dim: width,
+                    dtype: DType::F32,
+                    retention: None,
+                }],
+                explicit_layers: false,
                 k: vec![pool::Slab::new(4, width, DType::F32)],
                 v: vec![pool::Slab::new(4, width, DType::F32)],
                 scales: Vec::new(),
-                kv_dtype: DType::F32,
                 kv_heads: 1,
                 head_dim: width,
                 block_size: 4,
@@ -11086,6 +11247,8 @@ mod tests {
                 blocks: Mutex::new(BlockStore::new(1)),
             });
             let state = Arc::new(Mutex::new(SeqState {
+                transaction_tail: None,
+                copied_bytes: 0,
                 blocks: Vec::new(),
                 head: 0,
                 cursor: 0,
@@ -11096,6 +11259,8 @@ mod tests {
                 conv_states: Vec::new(),
             }));
             let context = KvContext {
+                access: StateAccessMode::Append,
+                valid_lengths: None,
                 pool,
                 slots: vec![Some(state)],
                 advances: vec![tokens],
@@ -11133,10 +11298,17 @@ mod tests {
     #[test]
     fn kv_attention_matches_sdpa() {
         let pool = Arc::new(PoolInner {
+            kv_layers: vec![KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 2,
+                head_dim: 4,
+                dtype: DType::F32,
+                retention: None,
+            }],
+            explicit_layers: false,
             k: vec![pool::Slab::new(8, 8, DType::F32)],
             v: vec![pool::Slab::new(8, 8, DType::F32)],
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 2,
             head_dim: 4,
             block_size: 4,
@@ -11146,6 +11318,8 @@ mod tests {
             blocks: Mutex::new(BlockStore::new(2)),
         });
         let state = Arc::new(Mutex::new(SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 0,
@@ -11156,6 +11330,8 @@ mod tests {
             conv_states: Vec::new(),
         }));
         let context = KvContext {
+            access: StateAccessMode::Append,
+            valid_lengths: None,
             pool,
             slots: vec![Some(state.clone())],
             advances: vec![3],
@@ -11283,10 +11459,17 @@ mod tests {
     #[test]
     fn block_attention_window_retains_committed_rows_plus_current_block() {
         let pool = Arc::new(PoolInner {
+            kv_layers: vec![KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 1,
+                head_dim: 1,
+                dtype: DType::F32,
+                retention: None,
+            }],
+            explicit_layers: false,
             k: vec![pool::Slab::new(8, 1, DType::F32)],
             v: vec![pool::Slab::new(8, 1, DType::F32)],
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 1,
             head_dim: 1,
             block_size: 4,
@@ -11296,6 +11479,8 @@ mod tests {
             blocks: Mutex::new(BlockStore::new(2)),
         });
         let mut state = SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 6,
@@ -11322,10 +11507,11 @@ mod tests {
     #[test]
     fn compiled_kda_commits_planned_next_state() {
         let pool = Arc::new(PoolInner {
+            kv_layers: Vec::new(),
+            explicit_layers: false,
             k: Vec::new(),
             v: Vec::new(),
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 0,
             head_dim: 0,
             block_size: 4,
@@ -11341,6 +11527,8 @@ mod tests {
             blocks: Mutex::new(BlockStore::new(2)),
         });
         let state = Arc::new(Mutex::new(SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 0,
@@ -11351,6 +11539,8 @@ mod tests {
             conv_states: Vec::new(),
         }));
         let context = Arc::new(KvContext {
+            access: StateAccessMode::Append,
+            valid_lengths: None,
             pool,
             slots: vec![Some(state.clone())],
             advances: vec![2],
@@ -11444,11 +11634,14 @@ mod tests {
 
     fn last_token_row_context(advance: usize) -> Arc<KvContext> {
         Arc::new(KvContext {
+            access: StateAccessMode::Append,
+            valid_lengths: None,
             pool: Arc::new(PoolInner {
+                kv_layers: Vec::new(),
+                explicit_layers: false,
                 k: Vec::new(),
                 v: Vec::new(),
                 scales: Vec::new(),
-                kv_dtype: DType::F32,
                 kv_heads: 0,
                 head_dim: 0,
                 block_size: 4,
@@ -11458,6 +11651,8 @@ mod tests {
                 blocks: Mutex::new(BlockStore::new(2)),
             }),
             slots: vec![Some(Arc::new(Mutex::new(SeqState {
+                transaction_tail: None,
+                copied_bytes: 0,
                 blocks: Vec::new(),
                 head: 0,
                 cursor: 0,
@@ -11538,6 +11733,8 @@ mod tests {
         )
         .unwrap();
         let active = Arc::new(Mutex::new(SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 7,
@@ -11548,6 +11745,8 @@ mod tests {
             conv_states: Vec::new(),
         }));
         let context = Arc::new(KvContext {
+            access: StateAccessMode::Append,
+            valid_lengths: None,
             pool: Arc::new(block_store_pool(2)),
             slots: vec![None, Some(active)],
             advances: vec![0, 2],
@@ -11612,6 +11811,7 @@ mod tests {
             .unwrap(),
         };
         let schema = NativeKvStateSchema {
+            access: None,
             max_tokens: 8,
             block_size: 4,
             kv_dtype: NativeDType::F32,
@@ -11646,6 +11846,7 @@ mod tests {
             vec![&logits, &hidden],
             None,
             Some(NativeKvStateSchema {
+                access: None,
                 max_tokens: 8,
                 block_size: 4,
                 kv_dtype: NativeDType::F32,
@@ -11678,6 +11879,7 @@ mod tests {
             .unwrap(),
         };
         let schema = |rows_per_sequence| NativeKvStateSchema {
+            access: None,
             max_tokens: 8,
             block_size: 4,
             kv_dtype: NativeDType::F32,
@@ -11701,10 +11903,11 @@ mod tests {
     #[test]
     fn compiled_short_conv_commits_planned_next_state() {
         let pool = Arc::new(PoolInner {
+            kv_layers: Vec::new(),
+            explicit_layers: false,
             k: Vec::new(),
             v: Vec::new(),
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 0,
             head_dim: 0,
             block_size: 4,
@@ -11718,6 +11921,8 @@ mod tests {
             blocks: Mutex::new(BlockStore::new(2)),
         });
         let state = Arc::new(Mutex::new(SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 0,
@@ -11728,6 +11933,8 @@ mod tests {
             conv_states: vec![Tensor::zeros(&[2, 2], DType::F32)],
         }));
         let context = Arc::new(KvContext {
+            access: StateAccessMode::Append,
+            valid_lengths: None,
             pool,
             slots: vec![Some(state.clone())],
             advances: vec![2],
@@ -11791,10 +11998,11 @@ mod tests {
 
     fn block_store_pool(blocks: usize) -> PoolInner {
         PoolInner {
+            kv_layers: Vec::new(),
+            explicit_layers: false,
             k: Vec::new(),
             v: Vec::new(),
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 1,
             head_dim: 1,
             block_size: 2,
@@ -11827,6 +12035,8 @@ mod tests {
     fn note_tokens_hashes_completed_blocks() {
         let pool = block_store_pool(2);
         let mut state = SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: vec![pool.alloc_block().unwrap(), pool.alloc_block().unwrap()],
             head: 0,
             cursor: 0,
@@ -11856,6 +12066,8 @@ mod tests {
         let pool = block_store_pool(1);
         let block = pool.alloc_block().unwrap();
         let mut state = SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: vec![block],
             head: 0,
             cursor: 0,
@@ -11898,6 +12110,8 @@ mod tests {
             std::thread::spawn(move || {
                 let target_block = target_pool.alloc_block().unwrap();
                 let mut target = SeqState {
+                    transaction_tail: None,
+                    copied_bytes: 0,
                     blocks: vec![target_block],
                     head: 0,
                     cursor: 0,
@@ -11917,6 +12131,8 @@ mod tests {
 
                 let proposer_block = proposer_pool.alloc_block().unwrap();
                 let mut proposer = SeqState {
+                    transaction_tail: None,
+                    copied_bytes: 0,
                     blocks: vec![proposer_block],
                     head: 0,
                     cursor: 0,
@@ -11962,6 +12178,8 @@ mod tests {
 
         let provisional = target_pool.alloc_block().unwrap();
         let mut target = SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: vec![provisional],
             head: 0,
             cursor: 0,
@@ -12047,6 +12265,8 @@ mod tests {
         let pool = Arc::new(block_store_pool(2));
         let original = pool.alloc_block().unwrap();
         let state = Arc::new(Mutex::new(SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: vec![original],
             head: 0,
             cursor: 1,
@@ -12078,10 +12298,17 @@ mod tests {
 
     fn hybrid_pool(blocks: usize) -> PoolInner {
         PoolInner {
+            kv_layers: vec![KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 1,
+                head_dim: 1,
+                dtype: DType::F32,
+                retention: None,
+            }],
+            explicit_layers: false,
             k: vec![pool::Slab::new(blocks * 2, 1, DType::F32)],
             v: vec![pool::Slab::new(blocks * 2, 1, DType::F32)],
             scales: Vec::new(),
-            kv_dtype: DType::F32,
             kv_heads: 1,
             head_dim: 1,
             block_size: 2,
@@ -12104,6 +12331,8 @@ mod tests {
 
     fn hybrid_state(kda_fill: f32, conv_fill: f32) -> SeqState {
         SeqState {
+            transaction_tail: None,
+            copied_bytes: 0,
             blocks: Vec::new(),
             head: 0,
             cursor: 0,
@@ -12269,6 +12498,7 @@ mod tests {
                 conv_channels: 2,
                 conv_kernel: 3,
             }),
+            None,
         )
         .unwrap();
         let tokens = vec![10, 11, 12, 13, 14];
@@ -12323,6 +12553,7 @@ mod tests {
                 conv_channels: 0,
                 conv_kernel: 0,
             }),
+            None,
         )
         .unwrap();
         assert_eq!(

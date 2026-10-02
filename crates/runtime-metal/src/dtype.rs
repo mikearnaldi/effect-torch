@@ -11,7 +11,7 @@ use effect_torch_runtime::{DType, StorageRepresentation};
 use objc2_metal::MTLDevice as _;
 
 /// Bump when classification or realization changes.
-pub(crate) const POLICY_REVISION: u64 = 4;
+pub(crate) const POLICY_REVISION: u64 = 7;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MetalDTypeCapabilities {
@@ -184,6 +184,12 @@ impl TargetDTypeCapabilities for MetalDTypeCapabilities {
             NodeKind::Arange { step, .. } if *step == 0.0 => {
                 unsupported(DTypeRequirement::Compute, "arange step must not be zero")
             }
+            NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+                unsupported(
+                    DTypeRequirement::Realization,
+                    "semantic operation requires native semantic preparation",
+                )
+            }
             NodeKind::Leaf(_)
             | NodeKind::Input { .. }
             | NodeKind::ScalarInput { .. }
@@ -213,6 +219,9 @@ impl TargetDTypeCapabilities for MetalDTypeCapabilities {
             | NodeKind::LastTokenRow { .. }
             | NodeKind::PositionEmbedding { .. }
             | NodeKind::Argmax { .. }
+            | NodeKind::TopKIndices { .. }
+            | NodeKind::ExpertLinearRows { .. }
+            | NodeKind::GroupedExpertLinearRows { .. }
             | NodeKind::Argmin { .. }
             | NodeKind::Cumsum { .. } => native(),
             NodeKind::Relu { .. } if !input_dtype.is_float() => native(),
@@ -351,6 +360,29 @@ impl TargetDTypeCapabilities for MetalDTypeCapabilities {
     }
 
     fn classify_region(&self, spec: &RegionDTypeSpec<'_>) -> DTypeDisposition {
+        if matches!(
+            spec.region,
+            NativeRegion::DualArgmax(_)
+                | NativeRegion::RouterTail(_)
+                | NativeRegion::AttentionFfnEntrance(_)
+                | NativeRegion::RmsResidual(_)
+                | NativeRegion::FfnNextNorm(_)
+                | NativeRegion::FfnTail(_)
+                | NativeRegion::VNormKvAttention(_)
+                | NativeRegion::NormRope(_)
+                | NativeRegion::GroupedExpertGated(_)
+                | NativeRegion::SmallSoftmax(_)
+                | NativeRegion::Entropy(_)
+                | NativeRegion::Bf16Softmax(_)
+                | NativeRegion::SharedRmsNorm(_)
+                | NativeRegion::ExpertRouteRank(_)
+                | NativeRegion::OrderedScatterReduce(_)
+        ) {
+            return unsupported(
+                DTypeRequirement::Region,
+                "ordered scatter fusion is not implemented on Metal",
+            );
+        }
         let Some(first) = spec.boundary_results.first() else {
             return unsupported(DTypeRequirement::Region, "region has no results");
         };

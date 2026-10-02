@@ -9,3 +9,9 @@ bench-results/
 .cuda-devbox-ssh-key
 .cuda-devbox-ssh-key.pub
 .bench/
+__pycache__/
+*.py[cod]
+
+# Local session handoffs
+/CONTINUATION*.md
+/HANDOFF*.md

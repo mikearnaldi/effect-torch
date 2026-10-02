@@ -63,6 +63,37 @@ mod tests {
     }
 
     #[test]
+    fn grouped_expert_projection_rejects_grad_and_vmap() {
+        let x = input(0, vec![2, 3]);
+        let indexes = Node::new(NodeKind::Zeros {
+            shape: vec![2],
+            dtype: DType::U32,
+            device: Device::Cpu(0),
+        })
+        .unwrap();
+        let output = Node::new(NodeKind::GroupedExpertLinearRows {
+            x: x.clone(),
+            weight: input(1, vec![4, 5, 3]),
+            indexes,
+        })
+        .unwrap();
+        let loss = Node::new(NodeKind::Sum {
+            a: output.clone(),
+            dims: vec![0, 1],
+            keepdims: false,
+        })
+        .unwrap();
+        assert!(grad(&loss, std::slice::from_ref(&x))
+            .err()
+            .unwrap()
+            .contains("groupedExpertLinearRows is inference-only"));
+        assert!(vmap(&output, &x, &input(2, vec![7, 2, 3]), 0)
+            .err()
+            .unwrap()
+            .contains("groupedExpertLinearRows requires explicit flattened rows"));
+    }
+
+    #[test]
     fn reverse_mode_builds_gradients_from_the_production_graph() {
         let x = input(0, vec![3]);
         let square = Node::new(NodeKind::Mul {
@@ -97,6 +128,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(grad(&loss, &[x]).unwrap()[0].shape, [3]);
+    }
+
+    #[test]
+    fn top_k_indices_rejects_grad_and_preserves_last_axis_when_batched() {
+        let x = input(0, vec![8]);
+        let selected = Node::new(NodeKind::TopKIndices { a: x.clone(), k: 2 }).unwrap();
+        let cast = Node::new(NodeKind::Cast {
+            a: selected.clone(),
+            dtype: DType::F32,
+        })
+        .unwrap();
+        let loss = Node::new(NodeKind::Sum {
+            a: cast,
+            dims: vec![0],
+            keepdims: false,
+        })
+        .unwrap();
+        assert!(grad(&loss, std::slice::from_ref(&x))
+            .err()
+            .unwrap()
+            .contains("topKIndices is not differentiable"));
+        let mapped = vmap(&selected, &x, &input(1, vec![3, 8]), 0).unwrap();
+        assert_eq!(mapped.shape, [3, 2]);
+        assert_eq!(mapped.dtype, DType::U32);
+        assert!(vmap(&selected, &x, &input(1, vec![8, 3]), 1)
+            .err()
+            .unwrap()
+            .contains("batch axis before the last axis"));
     }
 
     #[test]
@@ -389,6 +448,14 @@ fn vmap_rebuild(
             a: f(a),
             dim: shift_dim(*d, dim),
         }),
+        NodeKind::TopKIndices { a, k } => {
+            if dim >= a.shape.len() {
+                return Err(
+                    "vmap: topKIndices requires the batch axis before the last axis".into(),
+                );
+            }
+            Ok(NodeKind::TopKIndices { a: f(a), k: *k })
+        }
         NodeKind::Argmin { a, dim: d } => Ok(NodeKind::Argmin {
             a: f(a),
             dim: shift_dim(*d, dim),
@@ -482,10 +549,16 @@ fn vmap_rebuild(
         NodeKind::ChunkedHeadCe { .. } => {
             Err("vmap: chunked head ce nodes are not supported under vmap".to_string())
         }
+        NodeKind::ExpertLinearRows { .. } => {
+            Err("vmap: expertLinearRows requires explicit flattened rows and routes".into())
+        }
+        NodeKind::GroupedExpertLinearRows { .. } => {
+            Err("vmap: groupedExpertLinearRows requires explicit flattened rows and routes".into())
+        }
         NodeKind::ShortConv1d { .. } => {
             Err("vmap: short conv nodes are not supported under vmap".to_string())
         }
-        NodeKind::RotaryEmbedding { .. } => {
+        NodeKind::RotaryEmbedding { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
             Err("vmap: rotary embedding nodes are not supported under vmap".to_string())
         }
         NodeKind::Conv1d { .. }
@@ -625,6 +698,26 @@ pub fn grad(loss: &Arc<Node>, wrt: &[Arc<Node>]) -> std::result::Result<Vec<Arc<
         }
     }
     let order = topo(loss);
+    if order
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::GroupedExpertLinearRows { .. }))
+    {
+        return Err(
+            "grad: groupedExpertLinearRows is inference-only and not differentiable".into(),
+        );
+    }
+    if order
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::ExpertLinearRows { .. }))
+    {
+        return Err("grad: expertLinearRows is inference-only and not differentiable".into());
+    }
+    if order
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::TopKIndices { .. }))
+    {
+        return Err("grad: topKIndices is not differentiable".to_string());
+    }
     if order.iter().any(|node| {
         matches!(
             node.kind,
@@ -702,6 +795,43 @@ fn backward(
                 Ok::<(), String>(())
             };
         match &node.kind {
+            NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+                // Differentiate only the decomposition's interior. Its operand
+                // nodes receive cotangents in the enclosing reverse walk.
+                let expanded = effect_torch_graph::decompose_semantic(&node.kind)?
+                    .expect("configured semantic decomposition");
+                let inputs = node_children(&node.kind);
+                let boundaries = inputs.iter().map(|input| input.id).collect::<HashSet<_>>();
+                let mut local_order = Vec::new();
+                let mut seen = HashSet::new();
+                let mut stack = vec![(expanded.clone(), false)];
+                while let Some((current, ready)) = stack.pop() {
+                    if boundaries.contains(&current.id) {
+                        continue;
+                    }
+                    if ready {
+                        local_order.push(current);
+                        continue;
+                    }
+                    if !seen.insert(current.id) {
+                        continue;
+                    }
+                    stack.push((current.clone(), true));
+                    for child in node_children(&current.kind).into_iter().rev() {
+                        stack.push((child, false));
+                    }
+                }
+                let mut local = HashMap::from([(expanded.id, g)]);
+                backward(&local_order, &mut local)?;
+                let mut accumulated = HashSet::new();
+                for input in inputs {
+                    if input.dtype.is_float() && accumulated.insert(input.id) {
+                        if let Some(contribution) = local.remove(&input.id) {
+                            accumulate(&input, Ok(contribution))?;
+                        }
+                    }
+                }
+            }
             NodeKind::Add { a, b } => {
                 accumulate(a, sum_to_shape(&g, &a.shape))?;
                 accumulate(b, sum_to_shape(&g, &b.shape))?;
@@ -1296,6 +1426,16 @@ fn backward(
             NodeKind::RmsNorm { .. } => {
                 return Err("grad: RMS norm is not differentiable yet".to_string());
             }
+            NodeKind::ExpertLinearRows { .. } => {
+                return Err(
+                    "grad: expertLinearRows is inference-only and not differentiable".into(),
+                );
+            }
+            NodeKind::GroupedExpertLinearRows { .. } => {
+                return Err(
+                    "grad: groupedExpertLinearRows is inference-only and not differentiable".into(),
+                );
+            }
             NodeKind::Linear { x, weight, bias } => {
                 // For y = x·W + b over the last dimension, dx = g·Wᵀ. Compute
                 // dw = xᵀ·g by reducing over leading dimensions. db = Σ g.
@@ -1695,6 +1835,7 @@ fn backward(
             | NodeKind::Ge { .. }
             | NodeKind::Le { .. }
             | NodeKind::Argmax { .. }
+            | NodeKind::TopKIndices { .. }
             | NodeKind::Argmin { .. } => {
                 unreachable!("non-float nodes are filtered above")
             }

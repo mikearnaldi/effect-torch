@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "sourceArchiveSha256": "54979d50b5cb2e5ae68ece16540d26150957210dc42c4cbfb74508067a3e337e",
+  "candidateAddonSha256": "fab05c99fb5158489345af782f1fdbc53f8630e0ad723dda6e86b399e91a8be4",
+  "archiveSha256": {
+    "accepted-release-norm98-evidence.tar.gz": "4741d556c51f04e744410e68a6efb3fc208eb291d3b40453ed7a51d20c2d6e3d",
+    "combined97-100-101-release-entry-v1.tar.gz": "69809aa47b5bdf6361e8e0c33821a3b4040ac483c3b2be4e1a3b891df69ab599",
+    "combined97-100-101-release-runner-v1.tar.gz": "b0f8bbfec8176d2aafe18bcbebf3cccb4908e5146246daa8cd1ee5fb6f660c7d"
+  },
+  "externalAssets": "external-assets.json describes dependencies; external-backup.json pins the verified archive and companion metadata.",
+  "generationSources": "generation-sources.json"
+}

@@ -1,17 +1,19 @@
 // Backend-neutral quantized Muse-Glimmer chat inference with its official
 // DFlash draft. MUSE_GLIMMER_* variables configure paths and generation.
-import { Chat, Model, Tensor } from "@effect-torch/core"
+import { AutoRegressive, Chat, Tensor } from "@effect-torch/core"
 import type { Runtime } from "@effect-torch/core"
-import { MuseGlimmer } from "@effect-torch/core/models"
-import { DFlash } from "@effect-torch/core/proposers"
+import { DFlash, MuseGlimmer } from "@effect-torch/models"
 import * as Tokenizers from "@effect-torch/tokenizers"
 import { Config, Effect, Option, Schema, Stream } from "effect"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const directory = path.dirname(fileURLToPath(import.meta.url))
+
 const defaultModelPath = path.join(directory, "../data/Muse-Glimmer-30B-UD-Q2_K_XL.gguf")
+
 const defaultDraftPath = path.join(directory, "../data/dflash-Muse-Glimmer-30B-Q4_K_M.gguf")
+
 const defaultTokenizerPath = path.join(directory, "../data/muse-glimmer-tokenizer.json")
 
 const timed = <A, E, R>(label: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
@@ -20,6 +22,7 @@ const timed = <A, E, R>(label: string, effect: Effect.Effect<A, E, R>): Effect.E
     process.stderr.write(`${label}...\n`)
     const value = yield* effect
     process.stderr.write(`${label}: ${((performance.now() - start) / 1000).toFixed(2)}s\n`)
+
     return value
   })
 
@@ -91,9 +94,11 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
     const modelPath = yield* Config.nonEmptyString("MUSE_GLIMMER_MODEL_PATH").pipe(
       Config.withDefault(defaultModelPath)
     )
+
     const draftPath = yield* Config.nonEmptyString("MUSE_GLIMMER_DRAFT_PATH").pipe(
       Config.withDefault(defaultDraftPath)
     )
+
     const tokenizerPath = yield* Config.nonEmptyString("MUSE_GLIMMER_TOKENIZER_PATH").pipe(
       Config.withDefault(defaultTokenizerPath)
     )
@@ -124,9 +129,14 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
     }
 
     if (diagnostics) {
-      const formats = new Map<string, { tensors: number; bytes: number }>()
+      const formats = new Map<string, {
+        tensors: number
+        bytes: number
+      }>()
+
       const tails = new Map<string, number>()
-      for (const parameter of loaded.params) {
+
+      for (const parameter of loaded.parameters) {
         const format = parameter.storage?.encoding ?? parameter.dtype.toUpperCase()
         const physicalShape = parameter.storage?.physicalShape ?? parameter.shape
         const bytesPerElement = parameter.storage === undefined && parameter.dtype === "f32" ? 4 : 1
@@ -135,20 +145,24 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
         current.tensors++
         current.bytes += bytes
         formats.set(format, current)
+
         if (parameter.storage !== undefined && parameter.shape.length === 2) {
           const rowsPerGroup = parameter.storage.encoding === "Q2_K"
             ? 8
             : parameter.storage.encoding === "Q5_K"
             ? 2
             : 4
+
           if (parameter.shape[0]! % rowsPerGroup !== 0) {
             tails.set(parameter.storage.encoding, (tails.get(parameter.storage.encoding) ?? 0) + 1)
           }
         }
       }
+
       for (const [format, summary] of [...formats].sort(([left], [right]) => left.localeCompare(right))) {
         process.stderr.write(`${format}: ${summary.tensors} tensors, ${(summary.bytes / 1e9).toFixed(3)} GB\n`)
       }
+
       process.stderr.write(`partial linear threadgroups: ${JSON.stringify(Object.fromEntries(tails))}\n`)
     }
 
@@ -156,7 +170,7 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
 
     const inference = yield* timed(
       "Compiling inference",
-      Model.inference(loaded.model, loaded.params, {
+      AutoRegressive.compile(loaded.definition, loaded.parameters, {
         maxTokens: 4096,
         blockSize: 16,
         kvDtype: "f16",
@@ -168,10 +182,11 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
       })
     )
 
-    // Model.inference creates and retains an immutable parameter generation.
+    // AutoRegressive.compile creates and retains an immutable parameter generation.
     // Release the GGUF loader's handles after compilation.
-    yield* Tensor.clearAll(loaded.params)
-    if (draft !== undefined) yield* Tensor.clearAll(draft.params)
+    yield* Tensor.clearAll(loaded.parameters)
+
+    if (draft !== undefined) yield* Tensor.clearAll(draft.parameters)
 
     let sawSegment = false
 
@@ -200,11 +215,13 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
             }
             case "start": {
               sawSegment = true
+
               const label = event.segment.kind === "content"
                 ? "response"
                 : event.segment.kind === "reasoning"
                 ? "reasoning"
                 : event.segment.recipient ?? event.segment.role
+
               process.stdout.write(`[${label}]\n`)
               break
             }
@@ -228,11 +245,14 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
           }
         })
     )
+
     if (diagnostics) {
       const stats = yield* inference.diagnostics()
+
       const acceptance = stats.proposedTokens === 0n
         ? 0
         : Number(stats.acceptedTokens) / Number(stats.proposedTokens)
+
       process.stderr.write(
         `speculation: ${stats.acceptedTokens}/${stats.proposedTokens} accepted (${(acceptance * 100).toFixed(1)}%), ` +
           `rounds ordinary=${stats.ordinaryRounds} speculative=${stats.speculativeRounds}, ` +
@@ -241,5 +261,6 @@ export const inference = (prompt: string): Effect.Effect<void, unknown, Runtime.
           }s\n`
       )
     }
+
     if (!sawSegment) process.stdout.write("\n")
   })

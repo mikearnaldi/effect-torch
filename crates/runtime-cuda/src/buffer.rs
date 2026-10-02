@@ -6,20 +6,57 @@ use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[cfg(test)]
+thread_local! {
+    static PLANNED_ADDRESS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn planned_address_reads() -> usize {
+    PLANNED_ADDRESS_READS.with(std::cell::Cell::get)
+}
+
 /// A typed view into an owned CUDA allocation.
 ///
 /// The allocation can have a different element type, which is required for
-/// compiler-planned byte segments. All CUDA work in this backend uses one
-/// device-local stream, so pointer views rely on stream ordering rather than
-/// independent cudarc read/write events.
+/// compiler-planned byte segments. Planned views rely on primary-stream
+/// ordering and explicit dense/expert worker fork/join fences rather than
+/// independent cudarc read/write events per view.
 #[derive(Clone)]
 pub(crate) struct CudaBuffer<T> {
     ptr: sys::CUdeviceptr,
     len: usize,
+    allocation_bytes: usize,
     stream: Arc<CudaStream>,
     _owner: Arc<dyn Send + Sync>,
     _retention: Option<Arc<dyn Send + Sync>>,
     _marker: PhantomData<T>,
+}
+
+/// Shared checked byte geometry for original and cached planned views.
+pub(crate) fn validate_segment_range<T>(
+    byte_offset: usize,
+    len: usize,
+    capacity: usize,
+) -> Result<usize, String> {
+    if byte_offset % std::mem::align_of::<T>() != 0 {
+        return Err(format!(
+            "CUDA segment offset {byte_offset} is not aligned for {}",
+            std::any::type_name::<T>()
+        ));
+    }
+    let bytes = len
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| "CUDA buffer byte size overflowed usize".to_string())?;
+    let end = byte_offset
+        .checked_add(bytes)
+        .ok_or_else(|| "CUDA buffer range overflowed usize".to_string())?;
+    if end > capacity {
+        return Err(format!(
+            "CUDA buffer range {byte_offset}..{end} exceeds segment size {}",
+            capacity
+        ));
+    }
+    Ok(end)
 }
 
 impl<T: Send + Sync + 'static> CudaBuffer<T> {
@@ -32,10 +69,12 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         let (ptr, sync) = slice.device_ptr(&stream);
         drop(sync);
         let len = slice.len();
+        let allocation_bytes = len * std::mem::size_of::<T>();
         let owner: Arc<dyn Send + Sync> = slice;
         Self {
             ptr,
             len,
+            allocation_bytes,
             stream,
             _owner: owner,
             _retention: None,
@@ -49,25 +88,11 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         len: usize,
         retention: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Self, String> {
-        if byte_offset % std::mem::align_of::<T>() != 0 {
-            return Err(format!(
-                "CUDA segment offset {byte_offset} is not aligned for {}",
-                std::any::type_name::<T>()
-            ));
-        }
-        let bytes = len
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| "CUDA buffer byte size overflowed usize".to_string())?;
-        let end = byte_offset
-            .checked_add(bytes)
-            .ok_or_else(|| "CUDA buffer range overflowed usize".to_string())?;
-        if end > owner.len() {
-            return Err(format!(
-                "CUDA buffer range {byte_offset}..{end} exceeds segment size {}",
-                owner.len()
-            ));
-        }
+        validate_segment_range::<T>(byte_offset, len, owner.len())?;
+        let allocation_bytes = owner.len();
         let stream = Arc::clone(owner.stream());
+        #[cfg(test)]
+        PLANNED_ADDRESS_READS.with(|count| count.set(count.get() + 1));
         let (base, sync) = owner.device_ptr(&stream);
         drop(sync);
         let offset =
@@ -79,11 +104,20 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         Ok(Self {
             ptr,
             len,
+            allocation_bytes,
             stream,
             _owner: owner,
             _retention: retention,
             _marker: PhantomData,
         })
+    }
+
+    /// Identity and byte capacity of the complete allocation retained by this view.
+    pub(crate) fn allocation(&self) -> (usize, usize) {
+        (
+            Arc::as_ptr(&self._owner) as *const () as usize,
+            self.allocation_bytes,
+        )
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -113,6 +147,7 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
                 .checked_add(byte_offset)
                 .ok_or_else(|| "CUDA buffer slice pointer overflow".to_string())?,
             len: range.end - range.start,
+            allocation_bytes: self.allocation_bytes,
             stream: Arc::clone(&self.stream),
             _owner: Arc::clone(&self._owner),
             _retention: self._retention.clone(),
@@ -145,11 +180,25 @@ impl<T: Send + Sync + 'static> CudaBuffer<T> {
         Ok(CudaBuffer {
             ptr: self.ptr,
             len,
+            allocation_bytes: self.allocation_bytes,
             stream: Arc::clone(&self.stream),
             _owner: Arc::clone(&self._owner),
             _retention: self._retention.clone(),
             _marker: PhantomData,
         })
+    }
+}
+
+impl CudaBuffer<u8> {
+    /// Derive a checked view from an invocation-owned full-segment byte buffer.
+    /// Pointer readiness was acquired once; this does not alter stream fences.
+    pub(crate) fn planned_view<T: Send + Sync + 'static>(
+        &self,
+        byte_offset: usize,
+        len: usize,
+    ) -> Result<CudaBuffer<T>, String> {
+        let end = validate_segment_range::<T>(byte_offset, len, self.len)?;
+        self.slice(byte_offset..end)?.cast::<T>(len)
     }
 }
 

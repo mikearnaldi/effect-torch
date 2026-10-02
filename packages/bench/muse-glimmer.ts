@@ -1,6 +1,6 @@
 // Compares Muse-Glimmer on effect-torch and llama.cpp in one run. effect-torch
 // calls MuseGlimmer.loadGGUF once. If the selected modes include DFlash, it also
-// calls DFlash.loadGGUF once. It compiles one Model.inference program per mode
+// calls DFlash.loadGGUF once. It compiles one AutoRegressive.compile program per mode
 // and calls the low-level Generation.add/step API directly. The timed path
 // excludes Chat parsing and detokenization.
 //
@@ -35,9 +35,8 @@
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import * as BackendCuda from "@effect-torch/backend-cuda"
-import { Model, type Runtime, Tensor } from "@effect-torch/core"
-import { MuseGlimmer } from "@effect-torch/core/models"
-import { DFlash } from "@effect-torch/core/proposers"
+import { AutoRegressive, type Runtime, Tensor } from "@effect-torch/core"
+import { DFlash, MuseGlimmer } from "@effect-torch/models"
 import * as Tokenizers from "@effect-torch/tokenizers"
 import { Duration, Effect, Option, Predicate, Schema } from "effect"
 import { execFile } from "node:child_process"
@@ -50,9 +49,13 @@ import { promisify } from "node:util"
 const execFileAsync = promisify(execFile)
 
 const directory = path.dirname(fileURLToPath(import.meta.url))
+
 const repoRoot = path.resolve(directory, "../..")
+
 const defaultModelPath = path.join(directory, "../examples/data/Muse-Glimmer-30B-UD-Q2_K_XL.gguf")
+
 const defaultDraftPath = path.join(directory, "../examples/data/dflash-Muse-Glimmer-30B-Q4_K_M.gguf")
+
 const defaultTokenizerPath = path.join(directory, "../examples/data/muse-glimmer-tokenizer.json")
 
 // ---------------------------------------------------------------------------
@@ -60,7 +63,9 @@ const defaultTokenizerPath = path.join(directory, "../examples/data/muse-glimmer
 // ---------------------------------------------------------------------------
 
 type Engine = "effect" | "llama" | "all"
+
 type Backend = "apple" | "cuda"
+
 type Mode = "ordinary" | "dflash"
 
 interface Config {
@@ -95,26 +100,38 @@ const fail = (message: string): never => {
 
 const envInt = (name: string, fallback: number): number => {
   const raw = process.env[name]
+
   if (raw === undefined || raw === "") return fallback
+
   const value = Number(raw)
+
   if (!Number.isInteger(value)) return fail(`${name} must be an integer, got ${raw}`)
+
   return value
 }
 
 const envFloat = (name: string, fallback: number): number => {
   const raw = process.env[name]
+
   if (raw === undefined || raw === "") return fallback
+
   const value = Number(raw)
+
   if (!Number.isFinite(value) || value < 0) return fail(`${name} must be a non-negative number, got ${raw}`)
+
   return value
 }
 
 const envIntList = (name: string, fallback: ReadonlyArray<number>): ReadonlyArray<number> => {
   const raw = process.env[name]
+
   if (raw === undefined || raw === "") return fallback
+
   return raw.split(",").map((entry) => {
     const value = Number(entry.trim())
+
     if (!Number.isInteger(value) || value <= 0) return fail(`${name} entries must be positive integers, got ${entry}`)
+
     return value
   })
 }
@@ -123,29 +140,39 @@ const timestamp = (): string => new Date().toISOString().replace(/[:.]/g, "-")
 
 const loadConfig = (): Config => {
   const engineRaw = process.env.ENGINE ?? "all"
+
   if (engineRaw !== "effect" && engineRaw !== "llama" && engineRaw !== "all") {
     return fail(`ENGINE must be effect|llama|all, got ${engineRaw}`)
   }
+
   const backendRaw = process.env.BACKEND ?? "apple"
+
   if (backendRaw !== "apple" && backendRaw !== "cuda") {
     return fail(`BACKEND must be apple|cuda, got ${backendRaw}`)
   }
+
   const modeRaw = process.env.MODE ?? "both"
+
   if (modeRaw !== "ordinary" && modeRaw !== "dflash" && modeRaw !== "both") {
     return fail(`MODE must be ordinary|dflash|both, got ${modeRaw}`)
   }
+
   const maxTokens = envInt("MAX_TOKENS", 4096)
+
   if (maxTokens <= 0 || maxTokens % 16 !== 0) {
     return fail(`MAX_TOKENS must be a positive multiple of 16, got ${maxTokens}`)
   }
+
   const contexts = envIntList("CONTEXTS", [64, 512, 1024, 2048, 3072])
   const prefillChunks = envIntList("PREFILL_CHUNK", [64, 128, 256])
   const maxNew = envInt("MAX_NEW", 128)
+
   for (const context of contexts) {
     if (context + maxNew > maxTokens) {
       return fail(`context ${context} + MAX_NEW ${maxNew} exceeds the ${maxTokens}-token pool`)
     }
   }
+
   return {
     engine: engineRaw,
     backend: backendRaw,
@@ -352,11 +379,13 @@ const FILLERS = [".", ",", "!", "?", ";", ":", "\n", " the", " a", " and", " of"
 
 const mulberry32 = (seed: number): () => number => {
   let state = seed >>> 0
+
   return () => {
     state = (state + 0x6d2b79f5) >>> 0
     let value = state
     value = Math.imul(value ^ (value >>> 15), value | 1)
     value ^= value + Math.imul(value ^ (value >>> 7), value | 61)
+
     return ((value ^ (value >>> 14)) >>> 0) / 4294967296
   }
 }
@@ -384,29 +413,37 @@ export const buildPrompt = (
   Effect.gen(function*() {
     // Leave one token slot for the BOS that the caller prepends.
     const target = context - 1
+
     if (target < 8) {
       return yield* Effect.die(new Error(`context ${context} leaves only ${target} prompt tokens`))
     }
+
     const random = mulberry32((seed ^ Math.imul(caseId + 1, 0x9e3779b9)) >>> 0)
     // A unique prefix for each case prevents prefix-cache reuse across runs.
     let text = `Muse Glimmer benchmark case ${caseId} context ${context}.`
     let ids = yield* encodePlain(tokenizer, text)
+
     for (let attempt = 0; attempt < 8192 && ids.length !== target; attempt++) {
       if (ids.length > target) {
         const cut = text.lastIndexOf(" ")
+
         if (cut <= 0) {
           return yield* Effect.die(new Error(`prompt case ${caseId}: cannot trim ${ids.length} tokens to ${target}`))
         }
+
         text = text.slice(0, cut)
         ids = yield* encodePlain(tokenizer, text)
         continue
       }
+
       const gap = target - ids.length
       let placed = false
+
       if (gap <= 8) {
         for (const filler of FILLERS) {
           const candidate = text + filler
           const candidateIds = yield* encodePlain(tokenizer, candidate)
+
           if (candidateIds.length === target) {
             text = candidate
             ids = candidateIds
@@ -415,21 +452,25 @@ export const buildPrompt = (
           }
         }
       }
+
       if (!placed && ids.length !== target) {
         text += ` ${WORDS[Math.floor(random() * WORDS.length)]}`
         ids = yield* encodePlain(tokenizer, text)
       }
     }
+
     if (ids.length !== target) {
       return yield* Effect.die(
         new Error(`prompt case ${caseId}: produced ${ids.length} tokens, wanted exactly ${target}`)
       )
     }
+
     // Decode into canonical text, then verify that re-encoding preserves every
     // token ID. llama.cpp receives that text and tokenizes it into the same IDs.
     const roundTripText = yield* tokenizer.decode(ids)
     const roundTripIds = yield* encodePlain(tokenizer, roundTripText)
     const stable = roundTripIds.length === ids.length && roundTripIds.every((id, index) => id === ids[index])
+
     if (!stable) {
       return yield* Effect.die(
         new Error(
@@ -437,6 +478,7 @@ export const buildPrompt = (
         )
       )
     }
+
     return { text: roundTripText, ids }
   })
 
@@ -449,12 +491,14 @@ const percentile = (sorted: ReadonlyArray<number>, quantile: number): number | u
 
 const fnv1a = (tokens: ReadonlyArray<number>): string => {
   let hash = 0x811c9dc5
+
   for (const token of tokens) {
     for (let shift = 0; shift < 32; shift += 8) {
       hash ^= (token >>> shift) & 0xff
       hash = Math.imul(hash, 0x01000193)
     }
   }
+
   return (hash >>> 0).toString(16).padStart(8, "0")
 }
 
@@ -468,9 +512,11 @@ const decodeLlamaBenchRow = Schema.decodeUnknownSync(Schema.fromJsonString(Schem
 
 const metadataInt = (metadata: ReadonlyMap<string, unknown>, key: string): number => {
   const value = Option.getOrUndefined(Schema.decodeUnknownOption(Schema.Int)(metadata.get(key)))
+
   if (value === undefined) {
     return fail(`GGUF metadata ${key} must be an integer`)
   }
+
   return value
 }
 
@@ -478,6 +524,7 @@ const benchmarkCaseId = (config: Config, context: number, run: number): number =
   const configured = config.contexts.indexOf(context)
   const external = config.llamaE2eContexts.indexOf(context)
   const contextIndex = configured >= 0 ? configured : config.contexts.length + external
+
   return contextIndex * (config.warmup + config.runs) + config.warmup + run
 }
 
@@ -486,7 +533,7 @@ const benchmarkCaseId = (config: Config, context: number, run: number): number =
 // ---------------------------------------------------------------------------
 
 interface EffectCaseInput {
-  readonly program: Model.InferenceProgram
+  readonly program: AutoRegressive.Artifact
   readonly tokenizer: Tokenizers.Tokenizer
   readonly bosTokenId: number
   readonly mode: Mode
@@ -508,6 +555,7 @@ const runEffectCase = (
     allIds[0] = input.bosTokenId
     allIds.set(prompt.ids, 1)
     const generation = yield* program.generation()
+
     return yield* Effect.gen(function*() {
       const promptTensor = yield* Tensor.fromTypedArray(allIds, [1, allIds.length])
       const before = yield* program.diagnostics()
@@ -519,15 +567,19 @@ const runEffectCase = (
       const roundTimes: Array<number> = []
       let decodeMs = 0
       let stopReason = pages[0]?.stopReason
+
       while (stopReason === undefined && outputTokens.length < config.maxNew) {
         const stepStarted = performance.now()
         pages = yield* generation.step(pages.map(({ seq }) => ({ seq })))
         const stepMs = performance.now() - stepStarted
         roundTimes.push(stepMs)
         decodeMs += stepMs
+
         for (const page of pages) outputTokens.push(...page.tokens)
+
         stopReason = pages[0]?.stopReason
       }
+
       const after = yield* program.diagnostics()
       const decodeTokens = outputTokens.length - addTokens
       const sortedRounds = [...roundTimes].sort((left, right) => left - right)
@@ -536,7 +588,8 @@ const runEffectCase = (
       const speculativeRounds = Number(after.speculativeRounds - before.speculativeRounds)
       const ordinaryRounds = Number(after.ordinaryRounds - before.ordinaryRounds)
       const e2eMs = prefillMs + decodeMs
-      return {
+
+      const benchRecord: BenchRecord = {
         timestamp: new Date().toISOString(),
         engine: "effect" as const,
         mode: input.mode,
@@ -573,7 +626,9 @@ const runEffectCase = (
         temperature: config.temperature,
         topK: config.topK,
         topP: config.topP
-      } satisfies BenchRecord
+      }
+
+      return benchRecord
     }).pipe(Effect.ensuring(Effect.ignore(generation.close())))
   })
 
@@ -583,21 +638,25 @@ const effectSuite = (
 ): Effect.Effect<void, unknown, Runtime.Runtime> =>
   Effect.gen(function*() {
     let completedCases = 0
+
     const tokenizer = yield* Tokenizers.fromFile(config.tokenizerPath, {
       ...Tokenizers.strictConfig,
       specialTokens: "Always"
     })
+
     const loadStarted = performance.now()
     const loaded = yield* MuseGlimmer.loadGGUF(config.modelPath)
     const loadMs = performance.now() - loadStarted
     process.stderr.write(`loaded model: ${(loadMs / 1000).toFixed(2)}s\n`)
     const bosTokenId = metadataInt(loaded.metadata, "tokenizer.ggml.bos_token_id")
     const draft = config.modes.includes("dflash") ? yield* DFlash.loadGGUF(config.draftPath) : undefined
+
     if (draft !== undefined) process.stderr.write(`loaded DFlash draft (maxDraftTokens=${draft.maxDraftTokens})\n`)
 
     for (const mode of config.modes) {
       const compileStarted = performance.now()
-      const program = yield* Model.inference(loaded.model, loaded.params, {
+
+      const program = yield* AutoRegressive.compile(loaded.definition, loaded.parameters, {
         maxTokens: config.maxTokens,
         blockSize: config.blockSize,
         kvDtype: "f16",
@@ -616,13 +675,17 @@ const effectSuite = (
           }
           : undefined
       })
+
       const compileMs = performance.now() - compileStarted
       process.stderr.write(`compiled ${mode} inference: ${(compileMs / 1000).toFixed(2)}s\n`)
+
       for (const [contextIndex, context] of config.contexts.entries()) {
         const caseBase = contextIndex * (config.warmup + config.runs)
+
         if (completedCases > 0 && config.cooldownMs > 0) {
           yield* Effect.sleep(Duration.millis(config.cooldownMs))
         }
+
         for (let warmup = 0; warmup < config.warmup; warmup++) {
           yield* runEffectCase({
             program,
@@ -638,8 +701,10 @@ const effectSuite = (
           })
           completedCases++
           process.stderr.write(`warmup ${warmup + 1}/${config.warmup} done: ${mode} context=${context}\n`)
+
           if (config.cooldownMs > 0) yield* Effect.sleep(Duration.millis(config.cooldownMs))
         }
+
         for (let run = 0; run < config.runs; run++) {
           const record = yield* runEffectCase({
             program,
@@ -653,6 +718,7 @@ const effectSuite = (
             compileMs,
             config
           })
+
           records.push(record)
           completedCases++
         }
@@ -665,12 +731,16 @@ const effectSuite = (
           .filter((record) => record.engine === "effect" && record.mode === "ordinary" && record.run >= 0)
           .map((record) => [record.caseId, record] as const)
       )
+
       for (const record of records) {
         if (record.engine !== "effect" || record.mode !== "dflash" || record.run < 0) continue
+
         const baseline = ordinary.get(record.caseId)
+
         if (baseline === undefined) {
           return yield* Effect.die(new Error(`missing ordinary pair for case ${record.caseId}`))
         }
+
         if (baseline.generatedTokens !== record.generatedTokens || baseline.outputHash !== record.outputHash) {
           return yield* Effect.die(
             new Error(
@@ -682,10 +752,11 @@ const effectSuite = (
       }
     }
 
-    // Each Model.inference program retains its materialized parameter tensors.
+    // Each AutoRegressive artifact retains its materialized parameter tensors.
     // All cases are done here, so the benchmark clears the loader tensors.
-    yield* Tensor.clearAll(loaded.params)
-    if (draft !== undefined) yield* Tensor.clearAll(draft.params)
+    yield* Tensor.clearAll(loaded.parameters)
+
+    if (draft !== undefined) yield* Tensor.clearAll(draft.parameters)
   })
 
 // ---------------------------------------------------------------------------
@@ -701,6 +772,7 @@ interface CommandResult {
 const runCommand = async (command: string, args: ReadonlyArray<string>): Promise<CommandResult> => {
   const started = performance.now()
   const { stdout, stderr } = await execFileAsync(command, [...args], { maxBuffer: 64 * 1024 * 1024 })
+
   return { stdout, stderr, elapsedMs: performance.now() - started }
 }
 
@@ -733,8 +805,11 @@ const cooldown = async (config: Config): Promise<void> => {
 
 const numberAt = (text: string, pattern: RegExp, group: number): number | undefined => {
   const match = pattern.exec(text)
+
   if (match === null) return undefined
+
   const value = Number(match[group])
+
   return Number.isFinite(value) ? value : undefined
 }
 
@@ -750,22 +825,26 @@ const runLlamaBench = async (config: Config, binary: string, records: Array<Benc
     "-o",
     "jsonl"
   ]
+
   const commands = [
     // Measure prompt processing at each requested context.
     [...common, "-p", config.contexts.join(","), "-n", "0"],
     // Measure decoding with the KV cache populated to each requested depth.
     [...common, "-p", "0", "-n", String(config.maxNew), "-d", config.contexts.join(",")]
   ]
+
   for (const args of commands) {
     process.stderr.write(`running llama-bench: ${args.join(" ")}\n`)
     const { stdout, stderr } = await runCommand(binary, args)
     const lines = stdout.split("\n").filter((line) => line.trim().startsWith("{"))
+
     if (lines.length === 0) {
       process.stderr.write(
         `llama-bench produced no jsonl rows; stderr tail:\n${stderr.split("\n").slice(-5).join("\n")}\n`
       )
       continue
     }
+
     for (const line of lines) {
       const row = decodeLlamaBenchRow(line)
       const nPrompt = Number(row.n_prompt ?? 0)
@@ -774,11 +853,13 @@ const runLlamaBench = async (config: Config, binary: string, records: Array<Benc
       const avgNs = Number(row.avg_ns ?? NaN)
       const avgMs = Number.isFinite(avgNs) ? avgNs / 1e6 : undefined
       const tokens = nGen > 0 ? nGen : nPrompt
+
       const avgTs = Predicate.isNumber(row.avg_ts)
         ? row.avg_ts
         : avgMs !== undefined && avgMs > 0
         ? tokens / (avgMs / 1000)
         : undefined
+
       const base = {
         timestamp: new Date().toISOString(),
         engine: "llama-bench" as const,
@@ -791,6 +872,7 @@ const runLlamaBench = async (config: Config, binary: string, records: Array<Benc
         topK: config.topK,
         topP: config.topP
       }
+
       if (nGen > 0) {
         records.push({
           ...base,
@@ -802,19 +884,27 @@ const runLlamaBench = async (config: Config, binary: string, records: Array<Benc
         records.push({ ...base, prefillMs: avgMs, prefillTokPerSec: avgTs })
       }
     }
+
     process.stderr.write(`llama-bench: parsed ${lines.length} rows\n`)
   }
 }
 
 const LLAMA_PROMPT_PERF =
   /prompt eval time\s*=\s*([\d.]+) ms\s*\/\s*(\d+) tokens\s*\(\s*[\d.]+ ms per token,\s*([\d.]+) tokens per second\s*\)/
+
 const LLAMA_EVAL_PERF =
   /^\S*:\s*eval time\s*=\s*([\d.]+) ms\s*\/\s*(\d+) (?:runs|tokens)\s*\(\s*[\d.]+ ms per (?:token|run),\s*([\d.]+) tokens per second\s*\)/m
+
 const LLAMA_SIMPLE_PERF = /\[\s*Prompt:\s*([\d.]+) t\/s\s*\|\s*Generation:\s*([\d.]+) t\/s\s*\]/
+
 const LLAMA_LOAD = /load time\s*=\s*([\d.]+) ms/
+
 const SPEC_ENCODED = /encoded\s+(\d+)\s+tokens?\s+in\s+([\d.]+)\s*seconds?,\s*speed:\s*([\d.]+)\s*t\/s/i
+
 const SPEC_DECODED = /decoded\s+(\d+)\s+tokens?\s+in\s+([\d.]+)\s*seconds?,\s*speed:\s*([\d.]+)\s*t\/s/i
+
 const SPEC_ACCEPTED = /n_accept\s*=\s*(\d+)/
+
 const SPEC_DRAFTED = /n_drafted\s*=\s*(\d+)/
 
 const runLlamaCliE2e = async (
@@ -825,8 +915,10 @@ const runLlamaCliE2e = async (
 ): Promise<void> => {
   for (const context of config.llamaE2eContexts) {
     if (context !== config.llamaE2eContexts[0]) await cooldown(config)
+
     const caseId = benchmarkCaseId(config, context, 0)
     const prompt = await Effect.runPromise(buildPrompt(tokenizer, config.seed, caseId, context))
+
     const args = [
       "-m",
       config.modelPath,
@@ -848,6 +940,7 @@ const runLlamaCliE2e = async (
       "--no-warmup",
       "--perf"
     ]
+
     process.stderr.write(`running llama-cli e2e context=${context}\n`)
     const { stdout, stderr, elapsedMs } = await runCommand(binary, args)
     const combined = `${stdout}\n${stderr}`
@@ -859,23 +952,29 @@ const runLlamaCliE2e = async (
     let decodeTokPerSec = numberAt(combined, LLAMA_EVAL_PERF, 3)
     const simplePrefill = numberAt(combined, LLAMA_SIMPLE_PERF, 1)
     const simpleDecode = numberAt(combined, LLAMA_SIMPLE_PERF, 2)
+
     if (prefillTokPerSec === undefined && simplePrefill !== undefined) {
       prefillTokPerSec = simplePrefill
       prefillMs = context / simplePrefill * 1000
       promptTokens = context
     }
+
     if (decodeTokPerSec === undefined && simpleDecode !== undefined) {
       decodeTokPerSec = simpleDecode
       decodeMs = config.maxNew / simpleDecode * 1000
       generatedTokens = config.maxNew
     }
+
     const loadMs = numberAt(combined, LLAMA_LOAD, 1)
+
     if (decodeMs === undefined) {
       process.stderr.write(`llama-cli context=${context}: could not parse eval timing\n`)
     }
+
     if (promptTokens !== undefined && promptTokens !== context) {
       process.stderr.write(`llama-cli context=${context}: prompt evaluated ${promptTokens} tokens, want ${context}\n`)
     }
+
     records.push({
       timestamp: new Date().toISOString(),
       engine: "llama-cli",
@@ -907,8 +1006,10 @@ const runLlamaSpeculativeE2e = async (
 ): Promise<void> => {
   for (const context of config.llamaE2eContexts) {
     if (context !== config.llamaE2eContexts[0]) await cooldown(config)
+
     const caseId = benchmarkCaseId(config, context, 0)
     const prompt = await Effect.runPromise(buildPrompt(tokenizer, config.seed, caseId, context))
+
     const args = [
       "-m",
       config.modelPath,
@@ -929,6 +1030,7 @@ const runLlamaSpeculativeE2e = async (
       "--spec-draft-n-max",
       String(config.draftTokens)
     ]
+
     process.stderr.write(`running llama-speculative-simple e2e context=${context}\n`)
     const { stdout, stderr, elapsedMs } = await runCommand(binary, args)
     const combined = `${stdout}\n${stderr}`
@@ -940,9 +1042,11 @@ const runLlamaSpeculativeE2e = async (
     const decodeTokPerSec = numberAt(combined, SPEC_DECODED, 3)
     const acceptedTokens = numberAt(combined, SPEC_ACCEPTED, 1)
     const proposedTokens = numberAt(combined, SPEC_DRAFTED, 1)
+
     if (decodeSeconds === undefined) {
       process.stderr.write(`llama-speculative-simple context=${context}: could not parse decode timing\n`)
     }
+
     records.push({
       timestamp: new Date().toISOString(),
       engine: "llama-speculative-simple",
@@ -975,36 +1079,47 @@ const runLlamaSpeculativeE2e = async (
 const llamaSuite = async (config: Config, records: Array<BenchRecord>): Promise<void> => {
   if (config.llamaBin === undefined) {
     process.stderr.write("LLAMA_CPP_BIN is not set; skipping llama.cpp orchestration\n")
+
     return
   }
+
   const binary = (name: string): string | undefined => {
     const candidate = path.join(config.llamaBin!, name)
+
     if (!fs.existsSync(candidate)) {
       process.stderr.write(`missing ${candidate}; skipping\n`)
+
       return undefined
     }
+
     return candidate
   }
+
   const bench = binary("llama-bench")
   const cli = binary("llama-cli")
   const speculative = binary("llama-speculative-simple")
   let tokenizer: Tokenizers.Tokenizer | undefined
+
   const getTokenizer = async (): Promise<Tokenizers.Tokenizer> => {
     if (tokenizer === undefined) {
       tokenizer = await Effect.runPromise(
         Tokenizers.fromFile(config.tokenizerPath, { ...Tokenizers.strictConfig, specialTokens: "Always" })
       )
     }
+
     return tokenizer
   }
+
   if (bench !== undefined && config.modes.includes("ordinary")) {
     await runLlamaBench(config, bench, records)
     await cooldown(config)
   }
+
   if (cli !== undefined && config.modes.includes("ordinary")) {
     await runLlamaCliE2e(config, cli, await getTokenizer(), records)
     await cooldown(config)
   }
+
   if (speculative !== undefined && config.modes.includes("dflash")) {
     await runLlamaSpeculativeE2e(config, speculative, await getTokenizer(), records)
   }
@@ -1019,17 +1134,21 @@ const fixed = (value: number | undefined, digits: number, width: number): string
 
 const printRow = (record: BenchRecord): void => {
   const acceptance = record.acceptanceRate === undefined ? "-" : `${(record.acceptanceRate * 100).toFixed(1)}%`
+
   const draftPerRound = record.draftMs === undefined || record.speculativeRounds === undefined
       || record.speculativeRounds === 0
     ? undefined
     : record.draftMs / record.speculativeRounds
+
   const verifyPerRound = record.verificationMs === undefined || record.speculativeRounds === undefined
       || record.speculativeRounds === 0
     ? undefined
     : record.verificationMs / record.speculativeRounds
+
   const ordinary = record.mode === "dflash" && record.ordinaryRounds !== undefined && record.ordinaryRounds > 0
     ? ` ordinaryRounds=${record.ordinaryRounds}`
     : ""
+
   process.stdout.write(
     `${record.engine.padEnd(24)} ${record.mode.padEnd(8)} ctx=${String(record.context).padStart(4)} ` +
       `run=${String(record.run).padStart(2)} gen=${String(record.generatedTokens ?? "-").padStart(4)} ` +
@@ -1043,30 +1162,39 @@ const printRow = (record: BenchRecord): void => {
 
 const printTable = (records: ReadonlyArray<BenchRecord>): void => {
   if (records.length === 0) return
+
   process.stdout.write("\n")
+
   for (const record of records) printRow(record)
 }
 
 const median = (values: ReadonlyArray<number>): number | undefined => {
   if (values.length === 0) return undefined
+
   const sorted = [...values].sort((left, right) => left - right)
   const middle = Math.floor(sorted.length / 2)
+
   return sorted.length % 2 === 0 ? (sorted[middle - 1]! + sorted[middle]!) / 2 : sorted[middle]
 }
 
 const printSummary = (records: ReadonlyArray<BenchRecord>): void => {
   const groups = new Map<string, Array<BenchRecord>>()
+
   for (const record of records) {
     const key = `${record.engine}\0${record.mode}\0${record.context}`
     groups.set(key, [...(groups.get(key) ?? []), record])
   }
+
   if (groups.size === 0) return
+
   process.stdout.write("\nsummary (median)\n")
+
   for (const group of groups.values()) {
     const first = group[0]!
     const prefill = median(group.flatMap((record) => record.prefillTokPerSec ?? []))
     const decode = median(group.flatMap((record) => record.decodeTokPerSec ?? []))
     const acceptance = median(group.flatMap((record) => record.acceptanceRate ?? []))
+
     const draft = median(
       group.flatMap((record) =>
         record.draftMs === undefined || record.speculativeRounds === undefined || record.speculativeRounds === 0
@@ -1074,6 +1202,7 @@ const printSummary = (records: ReadonlyArray<BenchRecord>): void => {
           : record.draftMs / record.speculativeRounds
       )
     )
+
     const verify = median(
       group.flatMap((record) =>
         record.verificationMs === undefined || record.speculativeRounds === undefined || record.speculativeRounds === 0
@@ -1081,6 +1210,7 @@ const printSummary = (records: ReadonlyArray<BenchRecord>): void => {
           : record.verificationMs / record.speculativeRounds
       )
     )
+
     process.stdout.write(
       `${first.engine.padEnd(24)} ${first.mode.padEnd(8)} ctx=${String(first.context).padStart(4)} ` +
         `prefill=${fixed(prefill, 2, 8)} tok/s decode=${fixed(decode, 2, 8)} tok/s ` +
@@ -1110,13 +1240,16 @@ const main = async (): Promise<void> => {
       `temperature=${config.temperature} topK=${config.topK} topP=${config.topP}\n`
   )
   const records: Array<BenchRecord> = []
+
   if (config.engine !== "llama") {
     const layer = config.backend === "cuda" ? BackendCuda.layer() : BackendApple.layer()
     await Effect.runPromise(Effect.provide(effectSuite(config, records), layer))
   }
+
   if (config.engine !== "effect") {
     await llamaSuite(config, records)
   }
+
   writeOutput(config, records)
   printTable(records)
   printSummary(records)

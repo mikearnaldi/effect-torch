@@ -38,6 +38,32 @@ pub(crate) fn validate_storage_bytes(spec: ValueSpec<'_>, bytes: usize) -> Resul
     Ok(())
 }
 
+pub(crate) fn validate_planned_buffer(
+    spec: ValueSpec<'_>,
+    buffer: &CudaBuffer<u8>,
+) -> Result<(), String> {
+    validate_storage_bytes(spec, buffer.len())?;
+    let alignment = spec.canonical_geometry()?.physical_dtype.size_in_bytes() as u64;
+    if buffer.address() % alignment != 0 {
+        return Err(format!(
+            "CUDA storage pointer is not aligned to {alignment} bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_dense_reshape(
+    dtype: DType,
+    representation: StorageRepresentation,
+    bytes: usize,
+    shape: &[usize],
+) -> Result<(), String> {
+    if representation != StorageRepresentation::Dense {
+        return Err("CUDA packed values require representation-aware operations".to_string());
+    }
+    validate_storage_bytes(ValueSpec::dense(dtype, shape), bytes)
+}
+
 // Round the complete binary64 significand once. The half crate can discard
 // sticky bits, or convert through F32 on some hosts, before its final rounding.
 fn f64_to_half_bits(value: f64, fraction_bits: u32, exponent_bias: i32) -> u16 {
@@ -184,13 +210,7 @@ impl CudaValue {
         spec: ValueSpec<'_>,
         buffer: CudaBuffer<u8>,
     ) -> Result<Self, String> {
-        validate_storage_bytes(spec, buffer.len())?;
-        let alignment = spec.canonical_geometry()?.physical_dtype.size_in_bytes() as u64;
-        if buffer.address() % alignment != 0 {
-            return Err(format!(
-                "CUDA storage pointer is not aligned to {alignment} bytes"
-            ));
-        }
+        validate_planned_buffer(spec, &buffer)?;
         Ok(Self {
             device,
             buffer: Arc::new(buffer),
@@ -248,6 +268,11 @@ impl CudaValue {
             storage: self.storage.as_spec(),
         }
     }
+    /// Identity and full capacity of the backing allocation retained by this value.
+    pub(crate) fn allocation(&self) -> (usize, usize) {
+        self.buffer.allocation()
+    }
+
     pub(crate) fn storage_bytes(&self) -> usize {
         self.buffer.len()
     }
@@ -256,8 +281,12 @@ impl CudaValue {
     }
 
     pub(crate) fn reshape_dense(&self, shape: Vec<usize>) -> Result<Self, String> {
-        self.require_dense()?;
-        validate_storage_bytes(ValueSpec::dense(self.dtype, &shape), self.storage_bytes())?;
+        validate_dense_reshape(
+            self.dtype,
+            self.storage.representation,
+            self.storage_bytes(),
+            &shape,
+        )?;
         let mut reshaped = self.clone();
         reshaped.shape = shape.into();
         Ok(reshaped)

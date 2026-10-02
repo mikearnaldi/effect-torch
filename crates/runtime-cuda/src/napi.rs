@@ -1,12 +1,9 @@
 use crate::device::CUDA_TOP_K_LIMIT;
-use crate::executable::{
-    compile_stateful_with_layout, CudaKvCache, CudaKvSnapshot, CudaStateLayout,
-};
+use crate::executable::{compile_stateful_with_layout, CudaKvSnapshot, CudaStateLayout};
 use crate::{
     compile_with_options, CudaDevice, CudaExecutable, CudaSequenceState, CudaStateInvocation,
     CudaValue,
 };
-use cudarc::driver::CudaSlice;
 use effect_torch_compiler::{
     specialize_decode_layout_outputs_with_attention, CompileOptions, CurrentBlockAttention,
     DecodeGeometry, DecodeLayout, DecodeOutputSelection, InferenceOptions,
@@ -18,10 +15,10 @@ use effect_torch_graph::{
 use effect_torch_napi::{run_compute, CancellationState};
 use effect_torch_runtime::{
     effective_probabilities, purpose_counter, random_unit, sample_logits, sample_probabilities,
-    DType, PackedFormat, SamplingOptions, SamplingPurpose, StorageMetadata, StorageRepresentation,
-    ValueSpec,
+    DType, KvLayerDescriptor, PackedFormat, SamplingOptions, SamplingPurpose, StateAccessMode,
+    StorageMetadata, StorageRepresentation, ValueSpec,
 };
-use napi::bindgen_prelude::{Buffer, Uint8Array};
+use napi::bindgen_prelude::{Buffer, Uint32Array, Uint8Array};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use serde_json::Value as JsonValue;
@@ -29,10 +26,16 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
+#[path = "napi/chain96.rs"]
+mod chain96;
+#[path = "napi/chain97.rs"]
+mod chain97;
 #[path = "napi/gguf.rs"]
 mod gguf;
+#[path = "napi/literal89.rs"]
+mod literal89;
 #[path = "napi/safetensors.rs"]
 mod safetensors_io;
 #[allow(unused_imports)]
@@ -224,7 +227,38 @@ impl From<NativeDecodeOutputSelection> for DecodeOutputSelection {
 }
 
 #[napi(object)]
+#[derive(Clone)]
+pub struct NativeKvLayerDescriptor {
+    pub layer_id: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub dtype: String,
+    pub retention_window: Option<u32>,
+}
+
+impl From<KvLayerDescriptor> for NativeKvLayerDescriptor {
+    fn from(layer: KvLayerDescriptor) -> Self {
+        Self {
+            layer_id: layer.layer_id,
+            kv_heads: layer.kv_heads as u32,
+            head_dim: layer.head_dim as u32,
+            dtype: layer.dtype.name().to_string(),
+            retention_window: layer.retention.map(|value| value as u32),
+        }
+    }
+}
+
+fn state_access(access: Option<&str>) -> Result<StateAccessMode> {
+    match access {
+        None | Some("Append") | Some("append") => Ok(StateAccessMode::Append),
+        Some("ReadOnly") | Some("readOnly") | Some("read-only") => Ok(StateAccessMode::ReadOnly),
+        _ => Err(invalid("compile: invalid state access")),
+    }
+}
+
+#[napi(object)]
 pub struct NativeKvStateSchema {
+    pub access: Option<String>,
     pub max_tokens: u32,
     pub block_size: u32,
     pub kv_dtype: String,
@@ -250,6 +284,7 @@ pub struct NativeRecurrentStateSchema {
 #[napi(object)]
 pub struct NativeCompileOptions {
     pub optimize: Option<bool>,
+    pub random_seed: Option<u32>,
     pub constant_weights: Option<bool>,
 }
 
@@ -366,6 +401,7 @@ fn compile_options(explicit: Option<NativeCompileOptions>, stateful: bool) -> Co
         if let Some(optimize) = explicit.optimize {
             options.optimize = optimize;
         }
+        options.random_seed = explicit.random_seed.map(u64::from);
         if stateful || explicit.constant_weights.is_some() {
             options.inference = Some(InferenceOptions {
                 constant_weights: explicit.constant_weights.unwrap_or(false),
@@ -411,25 +447,29 @@ impl NativeTargetMatchingOutput {
     }
 }
 
+#[napi(object, object_from_js = false)]
+pub struct NativeChain97Output {
+    pub feedback: NativeTensor,
+    pub statistics: Buffer,
+}
+
 #[derive(Clone)]
 struct CudaStateSchema {
     max_tokens: u32,
     block_size: u32,
     kv_dtype: DType,
-    window: Option<u32>,
     batch: u32,
     packed_rows_per_sequence: Option<u32>,
     geometry: DecodeGeometry,
+    access: StateAccessMode,
 }
 
 struct PoolInner {
+    kv_layers: Vec<KvLayerDescriptor>,
+    explicit_layers: bool,
     ordinal: u32,
-    layers: u32,
-    kv_heads: u32,
-    head_dim: u32,
     max_tokens: u32,
     block_size: u32,
-    dtype: DType,
     recurrent: NativeRecurrentStateSchema,
     usage: Mutex<PoolUsage>,
 }
@@ -485,25 +525,53 @@ struct SequenceState {
 struct SequenceInner {
     pool: Arc<PoolInner>,
     state: Mutex<SequenceState>,
-    device_cache: Mutex<Option<SequenceDeviceCache>>,
     released: AtomicBool,
     running: AtomicBool,
-}
-
-struct SequenceDeviceCache {
-    kv: CudaKvCache,
-    cursor: Option<Arc<CudaSlice<u32>>>,
-    valid: Option<Arc<CudaSlice<u32>>>,
-    decode_graph: Option<crate::executable::CudaDecodeGraph>,
 }
 
 struct SequenceLease {
     inner: Arc<SequenceInner>,
 }
 
+impl SequenceInner {
+    fn release_if_idle(&self) {
+        if self.released.load(Ordering::Acquire)
+            && self
+                .running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.clear_released();
+            self.running.store(false, Ordering::Release);
+        }
+    }
+
+    fn clear_released(&self) {
+        let mut usage = self
+            .pool
+            .usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for key in state.block_keys.drain(..) {
+            if let Some(count) = usage.blocks.get_mut(&key) {
+                *count = count.saturating_sub(1);
+            }
+        }
+        *state = SequenceState::default();
+    }
+}
+
+impl Drop for SequenceInner {
+    fn drop(&mut self) {
+        self.clear_released();
+    }
+}
+
 impl Drop for SequenceLease {
     fn drop(&mut self) {
         self.inner.running.store(false, Ordering::Release);
+        self.inner.release_if_idle();
     }
 }
 
@@ -525,6 +593,7 @@ impl NativeKvPool {
         block_size: Option<u32>,
         dtype: Option<String>,
         recurrent: Option<NativeRecurrentStateSchema>,
+        kv_layers: Option<Vec<NativeKvLayerDescriptor>>,
     ) -> Result<Self> {
         CudaDevice::get(device).map_err(failure)?;
         let block_size = block_size.unwrap_or(16);
@@ -537,10 +606,48 @@ impl NativeKvPool {
                 "kv pool: capacity must be a positive multiple of block size",
             ));
         }
-        if (layers == 0) != (kv_heads == 0 || head_dim == 0) {
+        if kv_layers.is_none() && (layers == 0) != (kv_heads == 0 || head_dim == 0) {
             return Err(invalid(
                 "kv pool: attention geometry must be entirely zero or positive",
             ));
+        }
+        let explicit_layers = kv_layers.is_some();
+        let mut kv_layers = match kv_layers {
+            Some(layers) => layers
+                .into_iter()
+                .map(|layer| {
+                    Ok(KvLayerDescriptor {
+                        layer_id: layer.layer_id,
+                        kv_heads: layer.kv_heads as usize,
+                        head_dim: layer.head_dim as usize,
+                        dtype: parse_dtype(&layer.dtype)?,
+                        retention: layer.retention_window.map(|n| n as usize),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => (0..layers)
+                .map(|layer_id| KvLayerDescriptor {
+                    layer_id,
+                    kv_heads: kv_heads as usize,
+                    head_dim: head_dim as usize,
+                    dtype,
+                    retention: None,
+                })
+                .collect(),
+        };
+        kv_layers.sort_by_key(|layer| layer.layer_id);
+        for (id, layer) in kv_layers.iter().enumerate() {
+            if layer.layer_id as usize != id
+                || layer.kv_heads == 0
+                || layer.head_dim == 0
+                || !matches!(
+                    layer.dtype,
+                    DType::F32 | DType::F16 | DType::BF16 | DType::U8
+                )
+                || layer.row_bytes().is_none()
+            {
+                return Err(invalid("kv pool: invalid layer descriptor"));
+            }
         }
         let recurrent = recurrent.unwrap_or(NativeRecurrentStateSchema {
             kda_layers: 0,
@@ -554,12 +661,10 @@ impl NativeKvPool {
         Ok(Self {
             inner: Arc::new(PoolInner {
                 ordinal: device,
-                layers,
-                kv_heads,
-                head_dim,
+                kv_layers,
+                explicit_layers,
                 max_tokens,
                 block_size,
-                dtype,
                 recurrent,
                 usage: Mutex::new(PoolUsage::default()),
             }),
@@ -579,8 +684,10 @@ impl NativeKvPool {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .blocks
-            .len() as u32;
-        self.inner.max_tokens / self.inner.block_size - used
+            .values()
+            .filter(|&&references| references > 0)
+            .count() as u32;
+        (self.inner.max_tokens / self.inner.block_size).saturating_sub(used)
     }
 
     #[napi(getter)]
@@ -616,11 +723,284 @@ impl NativeKvPool {
                     ],
                     ..SequenceState::default()
                 }),
-                device_cache: Mutex::new(None),
                 released: AtomicBool::new(false),
                 running: AtomicBool::new(false),
             }),
         }
+    }
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeKvLayerSnapshot {
+    pub layer_id: u32,
+    pub start_position: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub dtype: String,
+    pub keys: Vec<f64>,
+    pub values: Vec<f64>,
+}
+
+#[napi(object, object_from_js = false)]
+pub struct NativeKvSnapshotInspection {
+    pub cursor: u32,
+    pub retained_bytes: f64,
+    pub shared_bytes: f64,
+    pub copied_bytes: f64,
+    pub layers: Vec<NativeKvLayerSnapshot>,
+}
+
+struct PrefixData {
+    pool: Arc<PoolInner>,
+    state: SequenceState,
+}
+
+fn retain_block_keys(pool: &PoolInner, keys: &[BlockKey]) -> Result<()> {
+    let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
+    if keys
+        .iter()
+        .any(|key| usage.blocks.get(key).is_none_or(|count| *count == u32::MAX))
+    {
+        return Err(failure(
+            "kv prefix references a missing or saturated pool block",
+        ));
+    }
+    for key in keys {
+        *usage.blocks.get_mut(key).expect("block reference checked") += 1;
+    }
+    Ok(())
+}
+
+impl Drop for PrefixData {
+    fn drop(&mut self) {
+        let mut usage = self
+            .pool
+            .usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for key in &self.state.block_keys {
+            if let Some(count) = usage.blocks.get_mut(key) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+}
+
+impl PrefixData {
+    fn bytes(&self, shared_only: bool) -> usize {
+        let mut allocations = HashMap::new();
+        if let Some(storage) = &self.state.kv_storage {
+            for layer in &storage.layers {
+                for page in &layer.pages {
+                    if shared_only && Arc::strong_count(page) <= 1 {
+                        continue;
+                    }
+                    for (identity, bytes) in [
+                        Some(page.keys.allocation()),
+                        Some(page.values.allocation()),
+                        page.key_scales.as_ref().map(|buffer| buffer.allocation()),
+                        page.value_scales.as_ref().map(|buffer| buffer.allocation()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        allocations.insert(identity, bytes);
+                    }
+                }
+            }
+        }
+        allocations.values().sum()
+    }
+}
+
+#[napi]
+pub struct NativeKvPrefix {
+    inner: Mutex<Option<Arc<PrefixData>>>,
+}
+
+impl NativeKvPrefix {
+    fn borrowed(&self) -> Result<Arc<PrefixData>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| invalid("kv prefix was released"))
+    }
+}
+
+#[napi]
+impl NativeKvPrefix {
+    #[napi]
+    pub fn release(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    #[napi(getter)]
+    pub fn cursor(&self) -> Result<u32> {
+        Ok(self.borrowed()?.state.cursor)
+    }
+
+    #[napi(getter)]
+    pub fn retained_bytes(&self) -> Result<f64> {
+        Ok(self.borrowed()?.bytes(false) as f64)
+    }
+
+    #[napi(getter)]
+    pub fn shared_bytes(&self) -> Result<f64> {
+        Ok(self.borrowed()?.bytes(true) as f64)
+    }
+
+    #[napi(getter)]
+    pub fn copied_bytes(&self) -> Result<f64> {
+        self.borrowed()?;
+        Ok(0.0)
+    }
+
+    #[napi]
+    pub fn fork(&self) -> Result<NativeKvSequence> {
+        let prefix = self.borrowed()?;
+        retain_block_keys(&prefix.pool, &prefix.state.block_keys)?;
+        Ok(NativeKvSequence {
+            inner: Arc::new(SequenceInner {
+                pool: prefix.pool.clone(),
+                state: Mutex::new(prefix.state.clone()),
+                released: AtomicBool::new(false),
+                running: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    #[napi]
+    pub fn inspect(&self) -> Result<NativeKvSnapshotInspection> {
+        let prefix = self.borrowed()?;
+        let mut layers = Vec::with_capacity(prefix.pool.kv_layers.len());
+        for descriptor in &prefix.pool.kv_layers {
+            let storage = prefix.state.kv_storage.as_ref().and_then(|storage| {
+                storage
+                    .layers
+                    .iter()
+                    .find(|layer| layer.descriptor.layer_id == descriptor.layer_id)
+            });
+            let start = storage.map_or(prefix.state.cursor, |layer| layer.start_position);
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            if let Some(layer) = storage {
+                let device = if layer.pages.is_empty() {
+                    None
+                } else {
+                    Some(CudaDevice::get(prefix.pool.ordinal).map_err(failure)?)
+                };
+                let mut expected = start;
+                for page in &layer.pages {
+                    let begin = page.start.max(start);
+                    let end = page
+                        .start
+                        .checked_add(page.count)
+                        .ok_or_else(|| failure("kv inspect: page position overflow"))?
+                        .min(prefix.state.cursor);
+                    if begin >= end {
+                        continue;
+                    }
+                    if begin != expected {
+                        return Err(failure("kv inspect: missing or overlapping prefix rows"));
+                    }
+                    let device = device.as_ref().expect("nonempty pages have a device");
+                    let export = |buffer: &crate::buffer::CudaBuffer<u8>,
+                                  scales: Option<&crate::buffer::CudaBuffer<f32>>|
+                     -> Result<Vec<f64>> {
+                        let bytes = device
+                            .stream
+                            .clone_dtoh(buffer)
+                            .map_err(|error| failure(error.to_string()))?;
+                        let scales = scales
+                            .map(|values| {
+                                device
+                                    .stream
+                                    .clone_dtoh(values)
+                                    .map_err(|error| failure(error.to_string()))
+                            })
+                            .transpose()?;
+                        let row_width = descriptor.kv_heads * descriptor.head_dim;
+                        let mut result = Vec::with_capacity((end - begin) as usize * row_width);
+                        for token in begin..end {
+                            for head in 0..descriptor.kv_heads {
+                                for column in 0..descriptor.head_dim {
+                                    let row = (token - page.start) as usize;
+                                    let element = (row * descriptor.kv_heads + head)
+                                        * descriptor.head_dim
+                                        + column;
+                                    let offset = element * descriptor.dtype.size_in_bytes();
+                                    let raw = bytes
+                                        .get(offset..offset + descriptor.dtype.size_in_bytes())
+                                        .ok_or_else(|| {
+                                            failure("kv inspect: truncated page storage")
+                                        })?;
+                                    let value = match descriptor.dtype {
+                                        DType::F32 => {
+                                            f32::from_le_bytes(raw.try_into().expect("f32 bytes"))
+                                                as f64
+                                        }
+                                        DType::F16 => half::f16::from_bits(u16::from_le_bytes(
+                                            raw.try_into().expect("f16 bytes"),
+                                        ))
+                                        .to_f64(),
+                                        DType::BF16 => half::bf16::from_bits(u16::from_le_bytes(
+                                            raw.try_into().expect("bf16 bytes"),
+                                        ))
+                                        .to_f64(),
+                                        DType::U8 => {
+                                            let scale = scales
+                                                .as_ref()
+                                                .and_then(|values| {
+                                                    values.get(row * descriptor.kv_heads + head)
+                                                })
+                                                .ok_or_else(|| {
+                                                    failure(
+                                                        "kv inspect: missing quantization scale",
+                                                    )
+                                                })?;
+                                            ((raw[0] as f32 - 128.0) * scale) as f64
+                                        }
+                                        _ => {
+                                            return Err(failure(
+                                                "kv inspect: unsupported storage dtype",
+                                            ));
+                                        }
+                                    };
+                                    result.push(value);
+                                }
+                            }
+                        }
+                        Ok(result)
+                    };
+                    keys.extend(export(&page.keys, page.key_scales.as_ref())?);
+                    values.extend(export(&page.values, page.value_scales.as_ref())?);
+                    expected = end;
+                }
+                if expected != prefix.state.cursor {
+                    return Err(failure("kv inspect: prefix is missing its tail"));
+                }
+            }
+            layers.push(NativeKvLayerSnapshot {
+                layer_id: descriptor.layer_id,
+                start_position: start,
+                kv_heads: descriptor.kv_heads as u32,
+                head_dim: descriptor.head_dim as u32,
+                dtype: descriptor.dtype.name().to_string(),
+                keys,
+                values,
+            });
+        }
+        Ok(NativeKvSnapshotInspection {
+            cursor: prefix.state.cursor,
+            retained_bytes: prefix.bytes(false) as f64,
+            shared_bytes: prefix.bytes(true) as f64,
+            copied_bytes: 0.0,
+            layers,
+        })
     }
 }
 
@@ -642,6 +1022,11 @@ impl NativeKvSequence {
         {
             return Err(invalid("kv sequence is already in use"));
         }
+        if self.inner.released.load(Ordering::Acquire) {
+            self.inner.clear_released();
+            self.inner.running.store(false, Ordering::Release);
+            return Err(invalid("kv sequence was released"));
+        }
         Ok(SequenceLease {
             inner: self.inner.clone(),
         })
@@ -660,6 +1045,24 @@ impl NativeKvSequence {
     }
 
     #[napi]
+    pub fn snapshot(&self) -> Result<NativeKvPrefix> {
+        let _lease = self.lease()?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        retain_block_keys(&self.inner.pool, &state.block_keys)?;
+        Ok(NativeKvPrefix {
+            inner: Mutex::new(Some(Arc::new(PrefixData {
+                pool: self.inner.pool.clone(),
+                state,
+            }))),
+        })
+    }
+
+    #[napi]
     pub fn fork(&self) -> Result<Self> {
         let _lease = self.lease()?;
         let state = self
@@ -668,25 +1071,6 @@ impl NativeKvSequence {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let device_cache = {
-            let cache = self
-                .inner
-                .device_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            cache
-                .as_ref()
-                .map(|cache| {
-                    let device = CudaDevice::get(self.inner.pool.ordinal).map_err(failure)?;
-                    Ok::<_, Error>(SequenceDeviceCache {
-                        kv: cache.kv.try_clone(&device).map_err(failure)?,
-                        cursor: None,
-                        valid: None,
-                        decode_graph: None,
-                    })
-                })
-                .transpose()?
-        };
         let mut usage = self
             .inner
             .pool
@@ -704,7 +1088,6 @@ impl NativeKvSequence {
             inner: Arc::new(SequenceInner {
                 pool: self.inner.pool.clone(),
                 state: Mutex::new(state),
-                device_cache: Mutex::new(device_cache),
                 released: AtomicBool::new(false),
                 running: AtomicBool::new(false),
             }),
@@ -713,51 +1096,16 @@ impl NativeKvSequence {
 
     #[napi]
     pub fn release(&self) {
-        if !self.inner.released.swap(true, Ordering::AcqRel) {
-            let mut usage = self
-                .inner
-                .pool
-                .usage
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            state.cursor = 0;
-            state.tokens.clear();
-            for key in state.block_keys.drain(..) {
-                if let Some(references) = usage.blocks.get_mut(&key) {
-                    *references = references.saturating_sub(1);
-                }
-            }
-            state.kv_storage = None;
-            for layer in &mut state.kda_states {
-                layer.fill(0.0);
-            }
-            for layer in &mut state.conv_states {
-                layer.fill(0.0);
-            }
-            *self
-                .inner
-                .device_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = None;
-        }
+        self.inner.released.store(true, Ordering::Release);
+        self.inner.release_if_idle();
     }
 
     #[napi]
     pub fn prefill_match(&self, tokens: Vec<u32>) -> Result<u32> {
-        if self.inner.released.load(Ordering::Acquire) {
-            return Err(invalid("kv sequence was released"));
-        }
-        if self.inner.running.load(Ordering::Acquire) {
-            return Err(invalid("kv sequence is already in use"));
-        }
+        let _lease = self.lease()?;
         let pool = &self.inner.pool;
         let recurrent = pool.recurrent.kda_layers > 0 || pool.recurrent.conv_layers > 0;
-        if recurrent && pool.layers == 0 {
+        if recurrent && pool.kv_layers.is_empty() {
             return Ok(0);
         }
         let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
@@ -798,11 +1146,7 @@ impl NativeKvSequence {
                     .expect("snapshot block was checked") += 1;
             }
             *state = (*snapshot).clone();
-            *self
-                .inner
-                .device_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = None;
+
             return Ok(end as u32);
         }
         Ok(0)
@@ -1026,9 +1370,75 @@ impl LazyTensor {
     }
 }
 
+#[derive(Default)]
+struct ExportedTensorMemory {
+    allocations: HashMap<usize, (usize, usize)>,
+    bytes: usize,
+}
+
+static EXPORTED_TENSOR_MEMORY: LazyLock<Mutex<ExportedTensorMemory>> =
+    LazyLock::new(|| Mutex::new(ExportedTensorMemory::default()));
+
+struct ExportedTensorAccounting {
+    allocation: usize,
+    active: AtomicBool,
+}
+
+impl ExportedTensorAccounting {
+    fn new((allocation, bytes): (usize, usize)) -> Self {
+        let mut memory = EXPORTED_TENSOR_MEMORY
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((_, references)) = memory.allocations.get_mut(&allocation) {
+            *references += 1;
+        } else {
+            memory.allocations.insert(allocation, (bytes, 1));
+            memory.bytes += bytes;
+        }
+        Self {
+            allocation,
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn release(&self) {
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut memory = EXPORTED_TENSOR_MEMORY
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((bytes, references)) = memory.allocations.get_mut(&self.allocation) else {
+            return;
+        };
+        *references -= 1;
+        if *references == 0 {
+            let bytes = *bytes;
+            memory.allocations.remove(&self.allocation);
+            memory.bytes -= bytes;
+        }
+    }
+}
+
+impl Drop for ExportedTensorAccounting {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Backing bytes retained by live exported tensor slots, deduplicated across aliases.
+#[napi]
+pub fn external_memory_bytes() -> f64 {
+    EXPORTED_TENSOR_MEMORY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .bytes as f64
+}
+
 #[derive(Clone)]
 #[napi]
 pub struct NativeTensor {
+    accounting: Arc<ExportedTensorAccounting>,
     slot: Arc<LeafSlot>,
     ordinal: u32,
 }
@@ -1036,7 +1446,9 @@ pub struct NativeTensor {
 impl NativeTensor {
     fn wrap(value: CudaValue) -> Self {
         let ordinal = value.ordinal();
+        let accounting = Arc::new(ExportedTensorAccounting::new(value.allocation()));
         Self {
+            accounting,
             slot: Arc::new(LeafSlot::new(value)),
             ordinal,
         }
@@ -1053,7 +1465,15 @@ impl NativeTensor {
 impl NativeTensor {
     #[napi]
     pub fn clear(&self) {
+        // Remove the accounting entry before the allocation can be freed and its identity reused.
+        self.accounting.release();
         self.slot.clear();
+    }
+
+    /// Returns an independently clearable slot retaining the same device allocation.
+    #[napi]
+    pub fn retain(&self) -> Result<NativeTensor> {
+        Ok(Self::wrap(self.value()?))
     }
 
     #[napi(js_name = "writeBytes")]
@@ -1170,6 +1590,56 @@ impl NativeTensor {
 pub struct Executable {
     inner: Arc<CudaExecutable>,
     state: Option<CudaStateSchema>,
+    request_rng99: Option<Arc<crate::executable::RequestRng99>>,
+}
+
+impl PoolInner {
+    fn matches_layers(&self, layers: &[KvLayerDescriptor]) -> bool {
+        self.kv_layers.len() == layers.len()
+            && self.kv_layers.iter().zip(layers).all(|(pool, layer)| {
+                let mut expected = *layer;
+                if !self.explicit_layers {
+                    expected.retention = pool.retention;
+                }
+                *pool == expected
+            })
+    }
+}
+
+impl CudaStateSchema {
+    fn retention_start(&self, cursor: u32) -> u32 {
+        self.geometry
+            .kv_layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .retention
+                    .map_or(0, |retention| cursor.saturating_sub(retention as u32))
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn validate_pool(&self, pool: &PoolInner, ordinal: u32) -> Result<()> {
+        let recurrent = &pool.recurrent;
+        if pool.ordinal != ordinal
+            || !pool.matches_layers(&self.geometry.kv_layers)
+            || pool.max_tokens != self.max_tokens
+            || pool.block_size != self.block_size
+            || recurrent.kda_layers != self.geometry.kda.layers as u32
+            || recurrent.kda_heads != self.geometry.kda.heads as u32
+            || recurrent.kda_head_dim != self.geometry.kda.head_dim as u32
+            || recurrent.kda_value_dim != self.geometry.kda.value_dim as u32
+            || recurrent.conv_layers != self.geometry.conv.layers as u32
+            || recurrent.conv_channels != self.geometry.conv.channels as u32
+            || recurrent.conv_kernel != self.geometry.conv.kernel as u32
+        {
+            return Err(invalid(
+                "execute: pool geometry does not match executable state",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Executable {
@@ -1186,6 +1656,9 @@ impl Executable {
             .state
             .as_ref()
             .ok_or_else(|| invalid("execute: state invocation requires a stateful executable"))?;
+        if schema.access != StateAccessMode::Append {
+            return Err(invalid("execute: ReadOnly state requires executeReadOnly"));
+        }
         let batch = schema.batch as usize;
         if sequences.is_empty()
             || sequences.len() > batch
@@ -1219,33 +1692,18 @@ impl Executable {
                     "execute: every sequence must use the same state pool",
                 ));
             }
-            let recurrent = &pool.recurrent;
-            if pool.ordinal != self.inner.ordinal()
-                || pool.layers != schema.geometry.layers as u32
-                || pool.kv_heads != schema.geometry.kv_heads as u32
-                || pool.head_dim != schema.geometry.head_dim as u32
-                || pool.max_tokens != schema.max_tokens
-                || pool.block_size != schema.block_size
-                || pool.dtype != schema.kv_dtype
-                || recurrent.kda_layers != schema.geometry.kda.layers as u32
-                || recurrent.kda_heads != schema.geometry.kda.heads as u32
-                || recurrent.kda_head_dim != schema.geometry.kda.head_dim as u32
-                || recurrent.kda_value_dim != schema.geometry.kda.value_dim as u32
-                || recurrent.conv_layers != schema.geometry.conv.layers as u32
-                || recurrent.conv_channels != schema.geometry.conv.channels as u32
-                || recurrent.conv_kernel != schema.geometry.conv.kernel as u32
-            {
-                return Err(invalid(
-                    "execute: pool geometry does not match executable state",
-                ));
-            }
+            schema.validate_pool(pool, self.inner.ordinal())?;
             let cursor = sequence
                 .inner
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .cursor;
-            if schema.window.is_none() && cursor.saturating_add(advances[slot]) > schema.max_tokens
+            if cursor.checked_add(advances[slot]).is_none()
+                || cursor
+                    .saturating_add(advances[slot])
+                    .saturating_sub(schema.retention_start(cursor))
+                    > schema.max_tokens
             {
                 return Err(invalid(format!(
                     "execute: sequence context exceeds pool capacity {}",
@@ -1287,17 +1745,10 @@ impl Executable {
             }
             let mut combined = state.tokens.clone();
             combined.extend_from_slice(&tokens[request]);
-            let previous_blocks = state.tokens.len().div_ceil(block_size);
-            let previous_retained = schema.window.map_or(previous_blocks, |window| {
-                previous_blocks.min((window as usize).div_ceil(block_size))
-            });
-            let previous_start = previous_blocks.saturating_sub(previous_retained);
+            let previous_start = schema.retention_start(state.cursor) as usize / block_size;
             let unchanged = state.tokens.len() / block_size;
             let blocks = combined.len().div_ceil(block_size);
-            let retained = schema.window.map_or(blocks, |window| {
-                blocks.min((window as usize).div_ceil(block_size))
-            });
-            let start = blocks.saturating_sub(retained);
+            let start = schema.retention_start(combined.len() as u32) as usize / block_size;
             let identity = Arc::as_ptr(&lease.inner) as usize;
             desired.push(
                 (start..blocks)
@@ -1346,68 +1797,12 @@ impl Executable {
     }
 
     fn decode_state_with_schema(
-        executable: &CudaExecutable,
+        _executable: &CudaExecutable,
         schema: &CudaStateSchema,
         leases: &[SequenceLease],
         slots: &[u32],
         valid_lengths: &[u32],
     ) -> Result<CudaStateInvocation> {
-        let retains_single_cache = leases.len() == 1 && slots == [0] && valid_lengths.len() == 1;
-        if !retains_single_cache {
-            for lease in leases {
-                if lease
-                    .inner
-                    .device_cache
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .is_none()
-                {
-                    continue;
-                }
-                let singleton = std::slice::from_ref(lease);
-                let mut retained =
-                    Self::decode_state_with_schema(executable, schema, singleton, &[0], &[0])?;
-                if let Err(error) = executable.readback_state(&mut retained) {
-                    Self::retain_device_cache(singleton, &[0], &mut retained);
-                    return Err(failure(error));
-                }
-                let snapshot = match retained.sequences[0].kv_storage.take() {
-                    Some(snapshot) => snapshot,
-                    None => {
-                        Self::retain_device_cache(singleton, &[0], &mut retained);
-                        return Err(failure(
-                            "CUDA retained cache readback did not publish a storage snapshot",
-                        ));
-                    }
-                };
-                lease
-                    .inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .kv_storage = Some(snapshot);
-            }
-        }
-        let device_cache = if retains_single_cache {
-            leases[0]
-                .inner
-                .device_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-        } else {
-            None
-        };
-        let retained_kv = device_cache.is_some();
-        let (cache, cursor_device, valid_device, decode_graph) =
-            device_cache.map_or((None, None, None, None), |cache| {
-                (
-                    Some(cache.kv),
-                    cache.cursor,
-                    cache.valid,
-                    cache.decode_graph,
-                )
-            });
         Ok(CudaStateInvocation {
             sequences: leases
                 .iter()
@@ -1421,11 +1816,7 @@ impl Executable {
                         cursor: state.cursor,
                         keys: Vec::new(),
                         values: Vec::new(),
-                        kv_storage: if retained_kv {
-                            None
-                        } else {
-                            state.kv_storage.clone()
-                        },
+                        kv_storage: state.kv_storage.clone(),
                         kda_states: state.kda_states.clone(),
                         conv_states: state.conv_states.clone(),
                     }
@@ -1433,63 +1824,57 @@ impl Executable {
                 .collect(),
             slots: slots.to_vec(),
             valid_lengths: valid_lengths.to_vec(),
-            capacity: leases[0].inner.pool.max_tokens,
-            cache_dtype: leases[0].inner.pool.dtype,
+            capacity: schema.max_tokens,
+            cache_dtype: schema.kv_dtype,
             packed_rows_per_sequence: schema.packed_rows_per_sequence,
-            cache,
-            cursor_device,
-            valid_device,
-            decode_graph,
+            kv_layers: schema.geometry.kv_layers.clone(),
+            access: schema.access,
+            cache: None,
         })
     }
 
-    fn should_readback_kv(leases: &[SequenceLease], slots: &[u32], advances: &[u32]) -> bool {
-        if leases.len() != 1 || slots != [0] || advances.len() != 1 {
-            return true;
-        }
-        let pool = &leases[0].inner.pool;
-        let cursor = leases[0]
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .cursor;
-        cursor
-            .saturating_add(advances[0])
-            .is_multiple_of(pool.block_size)
-    }
-
-    fn retain_device_cache(
+    fn with_state_transaction<A>(
         leases: &[SequenceLease],
-        slots: &[u32],
-        decoded: &mut CudaStateInvocation,
-    ) {
-        if leases.len() != 1 || slots != [0] || decoded.valid_lengths.len() != 1 {
-            return;
-        }
-        let Some(cache) = decoded.cache.take() else {
-            return;
-        };
-        *leases[0]
-            .inner
-            .device_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(SequenceDeviceCache {
-            kv: cache,
-            cursor: decoded.cursor_device.take(),
-            valid: decoded.valid_device.take(),
-            decode_graph: decoded.decode_graph.take(),
-        });
-    }
-
-    fn with_retained_device_cache<A>(
-        leases: &[SequenceLease],
-        slots: &[u32],
+        _slots: &[u32],
         decoded: &mut CudaStateInvocation,
         execute: impl FnOnce(&mut CudaStateInvocation) -> Result<A>,
     ) -> Result<A> {
+        let checkpoints = leases
+            .iter()
+            .map(|lease| {
+                lease
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+            })
+            .collect::<Vec<_>>();
         let result = execute(decoded);
-        Self::retain_device_cache(leases, slots, decoded);
+        if result.is_err() {
+            let mut usage = leases[0]
+                .inner
+                .pool
+                .usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for (lease, previous) in leases.iter().zip(checkpoints) {
+                let mut current = lease
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for key in &current.block_keys {
+                    if let Some(references) = usage.blocks.get_mut(key) {
+                        *references = references.saturating_sub(1);
+                    }
+                }
+                for key in &previous.block_keys {
+                    *usage.blocks.entry(key.clone()).or_default() += 1;
+                }
+                *current = previous;
+            }
+        }
         result
     }
 
@@ -1518,7 +1903,7 @@ impl Executable {
             state.kda_states = decoded.sequences[request].kda_states.clone();
             state.conv_states = decoded.sequences[request].conv_states.clone();
             state.block_keys = block_keys[request].clone();
-            if (commit_kv || lease.inner.pool.layers == 0)
+            if (commit_kv || lease.inner.pool.kv_layers.is_empty())
                 && state.cursor.is_multiple_of(lease.inner.pool.block_size)
             {
                 if let Some(key) = state.block_keys.last().cloned() {
@@ -1566,7 +1951,7 @@ impl Executable {
             }
             state.kda_states = decoded.sequences[request].kda_states.clone();
             state.conv_states = decoded.sequences[request].conv_states.clone();
-            if (commit_kv || lease.inner.pool.layers == 0)
+            if (commit_kv || lease.inner.pool.kv_layers.is_empty())
                 && state.cursor.is_multiple_of(lease.inner.pool.block_size)
             {
                 if let Some(key) = state.block_keys.last().cloned() {
@@ -1599,6 +1984,19 @@ impl Executable {
         self.state
             .as_ref()
             .is_some_and(|state| state.geometry.allows_window_eviction)
+    }
+
+    #[napi(getter)]
+    pub fn kv_layers(&self) -> Vec<NativeKvLayerDescriptor> {
+        self.state.as_ref().map_or_else(Vec::new, |state| {
+            state
+                .geometry
+                .kv_layers
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect()
+        })
     }
 
     #[napi(getter)]
@@ -1681,6 +2079,521 @@ impl Executable {
         self.inner.instruction_count() as u32
     }
 
+    /// Private diagnostic fork: two immutable templates, one request RNG stream.
+    #[napi]
+    pub fn fork_request_rng99(&self, peer: &Executable, seed: u32) -> Result<Vec<Executable>> {
+        if self.request_rng99.is_some()
+            || peer.request_rng99.is_some()
+            || self.inner.ordinal() != peer.inner.ordinal()
+            || !crate::executable::RequestRng99::graphs_disabled()
+            || [self, peer].iter().any(|program| {
+                !program.inner.request_rng99_admitted()
+                    || !program
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.access == StateAccessMode::ReadOnly)
+            })
+        {
+            return Err(invalid(
+                "forkRequestRng99: unforked read-only seed0 single-source same-device templates and graphs disabled required",
+            ));
+        }
+        let rng = Arc::new(crate::executable::RequestRng99::new(seed));
+        Ok([self, peer]
+            .into_iter()
+            .map(|program| Executable {
+                inner: program.inner.clone(),
+                state: program.state.clone(),
+                request_rng99: Some(rng.clone()),
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub async fn execute_read_only(
+        &self,
+        bindings: Vec<&NativeTensor>,
+        prefixes: Vec<&NativeKvPrefix>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        token: Option<&CancellationToken>,
+    ) -> Result<Vec<NativeTensor>> {
+        let schema = self
+            .state
+            .as_ref()
+            .ok_or_else(|| invalid("executeReadOnly: state schema required"))?;
+        if schema.access != StateAccessMode::ReadOnly
+            || schema.geometry.kda.layers != 0
+            || schema.geometry.conv.layers != 0
+            || schema.packed_rows_per_sequence.is_some()
+        {
+            return Err(invalid(
+                "executeReadOnly: requires a dense read-only KV executable",
+            ));
+        }
+        let batch = schema.batch as usize;
+        if prefixes.is_empty()
+            || prefixes.len() > batch
+            || slots.len() != prefixes.len()
+            || active_mask.len() != batch
+            || valid_lengths.len() != batch
+        {
+            return Err(invalid("executeReadOnly: invalid fixed-lane metadata"));
+        }
+        let prefixes = prefixes
+            .iter()
+            .map(|prefix| prefix.borrowed())
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = vec![false; batch];
+        for (prefix, &slot) in prefixes.iter().zip(&slots) {
+            let slot = slot as usize;
+            if slot >= batch || seen[slot] || valid_lengths[slot] == 0 {
+                return Err(invalid("executeReadOnly: invalid or duplicate active slot"));
+            }
+            seen[slot] = true;
+            if !Arc::ptr_eq(&prefixes[0].pool, &prefix.pool) {
+                return Err(invalid("executeReadOnly: prefixes must share a pool"));
+            }
+            schema.validate_pool(&prefix.pool, self.inner.ordinal())?;
+        }
+        if (0..batch).any(|slot| {
+            active_mask[slot] != seen[slot] || (!seen[slot] && valid_lengths[slot] != 0)
+        }) {
+            return Err(invalid(
+                "executeReadOnly: inconsistent inactive lane metadata",
+            ));
+        }
+        let bindings = bindings
+            .into_iter()
+            .map(NativeTensor::value)
+            .collect::<Result<Vec<_>>>()?;
+        let schema = schema.clone();
+        let executable = self.inner.clone();
+        let request_rng99 = self.request_rng99.clone();
+        let state = token
+            .map(|token| token.state.clone())
+            .unwrap_or_else(|| Arc::new(CancellationState::new()));
+        let notify = token.map(|token| token.notify.clone());
+        run_compute(state, notify, move |cancelled, _| {
+            let mut invocation = CudaStateInvocation {
+                sequences: prefixes
+                    .iter()
+                    .map(|prefix| CudaSequenceState {
+                        cursor: prefix.state.cursor,
+                        keys: Vec::new(),
+                        values: Vec::new(),
+                        kda_states: Vec::new(),
+                        conv_states: Vec::new(),
+                        kv_storage: prefix.state.kv_storage.clone(),
+                    })
+                    .collect(),
+                slots,
+                valid_lengths,
+                capacity: schema.max_tokens,
+                cache_dtype: schema.kv_dtype,
+                packed_rows_per_sequence: None,
+                kv_layers: schema.geometry.kv_layers,
+                access: StateAccessMode::ReadOnly,
+                cache: None,
+            };
+            match request_rng99.as_deref() {
+                Some(rng) => executable.execute_stateful_request99(
+                    &bindings,
+                    &mut invocation,
+                    cancelled,
+                    rng,
+                ),
+                None => executable.execute_stateful(&bindings, &[], &mut invocation, cancelled),
+            }
+            .map(|outputs| outputs.into_iter().map(NativeTensor::wrap).collect())
+            .map_err(|message| {
+                if cancelled.is_cancelled() {
+                    Error::new(Status::Cancelled, "operation aborted")
+                } else {
+                    failure(message)
+                }
+            })
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn execute_chain96(
+        &self,
+        head: Option<&Executable>,
+        sampler: &Executable,
+        bindings: Vec<&NativeTensor>,
+        prefixes: Vec<&NativeKvPrefix>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        temperature: f64,
+        token: Option<&CancellationToken>,
+    ) -> Result<Vec<NativeTensor>> {
+        if self.request_rng99.is_some()
+            || sampler.request_rng99.is_some()
+            || head.is_some_and(|head| head.request_rng99.is_some())
+        {
+            return Err(invalid("requestRng99 forks must use executeReadOnly"));
+        }
+        if head.is_some_and(|head| {
+            head.state.is_some() || head.inner.ordinal() != self.inner.ordinal()
+        }) || sampler.state.is_some()
+            || sampler.inner.ordinal() != self.inner.ordinal()
+            || !temperature.is_finite()
+        {
+            return Err(invalid(
+                "executeChain96: stateless same-device successors and finite temperature required",
+            ));
+        }
+        if !self.inner.chain96_dense_outputs()
+            || head.is_some_and(|head| !head.inner.chain96_successor(&[]))
+            || !sampler.inner.chain96_successor(&[DType::F32])
+        {
+            return Err(invalid(
+                "executeChain96: dense successors require zero head scalars and one F32 sampler scalar",
+            ));
+        }
+        let body_outputs = self.inner.outputs();
+        let sampler_input = head.map_or(body_outputs, |head| head.inner.outputs());
+        if body_outputs.len() != 1
+            || sampler_input.len() != 1
+            || sampler.inner.outputs().is_empty()
+            || sampler.inner.outputs().len() > 8
+            || head.is_some_and(|head| {
+                head.inner.tensor_input(0).as_ref() != body_outputs.first()
+                    || head.inner.tensor_input(1).is_some()
+            })
+            || sampler.inner.tensor_input(0).as_ref() != sampler_input.first()
+            || sampler.inner.tensor_input(1).is_some()
+        {
+            return Err(invalid(
+                "executeChain96: incompatible bounded one-output stage metadata",
+            ));
+        }
+        let head = head.map(|head| head.inner.clone());
+        let sampler = sampler.inner.clone();
+        let schema = self
+            .state
+            .as_ref()
+            .ok_or_else(|| invalid("executeChain96: state schema required"))?;
+        if schema.access != StateAccessMode::ReadOnly
+            || schema.geometry.kda.layers != 0
+            || schema.geometry.conv.layers != 0
+            || schema.packed_rows_per_sequence.is_some()
+        {
+            return Err(invalid(
+                "executeChain96: requires a dense read-only KV executable",
+            ));
+        }
+        let batch = schema.batch as usize;
+        if prefixes.is_empty()
+            || prefixes.len() > batch
+            || slots.len() != prefixes.len()
+            || active_mask.len() != batch
+            || valid_lengths.len() != batch
+        {
+            return Err(invalid("executeChain96: invalid fixed-lane metadata"));
+        }
+        let prefixes = prefixes
+            .iter()
+            .map(|prefix| prefix.borrowed())
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = vec![false; batch];
+        for (prefix, &slot) in prefixes.iter().zip(&slots) {
+            let slot = slot as usize;
+            if slot >= batch || seen[slot] || valid_lengths[slot] == 0 {
+                return Err(invalid("executeChain96: invalid or duplicate active slot"));
+            }
+            seen[slot] = true;
+            if !Arc::ptr_eq(&prefixes[0].pool, &prefix.pool) {
+                return Err(invalid("executeChain96: prefixes must share a pool"));
+            }
+            schema.validate_pool(&prefix.pool, self.inner.ordinal())?;
+        }
+        if (0..batch).any(|slot| {
+            active_mask[slot] != seen[slot] || (!seen[slot] && valid_lengths[slot] != 0)
+        }) {
+            return Err(invalid(
+                "executeChain96: inconsistent inactive lane metadata",
+            ));
+        }
+        let bindings = bindings
+            .into_iter()
+            .map(NativeTensor::value)
+            .collect::<Result<Vec<_>>>()?;
+        let schema = schema.clone();
+        let executable = self.inner.clone();
+        let state = token
+            .map(|token| token.state.clone())
+            .unwrap_or_else(|| Arc::new(CancellationState::new()));
+        let notify = token.map(|token| token.notify.clone());
+        run_compute(state, notify, move |cancelled, _| {
+            let mut invocation = CudaStateInvocation {
+                sequences: prefixes
+                    .iter()
+                    .map(|prefix| CudaSequenceState {
+                        cursor: prefix.state.cursor,
+                        keys: Vec::new(),
+                        values: Vec::new(),
+                        kda_states: Vec::new(),
+                        conv_states: Vec::new(),
+                        kv_storage: prefix.state.kv_storage.clone(),
+                    })
+                    .collect(),
+                slots,
+                valid_lengths,
+                capacity: schema.max_tokens,
+                cache_dtype: schema.kv_dtype,
+                packed_rows_per_sequence: None,
+                kv_layers: schema.geometry.kv_layers,
+                access: StateAccessMode::ReadOnly,
+                cache: None,
+            };
+            chain96::execute(
+                || executable.execute_stateful(&bindings, &[], &mut invocation, cancelled),
+                head.as_deref(),
+                &sampler,
+                temperature,
+                cancelled,
+            )
+            .map(|outputs| outputs.into_iter().map(NativeTensor::wrap).collect())
+            .map_err(|message| {
+                if cancelled.is_cancelled() {
+                    Error::new(Status::Cancelled, "operation aborted")
+                } else {
+                    failure(message)
+                }
+            })
+        })
+        .await
+    }
+
+    /// Pure immutable admission for the host-input / processed-output pipeline.
+    #[napi]
+    pub fn supports_chain97(
+        &self,
+        head: Option<&Executable>,
+        sampler: &Executable,
+        width: u32,
+    ) -> bool {
+        let width = width as usize;
+        let Some(schema) = self.state.as_ref() else {
+            return false;
+        };
+        let body_outputs = self.inner.outputs();
+        let sampler_input = head.map_or(body_outputs, |head| head.inner.outputs());
+        self.request_rng99.is_none()
+            && sampler.request_rng99.is_none()
+            && head.is_none_or(|head| head.request_rng99.is_none())
+            && schema.access == StateAccessMode::ReadOnly
+            && schema.batch == 1
+            && schema.geometry.kda.layers == 0
+            && schema.geometry.conv.layers == 0
+            && schema.packed_rows_per_sequence.is_none()
+            && (1..=256).contains(&width)
+            && self.inner.tensor_input(0) == Some((vec![1, width], DType::U32))
+            && self.inner.chain96_dense_outputs()
+            && body_outputs.len() == 1
+            && sampler_input.len() == 1
+            && head.is_none_or(|head| {
+                head.state.is_none()
+                    && head.inner.ordinal() == self.inner.ordinal()
+                    && head.inner.chain96_successor(&[])
+                    && head.inner.tensor_input(0).as_ref() == body_outputs.first()
+                    && head.inner.tensor_input(1).is_none()
+            })
+            && sampler.state.is_none()
+            && sampler.inner.ordinal() == self.inner.ordinal()
+            && sampler.inner.chain96_successor(&[DType::F32])
+            && sampler.inner.tensor_input(0).as_ref() == sampler_input.first()
+            && sampler.inner.tensor_input(1).is_none()
+            && sampler.inner.outputs().len() == 2
+            && sampler.inner.outputs()[1] == (vec![width * 4 + 1], DType::F32)
+    }
+
+    #[napi]
+    pub async fn execute_chain97(
+        &self,
+        head: Option<&Executable>,
+        sampler: &Executable,
+        canvas: Uint32Array,
+        bindings: Vec<&NativeTensor>,
+        prefixes: Vec<&NativeKvPrefix>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        temperature: f64,
+        token: Option<&CancellationToken>,
+    ) -> Result<NativeChain97Output> {
+        if self.request_rng99.is_some()
+            || sampler.request_rng99.is_some()
+            || head.is_some_and(|head| head.request_rng99.is_some())
+        {
+            return Err(invalid("requestRng99 forks must use executeReadOnly"));
+        }
+        if head.is_some_and(|head| {
+            head.state.is_some() || head.inner.ordinal() != self.inner.ordinal()
+        }) || sampler.state.is_some()
+            || sampler.inner.ordinal() != self.inner.ordinal()
+            || !temperature.is_finite()
+        {
+            return Err(invalid(
+                "executeChain97: stateless same-device successors and finite temperature required",
+            ));
+        }
+        if !self.inner.chain96_dense_outputs()
+            || head.is_some_and(|head| !head.inner.chain96_successor(&[]))
+            || !sampler.inner.chain96_successor(&[DType::F32])
+        {
+            return Err(invalid(
+                "executeChain97: dense successors require zero head scalars and one F32 sampler scalar",
+            ));
+        }
+        let body_outputs = self.inner.outputs();
+        let sampler_input = head.map_or(body_outputs, |head| head.inner.outputs());
+        if body_outputs.len() != 1
+            || sampler_input.len() != 1
+            || sampler.inner.outputs().is_empty()
+            || sampler.inner.outputs().len() > 8
+            || head.is_some_and(|head| {
+                head.inner.tensor_input(0).as_ref() != body_outputs.first()
+                    || head.inner.tensor_input(1).is_some()
+            })
+            || sampler.inner.tensor_input(0).as_ref() != sampler_input.first()
+            || sampler.inner.tensor_input(1).is_some()
+        {
+            return Err(invalid(
+                "executeChain97: incompatible bounded one-output stage metadata",
+            ));
+        }
+        let canvas = canvas.to_vec();
+        if canvas.is_empty()
+            || canvas.len() > 256
+            || self.inner.tensor_input(0) != Some((vec![1, canvas.len()], DType::U32))
+            || sampler.inner.outputs().len() != 2
+            || sampler.inner.outputs()[1] != (vec![canvas.len() * 4 + 1], DType::F32)
+        {
+            return Err(invalid(
+                "executeChain97: expected bounded U32 canvas and packed F32 statistics output",
+            ));
+        }
+        let upload = Node::new(NodeKind::FromBytes {
+            data: canvas
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+            shape: vec![1, canvas.len()],
+            dtype: DType::U32,
+            device: Device::Cuda(self.inner.ordinal()),
+        })
+        .map_err(invalid)?;
+        let device = CudaDevice::get(self.inner.ordinal()).map_err(failure)?;
+        let head = head.map(|head| head.inner.clone());
+        let sampler = sampler.inner.clone();
+        let schema = self
+            .state
+            .as_ref()
+            .ok_or_else(|| invalid("executeChain97: state schema required"))?;
+        if schema.access != StateAccessMode::ReadOnly
+            || schema.geometry.kda.layers != 0
+            || schema.geometry.conv.layers != 0
+            || schema.packed_rows_per_sequence.is_some()
+        {
+            return Err(invalid(
+                "executeChain97: requires a dense read-only KV executable",
+            ));
+        }
+        let batch = schema.batch as usize;
+        if prefixes.is_empty()
+            || prefixes.len() > batch
+            || slots.len() != prefixes.len()
+            || active_mask.len() != batch
+            || valid_lengths.len() != batch
+        {
+            return Err(invalid("executeChain97: invalid fixed-lane metadata"));
+        }
+        let prefixes = prefixes
+            .iter()
+            .map(|prefix| prefix.borrowed())
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen = vec![false; batch];
+        for (prefix, &slot) in prefixes.iter().zip(&slots) {
+            let slot = slot as usize;
+            if slot >= batch || seen[slot] || valid_lengths[slot] == 0 {
+                return Err(invalid("executeChain97: invalid or duplicate active slot"));
+            }
+            seen[slot] = true;
+            if !Arc::ptr_eq(&prefixes[0].pool, &prefix.pool) {
+                return Err(invalid("executeChain97: prefixes must share a pool"));
+            }
+            schema.validate_pool(&prefix.pool, self.inner.ordinal())?;
+        }
+        if (0..batch).any(|slot| {
+            active_mask[slot] != seen[slot] || (!seen[slot] && valid_lengths[slot] != 0)
+        }) {
+            return Err(invalid(
+                "executeChain97: inconsistent inactive lane metadata",
+            ));
+        }
+        let bindings = bindings
+            .into_iter()
+            .map(NativeTensor::value)
+            .collect::<Result<Vec<_>>>()?;
+        let schema = schema.clone();
+        let executable = self.inner.clone();
+        let state = token
+            .map(|token| token.state.clone())
+            .unwrap_or_else(|| Arc::new(CancellationState::new()));
+        let notify = token.map(|token| token.notify.clone());
+        run_compute(state, notify, move |cancelled, _| {
+            let mut invocation = CudaStateInvocation {
+                sequences: prefixes
+                    .iter()
+                    .map(|prefix| CudaSequenceState {
+                        cursor: prefix.state.cursor,
+                        keys: Vec::new(),
+                        values: Vec::new(),
+                        kda_states: Vec::new(),
+                        conv_states: Vec::new(),
+                        kv_storage: prefix.state.kv_storage.clone(),
+                    })
+                    .collect(),
+                slots,
+                valid_lengths,
+                capacity: schema.max_tokens,
+                cache_dtype: schema.kv_dtype,
+                packed_rows_per_sequence: None,
+                kv_layers: schema.geometry.kv_layers,
+                access: StateAccessMode::ReadOnly,
+                cache: None,
+            };
+            chain97::execute(
+                device,
+                upload,
+                bindings,
+                |bindings| executable.execute_stateful(bindings, &[], &mut invocation, cancelled),
+                head.as_deref(),
+                &sampler,
+                temperature,
+                cancelled,
+            )
+            .map(|(feedback, statistics)| NativeChain97Output {
+                feedback: NativeTensor::wrap(feedback),
+                statistics: Buffer::from(statistics),
+            })
+            .map_err(|message| {
+                if cancelled.is_cancelled() {
+                    Error::new(Status::Cancelled, "operation aborted")
+                } else {
+                    failure(message)
+                }
+            })
+        })
+        .await
+    }
+
     #[napi]
     pub async fn execute(
         &self,
@@ -1688,6 +2601,11 @@ impl Executable {
         scalars: Vec<f64>,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
+        if self.state.is_some() {
+            return Err(invalid(
+                "execute: stateful executable requires executeStateful or executeReadOnly",
+            ));
+        }
         let bindings = bindings
             .into_iter()
             .map(NativeTensor::value)
@@ -1743,7 +2661,7 @@ impl Executable {
             .map(|token| token.state.clone())
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
         let notify = token.map(|token| token.notify.clone());
-        run_compute(state, notify, move |cancelled, _| {
+        run_compute(state, notify, move |cancelled, cancellation| {
             let mut decode_state = Self::decode_state_with_schema(
                 &executable,
                 &schema,
@@ -1751,7 +2669,7 @@ impl Executable {
                 &slots,
                 &valid_lengths,
             )?;
-            Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
+            Self::with_state_transaction(&leases, &slots, &mut decode_state, |decode_state| {
                 let pool = leases[0].inner.pool.clone();
                 let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
                 let (mut planned, block_keys) =
@@ -1759,9 +2677,12 @@ impl Executable {
                 let values = executable
                     .execute_stateful(&bindings, &[], decode_state, cancelled)
                     .map_err(failure)?;
-                let readback_kv = Self::should_readback_kv(&leases, &slots, &advances);
+                let readback_kv = true;
                 if readback_kv {
                     executable.readback_state(decode_state).map_err(failure)?;
+                }
+                if !cancellation.complete() {
+                    return Err(Error::new(Status::Cancelled, "operation aborted"));
                 }
                 Self::commit_sequences(
                     &leases,
@@ -1829,7 +2750,7 @@ impl Executable {
             .map(|token| token.state.clone())
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
         let notify = token.map(|token| token.notify.clone());
-        run_compute(state, notify, move |cancelled, _| {
+        run_compute(state, notify, move |cancelled, cancellation| {
             let mut decode_state = Self::decode_state_with_schema(
                 &executable,
                 &schema,
@@ -1837,7 +2758,7 @@ impl Executable {
                 &slots,
                 &valid_lengths,
             )?;
-            Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
+            Self::with_state_transaction(&leases, &slots, &mut decode_state, |decode_state| {
                 let pool = leases[0].inner.pool.clone();
                 let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
                 let (mut planned, block_keys) =
@@ -1872,9 +2793,12 @@ impl Executable {
                     }
                     sampled
                 };
-                let readback_kv = Self::should_readback_kv(&leases, &slots, &advances);
+                let readback_kv = true;
                 if readback_kv {
                     executable.readback_state(decode_state).map_err(failure)?;
+                }
+                if !cancellation.complete() {
+                    return Err(Error::new(Status::Cancelled, "operation aborted"));
                 }
                 Self::commit_sequences(
                     &leases,
@@ -1978,7 +2902,7 @@ impl Executable {
             .map(|token| token.state.clone())
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
         let notify = token.map(|token| token.notify.clone());
-        run_compute(state, notify, move |cancelled, _| {
+        run_compute(state, notify, move |cancelled, cancellation| {
             let mut decode_state = Self::decode_state_with_schema(
                 &executable,
                 &schema,
@@ -1986,7 +2910,7 @@ impl Executable {
                 &slots,
                 &valid_lengths,
             )?;
-            Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
+            Self::with_state_transaction(&leases, &slots, &mut decode_state, |decode_state| {
                 let pool = leases[0].inner.pool.clone();
                 let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
                 let mut current_tokens = tokens;
@@ -2010,6 +2934,7 @@ impl Executable {
                         next.push(token);
                     }
                     drop(values);
+                    executable.readback_state(decode_state).map_err(failure)?;
                     Self::advance_sequences(
                         &leases,
                         &slots,
@@ -2038,9 +2963,9 @@ impl Executable {
                         .map_err(failure)?;
                     }
                 }
-                let readback_kv = Self::should_readback_kv(&leases, &slots, &[0]);
-                if readback_kv {
-                    executable.readback_state(decode_state).map_err(failure)?;
+                let readback_kv = true;
+                if !cancellation.complete() {
+                    return Err(Error::new(Status::Cancelled, "operation aborted"));
                 }
                 Self::commit_sequence_caches(&leases, decode_state, readback_kv, &mut usage);
                 Ok(sampled)
@@ -2167,10 +3092,10 @@ impl Executable {
             .map(|token| token.state.clone())
             .unwrap_or_else(|| Arc::new(CancellationState::new()));
         let notify = token.map(|token| token.notify.clone());
-        run_compute(state, notify, move |cancelled, _| {
+        run_compute(state, notify, move |cancelled, cancellation| {
             let mut decode_state =
                 Self::decode_state_with_schema(&executable, &schema, &leases, &slots, &valid_lengths)?;
-            Self::with_retained_device_cache(&leases, &slots, &mut decode_state, |decode_state| {
+            Self::with_state_transaction(&leases, &slots, &mut decode_state, |decode_state| {
             let proposal = proposal_probabilities
                 .as_ref()
                 .map(|value| {
@@ -2379,14 +3304,13 @@ impl Executable {
                 .enumerate()
                 .any(|(request, &slot)| actual_advances[slot as usize] != page_limits[request])
             {
-                let mut committed = Self::decode_state_with_schema(
+                let committed = Self::decode_state_with_schema(
                     &executable,
                     &schema,
                     &leases,
                     &slots,
                     &actual_advances,
                 )?;
-                committed.cache = decode_state.cache.take();
                 *decode_state = committed;
                 drop(values);
                 values = executable
@@ -2401,10 +3325,11 @@ impl Executable {
             let pool = leases[0].inner.pool.clone();
             let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
             let (mut planned, block_keys) = Self::block_plan(&schema, &leases, &consumed, &usage)?;
-            let readback_kv = Self::should_readback_kv(&leases, &slots, &actual_advances);
+            let readback_kv = true;
             if readback_kv {
                 executable.readback_state(decode_state).map_err(failure)?;
             }
+            if !cancellation.complete() { return Err(Error::new(Status::Cancelled, "operation aborted")); }
             Self::commit_sequences(
                 &leases,
                 &slots,
@@ -2527,6 +3452,21 @@ impl CudaRuntime {
         }
         tensor.value()?;
         lazy(Node::new(NodeKind::Leaf(tensor.slot.clone())))
+    }
+
+    /// Materializes a bounded set of existing scalar F32/U32 byte literals.
+    #[napi]
+    pub async fn materialize_literals89(
+        &self,
+        roots: Vec<&LazyTensor>,
+        token: Option<&CancellationToken>,
+    ) -> Result<Vec<NativeTensor>> {
+        literal89::execute(
+            self._device.clone(),
+            roots.into_iter().map(|root| root.node.clone()).collect(),
+            token,
+        )
+        .await
     }
 
     #[napi]
@@ -2683,6 +3623,10 @@ impl CudaRuntime {
                     _ => unreachable!(),
                 }
             }
+            "topKIndices" => NodeKind::TopKIndices {
+                a: input(&inputs, 0, &operation)?,
+                k: integer(&attributes, "k")?,
+            },
             "argmax" => NodeKind::Argmax {
                 a: input(&inputs, 0, &operation)?,
                 dim: integer(&attributes, "dim")?,
@@ -2739,6 +3683,54 @@ impl CudaRuntime {
                     window,
                 }
             }
+            "scaledDotProductAttentionConfigured" => {
+                let parse_window = |name: &str| -> Result<AttentionWindow> {
+                    match attributes.get(name) {
+                        None => Ok(AttentionWindow::Inherit),
+                        Some(JsonValue::Null) => Ok(AttentionWindow::Full),
+                        Some(value) => value
+                            .as_u64()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .map(AttentionWindow::Local)
+                            .ok_or_else(|| {
+                                invalid(format!("{name} must be a non-negative integer or null"))
+                            }),
+                    }
+                };
+                NodeKind::SdpaConfigured {
+                    q: input(&inputs, 0, &operation)?,
+                    k: input(&inputs, 1, &operation)?,
+                    v: input(&inputs, 2, &operation)?,
+                    scale: number(&attributes, "scale")?,
+                    causal: boolean(&attributes, "causal")?,
+                    window: parse_window("window")?,
+                    rounding: match string(&attributes, "rounding")? {
+                        "fused" => effect_torch_graph::AttentionRounding::Fused,
+                        "stepwise" => effect_torch_graph::AttentionRounding::Stepwise,
+                        _ => return Err(invalid("unsupported attention rounding")),
+                    },
+                    layer_id: attributes
+                        .get("layerId")
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .and_then(|v| u32::try_from(v).ok())
+                                .ok_or_else(|| invalid("layerId must be a U32 integer"))
+                        })
+                        .transpose()?,
+                    retention: parse_window("retentionWindow")?,
+                }
+            }
+            "rotaryEmbeddingExplicit" => NodeKind::RotaryEmbeddingExplicit {
+                x: input(&inputs, 0, &operation)?,
+                positions: input(&inputs, 1, &operation)?,
+                inverse_frequencies: input(&inputs, 2, &operation)?,
+                layout: match string(&attributes, "layout")? {
+                    "HalfSplit" => RotaryLayout::HalfSplit,
+                    "InterleavedPairs" => RotaryLayout::InterleavedPairs,
+                    layout => return Err(invalid(format!("unsupported rotary layout {layout}"))),
+                },
+            },
             "kdaChunk" => NodeKind::KdaChunk {
                 q: input(&inputs, 0, &operation)?,
                 k: input(&inputs, 1, &operation)?,
@@ -2776,6 +3768,16 @@ impl CudaRuntime {
                 x: input(&inputs, 0, &operation)?,
                 weight: inputs.get(1).cloned(),
                 eps: number(&attributes, "eps")?,
+            },
+            "expertLinearRows" => NodeKind::ExpertLinearRows {
+                x: input(&inputs, 0, &operation)?,
+                weight: input(&inputs, 1, &operation)?,
+                indexes: input(&inputs, 2, &operation)?,
+            },
+            "groupedExpertLinearRows" => NodeKind::GroupedExpertLinearRows {
+                x: input(&inputs, 0, &operation)?,
+                weight: input(&inputs, 1, &operation)?,
+                indexes: input(&inputs, 2, &operation)?,
             },
             "linear" => NodeKind::Linear {
                 x: input(&inputs, 0, &operation)?,
@@ -2881,7 +3883,7 @@ impl CudaRuntime {
             _ => {
                 return Err(invalid(format!(
                     "unsupported CUDA graph operation {operation}"
-                )))
+                )));
             }
         };
         lazy(Node::new(kind))
@@ -2964,7 +3966,7 @@ impl CudaRuntime {
                 let layout = packed_rows_per_sequence.map_or(DecodeLayout::dense(batch), |rows| {
                     DecodeLayout::packed_causal_chains(batch, rows as usize)
                 });
-                let (rewritten, geometry) = specialize_decode_layout_outputs_with_attention(
+                let (rewritten, mut geometry) = specialize_decode_layout_outputs_with_attention(
                     &roots,
                     native.window.map(|window| window as usize),
                     layout,
@@ -2976,15 +3978,14 @@ impl CudaRuntime {
                 )
                 .map_err(failure)?;
                 roots = rewritten;
+                for layer in &mut geometry.kv_layers {
+                    layer.dtype = kv_dtype;
+                }
                 Some(CudaStateSchema {
+                    access: state_access(native.access.as_deref())?,
                     max_tokens: native.max_tokens,
                     block_size: native.block_size,
                     kv_dtype,
-                    window: if geometry.allows_window_eviction {
-                        native.window
-                    } else {
-                        None
-                    },
                     batch: native.batch,
                     packed_rows_per_sequence,
                     geometry,
@@ -3004,6 +4005,8 @@ impl CudaRuntime {
                     dtype: state.kv_dtype,
                     slots: state.batch,
                     packed_rows_per_sequence: state.packed_rows_per_sequence,
+                    kv_layers: state.geometry.kv_layers.clone(),
+                    access: state.access,
                 },
             ),
             None => compile_with_options(roots, self.ordinal, options),
@@ -3012,6 +4015,7 @@ impl CudaRuntime {
             .map(|inner| Executable {
                 inner: Arc::new(inner),
                 state,
+                request_rng99: None,
             })
             .map_err(failure)
     }

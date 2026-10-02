@@ -1,0 +1,262 @@
+{
+  "schemaVersion": 1,
+  "kind": "diffusion-gemma-reproduction-dependencies",
+  "evidenceSources": [
+    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/natural/provenance.json",
+    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/timing128/provenance.json",
+    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/timing32/provenance.json",
+    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/natural/selected-input-pins.json",
+    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/timing128/selected-input-pins.json",
+    "bench-results/diffusion-gemma-20260930/combined97-100-101-release-evidence-v1/accepted-norm98/timing32/selected-input-pins.json"
+  ],
+  "guardedFiles": {
+    "/root/.cache/effect-torch/vllm-0.24.0/lib/python3.12/site-packages/vllm/model_executor/models/diffusion_gemma.py": "82ddb9f7954fc59ad16f3b3ce91faac6a45d8ba740de1f662ccdac4221d587fb",
+    "/root/bf16-quality-policy75/natural-tasks.json": "2b10c7b78ba8a1787e9d92b6ad92f32aeac9a07f57bd7cff2e92fde68e805f94",
+    "/root/bf16-quality-policy75/natural75-effect.ts": "597876f256e33e86663d93bdf0e9d1713539e5009adb0f580c92bfe81dcabbcb",
+    "/root/bf16-quality-policy75/natural75-manifest.json": "50d47617506c215aab5c939e22f33fa43c88b758dda8e269964ba764f9706454",
+    "/root/bf16-quality-policy75/natural75-vllm.py": "70f7910f4a991a85b73bbb412e63b6583c772c79f1df04bb146a97bde86244cd",
+    "/root/combined87-build-v3/ptx-abi2/attention75-bf16-d256.ptx": "66aabde44db5da33586bd5e8dc8f765e794f685e0902874f2424d2d98059434c",
+    "/root/combined87-build-v3/ptx-abi2/attention75-bf16-d512.ptx": "6b903af63bc8e2add8b4dfb74cbbe0e8eae10cb88b8625d37a7a5af839cba886",
+    "/root/combined87-build-v3/ptx-abi2/attention75-d256.ptx": "decb9c4906bafa9f3cc03cd49a21ceb126bb38f7792772dd6f67e88d543d2c94",
+    "/root/combined87-build-v3/ptx-abi2/attention75-d512.ptx": "a0eb8087be29dd9395aac6ce7071f896e9b3fec8b395601e4c2815322dbef210",
+    "/root/combined87-build-v3/ptx-abi2/manifest.json": "cce0b9a39331788858ffe9a032a816a6918ff9b9d3cf47d96cd899efc7db4fed",
+    "/root/combined97-100-101-release-build-v1/build-receipt.json": "07082bb5e87c4a2266a6814a3e4796320dde03d7d4ddbf67ac92b470e23acb94",
+    "/root/combined97-100-101-release-build-v1/combined97-100-101-release-v1.node": "fab05c99fb5158489345af782f1fdbc53f8630e0ad723dda6e86b399e91a8be4",
+    "/root/combined97-100-101-release-build-v1/hardware/assessment.json": "ea8de5be2096a19c2b1de0bad6e1d56c6b1b1d191e898a0cc53c595a44537903",
+    "/root/combined97-100-101-release-build-v1/source-v1-manifest.json": "90b58c67eb7d7b416607a34b896e8cc554ce87decd85dea1e29ca8ca39b03486",
+    "/root/combined97-100-101-release-build-v1/source-v1.tar.gz": "54979d50b5cb2e5ae68ece16540d26150957210dc42c4cbfb74508067a3e337e",
+    "/root/combined97-100-101-release-entry-v1/README.txt": "a3e79145053e463d11d09579f852ba3a5fe837be0855c2d2aa77c09ccebddfe3",
+    "/root/combined97-100-101-release-entry-v1/accepted-controlled-replay-validation.ts": "7d8db49ee6c9e06fe44c6ed94731e7b08027eb51b1b58b941ebbd952b5239a5d",
+    "/root/combined97-100-101-release-entry-v1/artifact-guards.json": "a99ca04c13b516e87e56ae025d1a80b29e8111b4ce2d8f16a6bbf37f5e8d9ff6",
+    "/root/combined97-100-101-release-entry-v1/bank-guard.py": "64849291ae3dff2504ea3d81bdf7551e7abb0e8de221848c1e87437af01a1e26",
+    "/root/combined97-100-101-release-entry-v1/candidate-dependencies.json": "dce0644c9dec8017f6c119155dd907988c513ad06e85a6763d3e4e97835d9d86",
+    "/root/combined97-100-101-release-entry-v1/common-env.sh": "7f812ba79e42ae0aabce363c156e245640d446e31339182b0ae6e3e5a59ec2b9",
+    "/root/combined97-100-101-release-entry-v1/compare-natural93.py": "b667de1491bc771411cd7d529abd9642f0b5e0c9702ed2b18c73972d2026e61c",
+    "/root/combined97-100-101-release-entry-v1/compare-same-addon.py": "90036f9437cedcd9d5dbc093661951b442a552cee72cecee0d77ee29812a5f47",
+    "/root/combined97-100-101-release-entry-v1/controlled-replay97.diff": "7e6e9dfb7bfe2fdf2ae2efc328a9fa8c5a243f1b88a4dfc10cb33dd9ec4c182c",
+    "/root/combined97-100-101-release-entry-v1/controlled-replay97.ts": "8a058219e590a3f16b2ff759d097853a03ca75b8183891c0d3d6133601de3291",
+    "/root/combined97-100-101-release-entry-v1/coverage-cpu-check.json": "15b0a09d2d1ae049d4e368111a7fd6355a4253a3ff837e6c26b18074456eb8f0",
+    "/root/combined97-100-101-release-entry-v1/declared-seeds.json": "b58f3c6bed359130554ec42c8cc9f8f337a51a8bacab4230de2388c8b151d8c1",
+    "/root/combined97-100-101-release-entry-v1/dependency-override.json": "d1ecfdb8f6bdb14ba7d38e77098ac6ece45ec5f3beb144cab631a8c876da2105",
+    "/root/combined97-100-101-release-entry-v1/dependency-pins.json": "155ca1bcd922337452e3d65349c89daa5471082b558753dd76a3d92b1285ba04",
+    "/root/combined97-100-101-release-entry-v1/local-checks.json": "14a39eea058688a7250bd738d31728f1e52f5e0c831404196a2a3ee8ef0bcde9",
+    "/root/combined97-100-101-release-entry-v1/manifest-source.json": "96f50d8ef5a4cd563f0a44fcd00ec4ffc84f1d64b3ac4d9f84aa17d6a7c54d15",
+    "/root/combined97-100-101-release-entry-v1/natural93-effect.ts": "30b7d94288002edfe4b21ffa6e9041b41c678de095d34496d44102d20311f890",
+    "/root/combined97-100-101-release-entry-v1/norm98-ptx-pins.json": "a0218ac5e0f522cf66229e840518cdbaed357eb5fce1063b13a1582b62f96fb4",
+    "/root/combined97-100-101-release-entry-v1/normrope101-ptx-pins.json": "1a6ea22aae6abf8f814ca5a2f8e58348ada42a7ccfc2bf58f95f78110bdb264b",
+    "/root/combined97-100-101-release-entry-v1/observer-coverage-cpu-check.ts": "7b959b47759afa3e93085a8a3d7913d7269939171d90240c657ba1d3fabb8753",
+    "/root/combined97-100-101-release-entry-v1/refresh-control-cpu-check.py": "d1d34c598684d816a9575a97bd0c72cfdf0f41b82d343b403c6b1c9b69672d05",
+    "/root/combined97-100-101-release-entry-v1/release-profile-cpu-check.py": "52cafc6ed8b4c8fec623a10ae9725e0c974a4abd47930bd7be98a0bbd2e18794",
+    "/root/combined97-100-101-release-entry-v1/replay97-cpu-check.ts": "8a44607e2464fe25d7992ab5a836459db0fef3fda982bd75eba8b1c1040dc6ff",
+    "/root/combined97-100-101-release-entry-v1/run-distinct-replay-target.sh": "d1a269bc80bb2db2ab6416ae000a038825555d76456b0b6a8ff71c8cefaa9f8a",
+    "/root/combined97-100-101-release-entry-v1/run.py": "44061880783a88224e2dc4a44efb7d999d9b5f7dc2a7684c1fbe21704d1f131c",
+    "/root/combined97-100-101-release-entry-v1/score-natural.py": "46336590dacab230223a63bed21356bb72eb5cc8bb654e4e731ccb1a94dc41ea",
+    "/root/combined97-100-101-release-entry-v1/softmax100-ptx-pins.json": "0e76cfce5b7d1b73843e9cdde92b24124a0241fb53e3b8fb05d02d0426a72345",
+    "/root/combined97-100-101-release-entry-v1/source-guards.json": "40a3af20e58644a7696bfe786b4e0ef582f21313ffb265f55252e5a75e162c5c",
+    "/root/combined97-100-101-release-entry-v1/stage.py": "c3ab4b4ff336d8d7f55029128a1336fdf28377ce5fecb8effd63c23ae882d371",
+    "/root/combined97-100-101-release-entry-v1/timing-preload-guard.diff": "46479c49826220ca6932bbfdb60291d96de8b8bd4b0ec7213b22b38a8aa9d755",
+    "/root/combined97-100-101-release-entry-v1/validation-pin.diff": "7d6ce5d1333eb4c1914f080c2b8fc87a49916d10f6d1af914794004a0a552971",
+    "/root/combined97-100-101-release-timing32-v1/prompt-32/effect-combined97-100-101-release-v1.jsonl": "6f9b01fc6068aa4221fc3f662f7010dc6a802339df93a8f1182e53a847883e57",
+    "/root/combined97-98-100-101-natural-v2/candidate-effect.jsonl": "118452f1680e81091286a9ccf4fc6ca1a04e9302480ac9dc4666e355bb95e862",
+    "/root/combined97-98-100-101-release-natural-v1/assessment.json": "3954ca055fdba2e5ec5c528af74a0730c5a6e36798f020c523804db1c2dbe532",
+    "/root/combined97-98-100-101-release-natural-v1/provenance.json": "d70f2977f2a0cf34aa816e7136c5c5503fc979cd994d2fdc405e8864724926f1",
+    "/root/combined97-98-100-101-release-timing128-v1/prompt-128/vllm-combined97-100-101-release-v1.jsonl": "fd97819330215eaa3024a9c76c9abf0265a5b1b9b4ecf9f5da2bb92ed2fb5f40",
+    "/root/combined97-98-100-101-release-timing32-v1/prompt-32/vllm-combined97-100-101-release-v1.jsonl": "1bedd9b37fc7a123f0f19aeb07e99d745cd268344097e3301261f485e432e601",
+    "/root/effect-expert-merged-v1-20260930.ptx": "56e1f7b1934ac08afc48625600d3e25f3ffe1f5d64e4fcee04a87359b63f6b4e",
+    "/root/effect-kv-pair57-v1-20260930.ptx": "aab7cfe58582664fed6ae31e14e58f48debdf90b0dfeda29acf2733edd7f8bac",
+    "/root/effect-ordinary-k16-v1-20260930.ptx": "619b04a2dcb19126a6b5af4a1598092d67f58216448c4b6ee292e9a6d675919e",
+    "/root/effect-torch/packages/backend-cuda/dist/internal/effect-torch-backend-cuda.linux-x64-gnu.node": "bdb5d1e21325b747fc989514bb2fad14b38796a1d1a8af3b73ee299303968d8a",
+    "/root/effect-torch/packages/backend-cuda/src/internal/adapter.ts": "8159fd27721c4c3029d76c4b0ae27f96c6300db827c94522fd507c1f5e17186b",
+    "/root/effect-torch/packages/backend-cuda/src/internal/native-addon.d.ts": "fec3bb5e08fa61c7c9e65b58cd924151873e9951e9bbc64c495ee397636844fa",
+    "/root/effect-torch/packages/backend-cuda/test/Cuda.test.ts": "22fc2b6c65146ea29ec39f1250f51267664da4f93db8e8e7e2347c708d0863f3",
+    "/root/effect-torch/packages/backend-cuda/test/Gguf.test.ts": "3d1ba0a5dee44bc75698f88e39104a816f57d615aa594a992527528d3354680d",
+    "/root/effect-torch/packages/bench/diffusion-gemma/common.ts": "94fac329ff9cf4794674ceeecf12626f36317eeaac48a96eb053b204ac241b63",
+    "/root/effect-torch/packages/bench/diffusion-gemma/compare-generation.py": "ebf74c8d847a6a6d4268237d0270faf61e42523654f8e8d1c03c2e178f8d641d",
+    "/root/effect-torch/packages/bench/diffusion-gemma/controlled-replay-direct.ts": "5283c99e731ff25670b3b1dcac76348a04220d81b3125f0585fb5d2eb49bbed4",
+    "/root/effect-torch/packages/bench/diffusion-gemma/controlled-replay-validation.ts": "7d8db49ee6c9e06fe44c6ed94731e7b08027eb51b1b58b941ebbd952b5239a5d",
+    "/root/effect-torch/packages/bench/diffusion-gemma/controlled-replay.ts": "e65ba98584e31ac722bb6556a17af1eae6cc94323307b11ccbf76680f10fcc58",
+    "/root/effect-torch/packages/bench/diffusion-gemma/natural75-effect.ts": "597876f256e33e86663d93bdf0e9d1713539e5009adb0f580c92bfe81dcabbcb",
+    "/root/effect-torch/packages/bench/diffusion-gemma/natural75-vllm.py": "70f7910f4a991a85b73bbb412e63b6583c772c79f1df04bb146a97bde86244cd",
+    "/root/effect-torch/packages/bench/diffusion-gemma/shared_rng.py": "3ab076bc9c670724016c4e4ea4e37872f0ec3ea8d269c996905e7da5ee9a6126",
+    "/root/effect-torch/packages/bench/diffusion-gemma/vllm-direct.py": "5c6aeb488a5f28d155b4e55bce6f1a19f46a97c9943d9bf4ce83b7dd3a59c785",
+    "/root/effect-torch/packages/bench/diffusion-gemma/vllm_controlled_replay.py": "dc1a7f443d1f8b7b5a2f32ac8edfc710f1e0a8791ffb5c7c94f8bd2042c4d085",
+    "/root/effect-torch/packages/core/src/Diffusion.ts": "17fb5e0da33600125fb871cbc6de7fb814eea8f05f3320dd48a610ad89da39d8",
+    "/root/effect-torch/packages/core/src/Runtime.ts": "7e21777bf0d1a473bde2f8b4cf6503ec0068ab37a4fccb0907611705e2713c3f",
+    "/root/effect-torch/packages/core/src/Tensor.ts": "613941dc68a720b08f99e26451d2964ba3b52f54f6cb38803463f6e417446efa",
+    "/root/effect-torch/packages/examples/scripts/diffusion-gemma/verify-full75-cancel.ts": "e19dd78579af2253e97674ddef5fc767576582831a690f3eacf114a990a70637",
+    "/root/effect-torch/packages/models/src/DiffusionGemma.ts": "11bd30b0253e942652a89bfac0d7020f5030bf15e3b8c9c82b29997c7a2d0b27",
+    "/root/effect-torch/packages/models/src/internal/diffusionGemmaStatistics.ts": "d31cf2fad074be4cce6533bf87cba368bc43c60c224f44ba69b7c3c6b60255d8",
+    "/root/effect-torch/packages/models/test/DiffusionGemmaGeneration.test.ts": "eb0c6676623daf7af9e18ff283504703049ed5a2a5991f48443f54b56a86b08d",
+    "/root/expert-flashinfer73-v2/libexpert-flashinfer73.so": "12bf7e7d6a4e4cc562017474a6a08e28a456e23de0c729282fde7a9269454f3e",
+    "/root/literal89-plus66-natural-v1/candidate-effect.jsonl": "b2b2db272db233b4079f3494b606bdd9db014d62d4a931942c60efc2218c8de8",
+    "/root/native-bf16-87-timing128-v1/prompt-128/vllm-current-v2.jsonl": "cf792e7ec23a9122aa633876e81ee021993686fbe0dc75a0dd4013ede58115ab",
+    "/root/native-bf16-87-timing32-v1/prompt-32/vllm-current-v2.jsonl": "ffa3927dfd7c3d656b78414ec42ea9eeb0b4388fd72eba144bcc01faaa9e109a",
+    "/root/native-bf16-combined85-oracle-v1/full/run.json": "0050d4f20f89bb116e5a50dfa3becc9ba383e17cd2104d844c316ac384a0b931",
+    "/root/native66-fresh-distinct-v1/prompt-128/bank/prompt-128-seed-20275016/manifest.json": "80de6d1b796ffea5c7b4cf04be90b7d9c91ea7a8bc729c4cc44bb98a9a5f3cd4",
+    "/root/native66-fresh-distinct-v1/prompt-128/bank/prompt-128-seed-20275023/manifest.json": "aff9b75557ad29d49fc97a49a2cb7922975cb1e8ce2ed4dff3699dd1ab27abb4",
+    "/root/native66-fresh-distinct-v1/prompt-128/bank/prompt-128-seed-20275030/manifest.json": "b9585395d09a7e1e366d51d5044c70e4286b7e8ca5f63fe7b6b1c7c711296a41",
+    "/root/native66-fresh-distinct-v1/prompt-128/bank/prompt-128-seed-20275037/manifest.json": "7c584e80c1f29c62d1f791df8d73c7c7b3c383fef44e507fc90334ac0e76e8ba",
+    "/root/native66-fresh-distinct-v1/prompt-128/bank/prompt-128-seed-20275044/manifest.json": "feacd355efbb44b372194fee445f38d51bcdfed22a3826977b353d3119d64634",
+    "/root/native66-fresh-distinct-v1/prompt-128/bank/prompt-128-seed-20275051/manifest.json": "a2b28b1009d344e8acb9b98215abc46c2bfb2733a7fb6d5b3262d1f289c055a2",
+    "/root/native66-fresh-distinct-v1/prompt-128/bank/prompt-128-seed-20275058/manifest.json": "2c3469d812d990cc8f0d94ecb3512d1cec762f434ae35bd445f071da9784ef45",
+    "/root/native66-fresh-distinct-v1/prompt-128/benchmark.json": "77bed668297f1712e1e50c2e7745a1d285c0ec3396c87d3c35d91eaa334aa66c",
+    "/root/native66-fresh-distinct-v1/prompt-128/case-plan.json": "6083b368c466e5fe334b23591f1bf7ef64cfd291a3bdc9f37702019793200832",
+    "/root/native66-fresh-distinct-v1/prompt-128/native66-bank-seal.json": "268d5175a5c86d5b33190c6fec0018b7a7d435da4a18cf7df249fb3288909835",
+    "/root/native66-fresh-distinct-v1/prompt-32/bank/prompt-32-seed-20265320/manifest.json": "72a4709dffd2937a13a07ccbe0de109c15a60ce34ec9a7d61f2693fd91848a03",
+    "/root/native66-fresh-distinct-v1/prompt-32/bank/prompt-32-seed-20265327/manifest.json": "9c4b99ffa8295f95c8b68086c29f3a54100ad004bb2b9cafe07128bfac1edf42",
+    "/root/native66-fresh-distinct-v1/prompt-32/bank/prompt-32-seed-20265334/manifest.json": "0ceb990c7096dd646f3c9390970d883db731151515ec9474f3424daa3970960b",
+    "/root/native66-fresh-distinct-v1/prompt-32/bank/prompt-32-seed-20265341/manifest.json": "ccd8a4fca979d6c1f4ae5e9f1e928251e06a4120386de368be764f26b22467e7",
+    "/root/native66-fresh-distinct-v1/prompt-32/bank/prompt-32-seed-20265348/manifest.json": "7839dc13d0035c7f0d8da427ba045d6811de1a819f4713db5ec251ba5a6dbeb8",
+    "/root/native66-fresh-distinct-v1/prompt-32/bank/prompt-32-seed-20265355/manifest.json": "06cff462d6100ae1e1dd47fc37c76ff28ba2de9927fb0269915f5a4bd30df51a",
+    "/root/native66-fresh-distinct-v1/prompt-32/bank/prompt-32-seed-20265362/manifest.json": "73aad30a28d11c694702490c9074e8e855bc30ae33befd49aba5a03e9d119a63",
+    "/root/native66-fresh-distinct-v1/prompt-32/benchmark.json": "4ebc6faacaa1d2a269a05a71f62ac7bb84d8ae1a973287215051e91925bd7641",
+    "/root/native66-fresh-distinct-v1/prompt-32/case-plan.json": "01b25bdd900cbe00ef4a4455739a4ccae38947a58d9bf43db2da4bbcc240cc9a",
+    "/root/native66-fresh-distinct-v1/prompt-32/native66-bank-seal.json": "9e80a59f3ae56147c1a10a6cf7c9b45dcd49b0b318c632c739ac8d8983eeaf10",
+    "/root/natural75-vllm-continuation-v1/vllm.jsonl": "e623dedd255bb4fedf8bcfbaf0da888fc56347c6d0a7be63fdc13e793ddb905b",
+    "/root/production97-timing128-v2/prompt-128/effect-production97-v1.jsonl": "8eb2bd4ac6330d63fe3151c6c94886747648824db0e919766119d9dd01a027ec",
+    "/root/triton-normalization98-screen-v1/entrance.ptx": "df8877a070740b4caf0a7e06012183ead8d78404bd7211f6d13ac2331a3da23b",
+    "/root/triton-normalization98-screen-v1/launch-manifest.json": "1b1845bb54d24a1d1988ce301c1398c28b09d875bd61acdb206c8759d3d974f6",
+    "/root/triton-normalization98-screen-v1/tail.ptx": "7c93f9dda6a2f4a64b01b62f62adcd12781df5ee052c88e5e78acfa47b0e0c97",
+    "/root/triton-normrope101-fulltables-screen-v2/helpers.ptx": "c3984b2208ee1cdeb4094fb975be3136b2cbe604dafbb744f6fad0bd0a9f5e33",
+    "/root/triton-normrope101-fulltables-screen-v2/launch-manifest.json": "9476c087a7c5af33f2e4521833faee6d4cd048b1cb483751fe29388fca482aa4",
+    "/root/triton-normrope101-fulltables-screen-v2/pointwise.ptx": "b5c757f91fc75f56e4fb06b131ec21a53d1f739eea4ce9e631b8329fb58b947a",
+    "/root/triton-normrope101-fulltables-screen-v2/reduction.ptx": "71925415c29170bbdc09bffba6eb75f3b8670a4b32e3227b074c6b3056099889",
+    "/root/triton-softmax100-screen-v1/launch-manifest.json": "08106443faa6c3346273a4f477c33ee334093488b6fb8d0280bfd78e19a187a3",
+    "/root/triton-softmax100-screen-v1/stage0.ptx": "64d01104167bf740fb918941c33660fccddfcf89bcade05767bb6f39f876f33f",
+    "/root/triton-softmax100-screen-v1/stage1.ptx": "1cb7b99b44f365d48c690babc34c33eb27ce52e6274df46d28bad9b90cb3ae4e",
+    "/root/triton-softmax100-screen-v1/stage2.ptx": "48a18b46910598fadf376118378a9f76de189892e8bec693b5cf67dba09a7a45",
+    "/root/triton-softmax100-screen-v1/stage3.ptx": "b2f3e5de4021ec83c6ac60c2b5cfc1282c82b6ab808dc158037c9c2baa791569",
+    "/root/triton-softmax100-screen-v1/stage4.ptx": "31f2fd1aebff66fab15042ef8b7f4708bc15567c3442ed25764c92d1c05ecbbd",
+    "/root/vllm-controlled-replay-v4-20260930/decode_counters.py": "d00e6c444d4d4e0024d07bbb6e8db9f72906aed927ec42e5d3598bf84ce41282",
+    "/root/vllm-controlled-replay-v4-20260930/diffusion_gemma.py": "eae08cbaef4b285be59b7513bedeb26247716b0757b59709c601a63f9596ef85",
+    "/root/vllm-controlled-replay-v4-20260930/manifest.json": "4f3cfa3df05309ec377afb964b87d9c8931a283f15e95053b4fc53e467001755",
+    "/root/vllm-controlled-replay-v4-20260930/shared_rng.py": "3ab076bc9c670724016c4e4ea4e37872f0ec3ea8d269c996905e7da5ee9a6126",
+    "/root/vllm-controlled-replay-v4-20260930/sitecustomize.py": "094423f02f6b6b0ba008206f59a6d006f482ef2e9eb8616aacdb84c1a85940c7",
+    "/root/vllm-controlled-replay-v4-20260930/vllm_controlled_replay.py": "dc1a7f443d1f8b7b5a2f32ac8edfc710f1e0a8791ffb5c7c94f8bd2042c4d085"
+  },
+  "requiredDirectories": [
+    {
+      "path": "/root/native66-fresh-distinct-v1",
+      "why": "sealed14casebank includingallfeedback/tapes; preserve symlinktargets",
+      "exclude": []
+    },
+    {
+      "path": "/root/oracle-eager-20260930",
+      "why": "four oracle reads, generation data, initializedRoPEmanifest+1536Bpayload",
+      "exclude": []
+    },
+    {
+      "path": "/root/expert-flashinfer73-v2",
+      "why": "exactbridgeSO+buildsources+buildprovenance; no largefixtures required",
+      "exclude": []
+    },
+    {
+      "path": "/root/combined87-build-v3/ptx-abi2",
+      "why": "exactattentionfourPTXs+manifest",
+      "exclude": []
+    },
+    {
+      "path": "/root/triton-normalization98-screen-v1",
+      "why": "exactnorm98PTX+manifest+provenance/assessment",
+      "exclude": []
+    },
+    {
+      "path": "/root/triton-softmax100-screen-v1",
+      "why": "exactfivePTXimages+manifest+provenance/assessment",
+      "exclude": []
+    },
+    {
+      "path": "/root/triton-normrope101-fulltables-screen-v2",
+      "why": "strideABI2helperPTX+reduction/pointwise+manifest+proofs",
+      "exclude": []
+    },
+    {
+      "path": "/root/combined97-100-101-release-build-v1",
+      "why": "sourcearchive+manifest+releaseaddon+buildrunner+profile/hardware receipts; excludeCargo target and extractedsource",
+      "exclude": [
+        "target",
+        "source-v1"
+      ]
+    },
+    {
+      "path": "/root/combined97-100-101-release-entry-v1",
+      "why": "exactguardedentry scripts+pins",
+      "exclude": []
+    },
+    {
+      "path": "/root/combined97-98-100-101-release-natural-v1",
+      "why": "finalquality/coverage/selectedpins/original8files/restoration",
+      "exclude": []
+    },
+    {
+      "path": "/root/combined97-98-100-101-release-timing32-v1",
+      "why": "finalrawrecords/counters/comparison/selectedpins/original8files/restoration",
+      "exclude": []
+    },
+    {
+      "path": "/root/combined97-98-100-101-release-timing128-v1",
+      "why": "finalrawrecords/counters/comparison/selectedpins/original8files/restoration",
+      "exclude": []
+    },
+    {
+      "path": "/root/bf16-quality-policy75",
+      "why": "naturalmanifest/taskfixtures+harness",
+      "exclude": []
+    },
+    {
+      "path": "/root/vllm-controlled-replay-v4-20260930",
+      "why": "exactoverlay,manifest,sitecustomize,decodecounters",
+      "exclude": []
+    }
+  ],
+  "additionalRequiredFiles": [
+    {
+      "path": "/root/.cache/flashinfer/0.6.12/120f/cached_ops/fused_moe_120/fused_moe_120.so",
+      "why": "bridgeELFdependency"
+    },
+    {
+      "path": "/root/.cache/effect-torch/vllm-0.24.0/lib/python3.12/site-packages/tvm_ffi/lib/libtvm_ffi.so",
+      "why": "bridgeELFdependency"
+    },
+    {
+      "path": "/root/effect-torch/packages/tokenizers/dist/internal/effect-torch-tokenizers.linux-x64-gnu.node",
+      "why": "runtime tokenizeraddon; capturehash/deps"
+    },
+    {
+      "path": "/root/effect-torch/flake.nix",
+      "why": "Nixenvironment"
+    },
+    {
+      "path": "/root/effect-torch/flake.lock",
+      "why": "Nixpin"
+    },
+    {
+      "path": "/root/effect-torch/pnpm-lock.yaml",
+      "why": "JSdependencyclosure"
+    },
+    {
+      "path": "/root/effect-torch/rust-toolchain.toml",
+      "why": "Rustpin"
+    }
+  ],
+  "requiredModelMetadata": {
+    "directory": "/root/models/diffusiongemma",
+    "includeGlobs": [
+      "*.json",
+      "*.txt",
+      "*.md",
+      "*.jinja",
+      "*.py",
+      ".gitattributes"
+    ],
+    "excludeWeightGlobs": [
+      "model-*.safetensors",
+      "*.bin",
+      "*.gguf"
+    ],
+    "download": {
+      "repo": "google/diffusiongemma-26B-A4B-it",
+      "revision": "f7f5b7f5fa82ffc52addd066915886d497f5517b"
+    }
+  }
+}

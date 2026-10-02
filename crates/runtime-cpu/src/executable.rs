@@ -249,6 +249,9 @@ pub enum CpuOp {
     Unary(CpuUnaryOp),
     Binary(CpuBinaryOp),
     Where,
+    TopKIndices {
+        k: usize,
+    },
     Argmax {
         dim: usize,
     },
@@ -320,6 +323,7 @@ pub enum CpuOp {
         layer: u32,
         window: Option<usize>,
         mode: KvAttentionMode,
+        rounding: effect_torch_graph::AttentionRounding,
     },
     RotaryEmbedding {
         theta: f64,
@@ -331,6 +335,8 @@ pub enum CpuOp {
         layout: RotaryLayout,
     },
     Linear,
+    ExpertLinearRows,
+    GroupedExpertLinearRows,
     QuantizedLinear {
         codec: GgmlKQuant,
         weight_shape: [usize; 2],
@@ -458,6 +464,7 @@ impl CpuOp {
             Self::Binary(_) => "binary",
             Self::Where => "where",
             Self::Argmax { .. } | Self::Argmin { .. } => "arg_reduce",
+            Self::TopKIndices { .. } => "topKIndices",
             Self::Cumsum { .. } => "cumsum",
             Self::ScatterAdd { .. } => "scatter_add",
             Self::Gather { .. } => "gather",
@@ -481,6 +488,8 @@ impl CpuOp {
             Self::RotaryEmbedding { .. } => "rotary_embedding",
             Self::RotaryEmbeddingBackward { .. } => "rotary_embedding_backward",
             Self::Linear => "linear",
+            Self::ExpertLinearRows => "expertLinearRows",
+            Self::GroupedExpertLinearRows => "groupedExpertLinearRows",
             Self::QuantizedLinear { .. } => "quantized_linear",
             Self::QuantizedEmbedding { .. } => "quantized_embedding",
             Self::LinearResidual => "linear_residual",
@@ -521,6 +530,7 @@ impl CpuOp {
 pub enum CpuAlgorithmPlan {
     None,
     Matmul(MatmulRequirements),
+    GroupedExpertLinearRows(crate::grouped_expert_linear::Plan),
     Determinant(DeterminantRequirements),
     Inverse(InverseRequirements),
     Solve(SolveRequirements),
@@ -618,6 +628,7 @@ pub struct CpuExecutable {
     pub diagnostics: ExecutableDiagnostics,
     pub compiler_work: CompilerWorkReport,
     pub state_cursor: Option<ValueId>,
+    runs: AtomicU64,
 }
 
 impl fmt::Debug for CpuExecutable {
@@ -1042,7 +1053,18 @@ impl Lowerer {
                 }
                 CpuAlgorithmPlan::Solve(requirements)
             }
-            CpuOp::Binary(_) => CpuAlgorithmPlan::None,
+            CpuOp::GroupedExpertLinearRows => {
+                let plan = crate::grouped_expert_linear::Plan::new([
+                    &tensors[0],
+                    &tensors[1],
+                    &tensors[2],
+                ])?;
+                for (index, requirement) in plan.scratch.iter().enumerate() {
+                    add_scratch(self, requirement, &format!("grouped_expert_{index}"))?;
+                }
+                CpuAlgorithmPlan::GroupedExpertLinearRows(plan)
+            }
+            CpuOp::Binary(_) | CpuOp::TopKIndices { .. } => CpuAlgorithmPlan::None,
             CpuOp::Argmax { .. } | CpuOp::Argmin { .. } => {
                 let dimension = match &op {
                     CpuOp::Argmax { dim } | CpuOp::Argmin { dim } => *dim,
@@ -1750,6 +1772,24 @@ impl Lowerer {
                     outputs,
                 )
             }
+            NativeRegion::DualArgmax(_)
+            | NativeRegion::RouterTail(_)
+            | NativeRegion::AttentionFfnEntrance(_)
+            | NativeRegion::RmsResidual(_)
+            | NativeRegion::FfnNextNorm(_)
+            | NativeRegion::FfnTail(_)
+            | NativeRegion::VNormKvAttention(_)
+            | NativeRegion::NormRope(_)
+            | NativeRegion::GroupedExpertGated(_)
+            | NativeRegion::SmallSoftmax(_)
+            | NativeRegion::Entropy(_)
+            | NativeRegion::Bf16Softmax(_)
+            | NativeRegion::SharedRmsNorm(_)
+            | NativeRegion::ExpertRouteRank(_)
+            | NativeRegion::OrderedScatterReduce(_)
+            | NativeRegion::ElementwiseArgReduce(_) => {
+                return Err("compile: elementwise index reduction requires target support".into())
+            }
             NativeRegion::ElementwiseReduce(region) => {
                 if !region.device.is_cpu() {
                     return Err(format!(
@@ -2302,6 +2342,9 @@ impl Lowerer {
             .collect::<Result<Vec<_>, _>>()?;
 
         let op = match &node.kind {
+            NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+                return Err("compile: semantic operation escaped native preparation".into());
+            }
             NodeKind::Randn { shape, dtype, .. } => CpuOp::Randn {
                 shape: shape.clone().into_boxed_slice(),
                 dtype: *dtype,
@@ -2354,6 +2397,7 @@ impl Lowerer {
             NodeKind::Sign { .. } => CpuOp::Unary(CpuUnaryOp::Sign),
             NodeKind::Where { .. } => CpuOp::Where,
             NodeKind::Argmax { dim, .. } => CpuOp::Argmax { dim: *dim },
+            NodeKind::TopKIndices { k, .. } => CpuOp::TopKIndices { k: *k },
             NodeKind::Argmin { dim, .. } => CpuOp::Argmin { dim: *dim },
             NodeKind::Cumsum { dim, .. } => CpuOp::Cumsum { dim: *dim },
             NodeKind::ScatterAdd { dim, .. } => CpuOp::ScatterAdd { dim: *dim },
@@ -2427,9 +2471,10 @@ impl Lowerer {
                 layer,
                 window,
                 mode,
+                rounding,
                 ..
             } => {
-                if node.dtype != DType::F32 {
+                if !matches!(node.dtype, DType::F32 | DType::F16 | DType::BF16) {
                     return Err(format!(
                         "compile: kv_attention does not support CPU dtype {}",
                         node.dtype
@@ -2440,6 +2485,7 @@ impl Lowerer {
                     layer: *layer,
                     window: *window,
                     mode: *mode,
+                    rounding: *rounding,
                 }
             }
             NodeKind::RotaryEmbedding {
@@ -2459,6 +2505,8 @@ impl Lowerer {
                 }
             }
             NodeKind::Linear { .. } => CpuOp::Linear,
+            NodeKind::ExpertLinearRows { .. } => CpuOp::ExpertLinearRows,
+            NodeKind::GroupedExpertLinearRows { .. } => CpuOp::GroupedExpertLinearRows,
             NodeKind::QuantizedLinear { weight, .. } => {
                 let (codec, weight_shape) = weight.value_spec().packed_matrix()?;
                 CpuOp::QuantizedLinear {
@@ -2748,12 +2796,14 @@ impl Lowerer {
                             | CpuOp::ShortConv1dBackwardX
                             | CpuOp::ShortConv1dBackwardW
                             | CpuOp::ConvState { .. }
+                            | CpuOp::KvAttention { .. }
                             | CpuOp::KdaChunk { .. }
                             | CpuOp::KdaRecurrence { .. }
                             | CpuOp::KdaBackward { .. }
                             | CpuOp::AdamW { .. }
                             | CpuOp::Sgd { .. }
                             | CpuOp::Cumsum { .. }
+                            | CpuOp::GroupedExpertLinearRows
                     )
                 {
                     return Err(
@@ -3048,6 +3098,7 @@ impl Lowerer {
                 diagnostics,
                 compiler_work: CompilerWorkReport::default(),
                 state_cursor: self.state_cursor,
+                runs: AtomicU64::new(0),
             },
             self.generated,
             self.generated_slots,
@@ -3338,6 +3389,7 @@ fn compile_prepared_internal(
     if slots.iter().any(|slot| !slot.device.is_cpu()) {
         return Err("compile: graph contains an unsupported device".to_string());
     }
+    let stable_random_provenance = options.random_seed.is_some();
     let random_provenance = index
         .random_source_order
         .iter()
@@ -3345,7 +3397,12 @@ fn compile_prepared_internal(
             let node = index
                 .node(source.node)
                 .ok_or_else(|| format!("compile: random source {} is out of range", source.node))?;
-            Ok((node.id, source.provenance))
+            let provenance = if stable_random_provenance {
+                source.id.index() as u64
+            } else {
+                source.provenance
+            };
+            Ok((node.id, provenance))
         })
         .collect::<Result<HashMap<_, _>, String>>()?;
     let mut lowerer = Lowerer::new(
@@ -3864,6 +3921,24 @@ fn dispatch_command<'a>(
             inputs[2].tensor(),
             &mut destinations[0],
         ),
+        CpuOp::ExpertLinearRows => inputs[0].tensor().expert_linear_rows_into(
+            inputs[1].tensor(),
+            inputs[2].tensor(),
+            &mut destinations[0],
+        ),
+        CpuOp::GroupedExpertLinearRows => {
+            let CpuAlgorithmPlan::GroupedExpertLinearRows(plan) = plan else {
+                return Err("groupedExpertLinearRows: missing compiled plan".into());
+            };
+            plan.execute_into(
+                [inputs[0].tensor(), inputs[1].tensor(), inputs[2].tensor()],
+                [scratch_value(0).tensor(), scratch_value(1).tensor()],
+                &mut destinations[0],
+            )
+        }
+        CpuOp::TopKIndices { k } => inputs[0]
+            .tensor()
+            .top_k_indices_into(*k, &mut destinations[0]),
         CpuOp::Argmax { dim } => {
             inputs[0].tensor().argmax_into(*dim, &mut scratch[0])?;
             scratch_value(0)
@@ -4621,7 +4696,10 @@ fn execute_reported_with_commit(
             )
             .map_err(|error| format!("execute: {error}"))?;
     }
-    let nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
+    let nonce = executable.options.random_seed.map_or_else(
+        || INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel),
+        |seed| seed.wrapping_add(executable.runs.fetch_add(1, Ordering::AcqRel)),
+    );
     let segments = acquire_segments(executable)?;
     let values = {
         let _allocation_guard = ExecutableAllocationGuard::enter();
@@ -5191,6 +5269,166 @@ mod tests {
                     .materialized_conversions,
                 0
             );
+        }
+    }
+
+    #[test]
+    fn configured_stepwise_attention_preserves_bf16_scale_and_autodiff() {
+        use effect_torch_graph::{AttentionRounding, AttentionWindow};
+        let half = |values, shape| {
+            Node::new(NodeKind::Cast {
+                a: leaf_shape(values, shape),
+                dtype: DType::BF16,
+            })
+            .unwrap()
+        };
+        let q = half(vec![1.], vec![1, 1]);
+        let k = half(vec![3., -2.], vec![2, 1]);
+        let v = half(vec![0., 1.], vec![2, 1]);
+        let root = Node::new(NodeKind::SdpaConfigured {
+            q: q.clone(),
+            k: k.clone(),
+            v: v.clone(),
+            scale: 0.3,
+            causal: false,
+            window: AttentionWindow::Inherit,
+            rounding: AttentionRounding::Stepwise,
+            layer_id: Some(7),
+            retention: AttentionWindow::Local(0),
+        })
+        .unwrap();
+        let loss = Node::new(NodeKind::Sum {
+            a: root.clone(),
+            dims: vec![0, 1],
+            keepdims: false,
+        })
+        .unwrap();
+        let gradients = effect_torch_autodiff::grad(&loss, &[q, k, v]).unwrap();
+        for optimize in [false, true] {
+            let mut roots = vec![root.clone()];
+            roots.extend(gradients.iter().cloned());
+            let compilation = compile(&roots, options(optimize), 4096).unwrap();
+            let output = run(&compilation);
+            assert_eq!(output[0].to_f32_vec().unwrap(), [0.1826171875]);
+            assert_eq!(output[3].to_f32_vec().unwrap(), [0.81640625, 0.1826171875]);
+            for grad in &output[1..] {
+                assert!(grad
+                    .to_f32_vec()
+                    .unwrap()
+                    .iter()
+                    .all(|value| value.is_finite()));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_rotary_preserves_absolute_positions_and_pair_layouts() {
+        let x = leaf_shape(vec![1., 2., 3., 4., 5., 6., 7., 8.], vec![1, 2, 4]);
+        let positions = Node::new(NodeKind::FromBytes {
+            data: [0u32, 2].into_iter().flat_map(u32::to_le_bytes).collect(),
+            shape: vec![2],
+            dtype: DType::U32,
+            device: Device::Cpu(0),
+        })
+        .unwrap();
+        let frequencies = leaf_shape(vec![1., 0.], vec![2]);
+        for layout in [RotaryLayout::HalfSplit, RotaryLayout::InterleavedPairs] {
+            let root = Node::new(NodeKind::RotaryEmbeddingExplicit {
+                x: x.clone(),
+                positions: positions.clone(),
+                inverse_frequencies: frequencies.clone(),
+                layout,
+            })
+            .unwrap();
+            let loss = Node::new(NodeKind::Sum {
+                a: root.clone(),
+                dims: vec![0, 1, 2],
+                keepdims: false,
+            })
+            .unwrap();
+            let gradients =
+                effect_torch_autodiff::grad(&loss, &[x.clone(), frequencies.clone()]).unwrap();
+            let (s, c) = 2f32.sin_cos();
+            let expected = match layout {
+                RotaryLayout::HalfSplit => {
+                    vec![1., 2., 3., 4., 5. * c - 7. * s, 6., 5. * s + 7. * c, 8.]
+                }
+                RotaryLayout::InterleavedPairs => {
+                    vec![1., 2., 3., 4., 5. * c - 6. * s, 5. * s + 6. * c, 7., 8.]
+                }
+            };
+            for optimize in [false, true] {
+                let mut roots = vec![root.clone()];
+                roots.extend(gradients.iter().cloned());
+                let compilation = compile(&roots, options(optimize), 4096).unwrap();
+                let output = run(&compilation);
+                for (actual, expected) in output[0].to_f32_vec().unwrap().iter().zip(&expected) {
+                    assert!((actual - expected).abs() < 1e-5);
+                }
+                let (dx, df) = match layout {
+                    RotaryLayout::HalfSplit => (
+                        vec![1., 1., 1., 1., c + s, 1., c - s, 1.],
+                        vec![-4. * c - 24. * s, -4.],
+                    ),
+                    RotaryLayout::InterleavedPairs => (
+                        vec![1., 1., 1., 1., c + s, c - s, 1., 1.],
+                        vec![-2. * c - 22. * s, -2.],
+                    ),
+                };
+                for (output, expected) in [(&output[1], dx), (&output[2], df)] {
+                    for (actual, expected) in output.to_f32_vec().unwrap().iter().zip(expected) {
+                        assert!((actual - expected).abs() < 1e-5);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_rotary_rounds_each_half_operation_on_cpu() {
+        for (dtype, expected) in [
+            (
+                DType::BF16,
+                [
+                    [-3.59375, -2.296875, -0.0703125, 0.7421875],
+                    [1.0625, 2.640625, 3.078125, 1.0625],
+                ],
+            ),
+            (
+                DType::F16,
+                [
+                    [-3.58203125, -2.298828125, -0.0673828125, 0.73828125],
+                    [1.05859375, 2.646484375, 3.06640625, 1.060546875],
+                ],
+            ),
+        ] {
+            for (layout, expected) in [RotaryLayout::HalfSplit, RotaryLayout::InterleavedPairs]
+                .into_iter()
+                .zip(expected)
+            {
+                let root = Node::new(NodeKind::RotaryEmbeddingExplicit {
+                    x: Node::new(NodeKind::Cast {
+                        a: leaf_shape(vec![1.75, -2.25, 3.125, 0.875], vec![1, 4]),
+                        dtype,
+                    })
+                    .unwrap(),
+                    positions: Node::new(NodeKind::FromBytes {
+                        data: 3u32.to_le_bytes().to_vec(),
+                        shape: vec![1],
+                        dtype: DType::U32,
+                        device: Device::Cpu(0),
+                    })
+                    .unwrap(),
+                    inverse_frequencies: leaf_shape(vec![0.7, 0.02], vec![2]),
+                    layout,
+                })
+                .unwrap();
+                for optimize in [false, true] {
+                    let compilation =
+                        compile(std::slice::from_ref(&root), options(optimize), 4096).unwrap();
+                    assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), expected);
+                }
+            }
         }
     }
 
@@ -5939,6 +6177,7 @@ mod tests {
                 .map(|timing| timing.phase.as_str())
                 .collect::<Vec<_>>(),
             [
+                "semantic_preparation",
                 "graph_index",
                 "optimization",
                 "target_legalization",

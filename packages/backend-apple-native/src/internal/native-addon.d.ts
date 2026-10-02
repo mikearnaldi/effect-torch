@@ -8,12 +8,14 @@ export declare class CancellationToken {
 }
 
 export declare class Executable {
+  executeReadOnly(bindings: Array<NativeTensor>, prefixes: Array<NativeKvPrefix>, slots: Array<number>, activeMask: Array<boolean>, validLengths: Array<number>, cancellationToken?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   get diagnostics(): NativeExecutableDiagnostics
   get stateful(): boolean
   get batch(): number
   get packedRowsPerSequence(): number | null
   get allowsWindowEviction(): boolean
   get layers(): number
+  get kvLayers(): Array<NativeKvLayerDescriptor>
   get kvHeads(): number
   get headDim(): number
   get kdaLayers(): number
@@ -74,6 +76,7 @@ export declare class LazyTensor {
   sign(): LazyTensor
   whereCond(a: LazyTensor, b: LazyTensor): LazyTensor
   argmax(dim: number): LazyTensor
+  topKIndices(k: number): LazyTensor
   argmin(dim: number): LazyTensor
   cumsum(dim: number): LazyTensor
   indexSelect(dim: number, indexes: LazyTensor): LazyTensor
@@ -81,6 +84,8 @@ export declare class LazyTensor {
   gather(dim: number, indexes: LazyTensor): LazyTensor
   crossEntropy(target: LazyTensor, ignoreIndex: number): LazyTensor
   scaledDotProductAttention(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean, window: number): LazyTensor
+  scaledDotProductAttentionConfigured(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean, window: number, rounding: string, layerId?: number | undefined | null, retentionWindow?: number | undefined | null): LazyTensor
+  rotaryEmbeddingExplicit(positions: LazyTensor, inverseFrequencies: LazyTensor, layout: string): LazyTensor
   kdaChunk(k: LazyTensor, v: LazyTensor, logDecay: LazyTensor, beta: LazyTensor, scale: number): LazyTensor
   shortConv1d(weight: LazyTensor): LazyTensor
   positionEmbedding(seqLen: number): LazyTensor
@@ -89,6 +94,8 @@ export declare class LazyTensor {
   rmsNorm(weight: LazyTensor | undefined | null, eps: number): LazyTensor
   linear(weight: LazyTensor, bias: LazyTensor): LazyTensor
   quantizedLinear(weight: LazyTensor, bias?: LazyTensor | undefined | null): LazyTensor
+  groupedExpertLinearRows(weight: LazyTensor, indexes: LazyTensor): LazyTensor
+  expertLinearRows(weight: LazyTensor, indexes: LazyTensor): LazyTensor
   quantizedEmbedding(weight: LazyTensor, paddingIndex?: number | undefined | null): LazyTensor
   conv1d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
@@ -154,15 +161,26 @@ export declare class NativeInferenceSession {
 }
 
 export declare class NativeKvPool {
-  constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, dtype?: NativeDType | undefined | null, recurrent?: NativeRecurrentStateSchema | undefined | null)
-  static forDevice(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize: number | undefined | null, dtype: NativeDType | undefined | null, recurrent: NativeRecurrentStateSchema | undefined | null, deviceOrdinal: number): NativeKvPool
+  constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, dtype?: NativeDType | undefined | null, recurrent?: NativeRecurrentStateSchema | undefined | null, kvLayers?: Array<NativeKvLayerDescriptor> | undefined | null)
+  static forDevice(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize: number | undefined | null, dtype: NativeDType | undefined | null, recurrent: NativeRecurrentStateSchema | undefined | null, deviceOrdinal: number, kvLayers?: Array<NativeKvLayerDescriptor> | undefined | null): NativeKvPool
   get capacity(): number
   get freeBlocks(): number
   get cachedBlocks(): number
   makeSequence(): NativeKvSequence
 }
 
+export declare class NativeKvPrefix {
+  release(): void
+  get cursor(): number
+  get retainedBytes(): number
+  get sharedBytes(): number
+  get copiedBytes(): number
+  fork(): NativeKvSequence
+  inspect(): NativeKvSnapshotInspection
+}
+
 export declare class NativeKvSequence {
+  snapshot(): NativeKvPrefix
   get cursor(): number
   release(): void
   prefillMatch(tokens: Array<number>): number
@@ -215,6 +233,7 @@ export declare function loadTensorsForDevice(path: string, deviceOrdinal: number
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined
+  randomSeed?: number | undefined
   constantWeights?: boolean | undefined
 }
 
@@ -373,7 +392,34 @@ export interface NativeInstructionDiagnostics {
   count: number
 }
 
+export interface NativeKvLayerDescriptor {
+  layerId: number
+  kvHeads: number
+  headDim: number
+  dtype: NativeDType
+  retentionWindow?: number | undefined
+}
+
+export interface NativeKvLayerSnapshot {
+  layerId: number
+  startPosition: number
+  kvHeads: number
+  headDim: number
+  dtype: NativeDType
+  keys: Array<number>
+  values: Array<number>
+}
+
+export interface NativeKvSnapshotInspection {
+  cursor: number
+  retainedBytes: number
+  sharedBytes: number
+  copiedBytes: number
+  layers: Array<NativeKvLayerSnapshot>
+}
+
 export interface NativeKvStateSchema {
+  access?: string | undefined
   maxTokens: number
   blockSize: number
   kvDtype: NativeDType

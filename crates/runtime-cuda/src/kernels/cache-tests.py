@@ -46,7 +46,9 @@ def run_case(activation, cache, batch, rows, tokens, dim, qheads, kheads, capaci
         payload = b"".join(encode(v, activation) for v in data)
         payloads.append(payload)
         values.append([decode(payload[i:i + aw], activation) for i in range(0, len(payload), aw)])
-    cache_rows = batch * capacity * kheads
+    storage_tokens = capacity + rows * tokens
+    starts = [max(0, context + sequence % 3 - capacity) for sequence in range(batch)]
+    cache_rows = batch * storage_tokens * kheads
     raw = [bytearray(cache_rows * dim * cw), bytearray(cache_rows * dim * cw)]
     scales = [[1.0] * cache_rows, [1.0] * cache_rows]
 
@@ -91,21 +93,20 @@ def run_case(activation, cache, batch, rows, tokens, dim, qheads, kheads, capaci
             def append(token):
                 for head in range(kheads):
                     source = ((lane * kheads + head) * tokens + token) * dim
-                    dest = (sequence * capacity + (cursors[lane] + token) % capacity) * kheads + head
+                    dest = (sequence * storage_tokens + cursors[lane] + token - starts[sequence]) * kheads + head
                     for role in range(2):
                         write_row(role, dest, values[role + 1][source:source + dim])
 
-            if bidirectional:
-                for token in range(count):
-                    append(token)
             for token in range(count):
-                if not bidirectional:
-                    append(token)
-                end = cursors[lane] + (count if bidirectional else token + 1)
-                start = max(0, end - capacity, end - window if window else 0)
+                append(token)
+        end_sequence = cursors[sequence * rows] + sum(valid[sequence * rows:(sequence + 1) * rows])
+        for lane in range(sequence * rows, (sequence + 1) * rows):
+            for token in range(valid[lane]):
+                end = end_sequence if bidirectional else cursors[lane] + token + 1
+                start = max(starts[sequence], end - window if window else 0)
                 for head in range(qheads):
                     query = ((lane * qheads + head) * tokens + token) * dim
-                    positions = [(sequence * capacity + pos % capacity) * kheads + head * kheads // qheads for pos in range(start, end)]
+                    positions = [(sequence * storage_tokens + pos - starts[sequence]) * kheads + head * kheads // qheads for pos in range(start, end)]
                     scores = [sum(values[0][query + d] * load(0, row, d) for d in range(dim)) * scale for row in positions]
                     maximum = max(scores)
                     weights = [math.exp(score - maximum) for score in scores]
@@ -122,9 +123,20 @@ def run_case(activation, cache, batch, rows, tokens, dim, qheads, kheads, capaci
     for role in range(3):
         a.inputs[role] = upload(payloads[role])
         a.input_dtypes[role] = activation
+    cache_pointers, scale_pointers = [], []
     for role in range(2):
-        a.inputs[3 + role] = upload(guards + initial[role] + guards) + 16
-        a.inputs[5 + role] = upload(guards + initial_scales[role] + guards) + 16
+        cache_pointers.append(upload(guards + initial[role] + guards) + 16)
+        scale_pointers.append(upload(guards + initial_scales[role] + guards) + 16)
+    table = [0] * (batch * 4)
+    for sequence in range(batch):
+        cursor = cursors[sequence * rows]
+        end = cursor + sum(valid[sequence * rows:(sequence + 1) * rows])
+        table[sequence * 4:sequence * 4 + 4] = [starts[sequence], cursor, end, len(table)]
+        for pos in range(starts[sequence], end):
+            row = (sequence * storage_tokens + pos - starts[sequence]) * kheads
+            table.extend([cache_pointers[0] + row * dim * cw, cache_pointers[1] + row * dim * cw,
+                          scale_pointers[0] + row * 4, scale_pointers[1] + row * 4])
+    a.inputs[3] = upload(struct.pack("<" + "Q" * len(table), *table))
     a.inputs[7] = upload(struct.pack("<" + "I" * lanes, *cursors))
     a.scratch[0] = upload(struct.pack("<" + "I" * lanes, *valid))
     a.scratch[3] = upload(bytes(4))
@@ -138,6 +150,10 @@ def run_case(activation, cache, batch, rows, tokens, dim, qheads, kheads, capaci
     a.integers[3] = window
     a.integers[4] = bidirectional
     a.integers[5] = batch
+    a.integers[7] = tokens
+    a.integers[9] = storage_tokens
+    a.integers[10] = dim
+    a.inputs[4] = upload(bytes(lanes * qheads * tokens * storage_tokens * ow))
     a.scalars[0] = scale
     launch("cache", "et_kv_attention", a)
     assert read(a.scratch[3], 4) == bytes(4)
@@ -148,13 +164,13 @@ def run_case(activation, cache, batch, rows, tokens, dim, qheads, kheads, capaci
     error = max(abs(x - y) for x, y in zip(actual, expected))
     assert error <= tolerance, (activation, cache, dim, context, window, bidirectional, error)
     for role in range(2):
-        assert read(a.inputs[3 + role] - 16, len(raw[role]) + 32) == guards + bytes(raw[role]) + guards
+        assert read(cache_pointers[role] - 16, len(raw[role]) + 32) == guards + bytes(raw[role]) + guards
         expected_scales = struct.pack("<" + "f" * cache_rows, *scales[role])
-        assert read(a.inputs[5 + role] - 16, len(expected_scales) + 32) == guards + expected_scales + guards
+        assert read(scale_pointers[role] - 16, len(expected_scales) + 32) == guards + expected_scales + guards
     # Restore the original state and repeat to verify deterministic execution.
     for role in range(2):
-        checked(driver.cuMemcpyHtoD_v2(c.c_uint64(a.inputs[3 + role]), initial[role], c.c_size_t(len(initial[role]))))
-        checked(driver.cuMemcpyHtoD_v2(c.c_uint64(a.inputs[5 + role]), initial_scales[role], c.c_size_t(len(initial_scales[role]))))
+        checked(driver.cuMemcpyHtoD_v2(c.c_uint64(cache_pointers[role]), initial[role], c.c_size_t(len(initial[role]))))
+        checked(driver.cuMemcpyHtoD_v2(c.c_uint64(scale_pointers[role]), initial_scales[role], c.c_size_t(len(initial_scales[role]))))
     launch("cache", "et_kv_attention", a)
     assert read(a.output, len(expected) * ow) == output[16:-16]
     for ptr in allocations[begin_allocations:]:
@@ -171,4 +187,4 @@ for activation in [0, 1, 2, 3]:
             run_case(activation, cache, 2, 4, 2, 1, 2, 1, 37, 71, 17, bidirectional)
             run_case(activation, cache, 1, 2, 2, 33, 2, 1, 67, 130, 0, bidirectional)
             cases += 3
-print(f"PASSED {cases} warp KV dtype/ring/padding/GQA/bidirectional cases, exact cache bytes and deterministic replay")
+print(f"PASSED {cases} paged KV dtype/retention/padding/GQA/bidirectional cases, exact cache bytes and deterministic replay")

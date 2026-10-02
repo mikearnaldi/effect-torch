@@ -89,23 +89,36 @@ export const isTensorStorageEncoding = (value: unknown): value is TensorStorageE
 export const encodedStorageGeometry = (
   encoding: TensorStorageEncoding,
   logicalShape: ReadonlyArray<number>
-): { readonly physicalShape: readonly [rows: number, rowBytes: number]; readonly byteLength: number } | undefined => {
+): {
+  readonly physicalShape: readonly [rows: number, rowBytes: number]
+  readonly byteLength: number
+} | undefined => {
   if (
     !isTensorStorageEncoding(encoding) || logicalShape.length === 0 ||
     !logicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0)
   ) return undefined
+
   const blockBytes = { Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210 }[encoding]
   const columns = logicalShape[logicalShape.length - 1]!
+
   if (columns % 256 !== 0) return undefined
+
   const rowBytes = columns / 256 * blockBytes
+
   if (!Number.isSafeInteger(rowBytes)) return undefined
+
   let rows = 1
+
   for (let index = 0; index < logicalShape.length - 1; index++) {
     rows *= logicalShape[index]!
+
     if (!Number.isSafeInteger(rows)) return undefined
   }
+
   const byteLength = rows * rowBytes
+
   if (!Number.isSafeInteger(byteLength) || !Number.isSafeInteger(rows * columns)) return undefined
+
   return { physicalShape: [rows, rowBytes], byteLength }
 }
 
@@ -120,6 +133,7 @@ export const validEncodedStorage = (
   storage: EncodedTensorStorage
 ): boolean => {
   const geometry = encodedStorageGeometry(storage.encoding, logicalShape)
+
   return geometry !== undefined && storage.physicalDtype === "u8" && Array.isArray(storage.physicalShape) &&
     storage.physicalShape.length === 2 &&
     storage.physicalShape.every((dimension, index) => dimension === geometry.physicalShape[index])
@@ -213,20 +227,31 @@ export class BackendError extends Data.TaggedError("BackendError")<{
 
 /** Internal nominal brand for all tensor handles. */
 declare const TensorHandleTypeId: unique symbol
+
 /** Internal nominal brand for lazy tensor handles. */
 declare const LazyTensorHandleTypeId: unique symbol
+
 /** Internal nominal brand for concrete tensor handles. */
 declare const ConcreteTensorHandleTypeId: unique symbol
+
 /** Internal nominal brand for compiled executable handles. */
 declare const ExecutableHandleTypeId: unique symbol
+
 /** Internal nominal brand for paged KV pool handles. */
 declare const KvPoolHandleTypeId: unique symbol
+
 /** Internal nominal brand for paged KV sequence handles. */
 declare const KvSequenceHandleTypeId: unique symbol
+
+/** Internal nominal brand for immutable paged KV snapshots. */
+declare const KvPrefixHandleTypeId: unique symbol
+
 /** Internal nominal brand for a native inference artifact. */
 declare const InferenceArtifactHandleTypeId: unique symbol
+
 /** Internal nominal brand for a native generation session. */
 declare const InferenceSessionHandleTypeId: unique symbol
+
 /** Internal nominal brand for a native generation sequence. */
 declare const InferenceSequenceHandleTypeId: unique symbol
 
@@ -313,6 +338,13 @@ export interface ExecutableCompileOptions {
    */
   readonly optimize?: boolean | undefined
   /**
+   * Optional unsigned 32-bit base seed for random graph nodes. The first
+   * invocation uses this seed and later invocations advance a program-local
+   * counter. Programs compiled independently with the same seed and graph
+   * reproduce the same per-invocation stream.
+   */
+  readonly randomSeed?: number | undefined
+  /**
    * Authorizes inference-only retention of eligible materialized graph leaves
    * as executable constants. The executable, rather than the source handle,
    * retains the storage it needs. Bundled runtimes bypass structural
@@ -330,6 +362,8 @@ export interface ExecutableCompileOptions {
  * @category models
  */
 export interface DecodeStateRequest {
+  /** Persistent state access, independent of current-block attention visibility. */
+  readonly access: "Append" | "ReadOnly"
   /** Positive unsigned 32-bit token-row capacity of the compatible KV pool. */
   readonly maxTokens: number
   /** Positive unsigned 32-bit paging unit that must divide `maxTokens`. */
@@ -338,8 +372,9 @@ export interface DecodeStateRequest {
   readonly kvDtype: DType
   /**
    * Optional unsigned 32-bit global attention window in `1..=maxTokens`.
-   * A completed schema retains it as the KV eviction window only when every
-   * resolved attention operation is windowed.
+   * A completed schema retains this legacy default only when every attention
+   * layer permits eviction. Per-layer `kvLayers` descriptors determine actual
+   * persistent retention and pool compatibility.
    */
   readonly window?: number | undefined
   /**
@@ -399,11 +434,13 @@ export interface PackedCausalChainsLayout {
  * @category models
  */
 export interface DecodeStateSchema extends DecodeStateRequest {
+  /** Ordered persistent layer descriptors, shared across compatible entry points. */
+  readonly kvLayers: ReadonlyArray<KvLayerDescriptor>
   /** Number of attention layers backed by the KV pool. */
   readonly layers: number
-  /** Number of key/value heads per attention layer. */
+  /** Legacy uniform head count, or zero for heterogeneous layer geometry. */
   readonly kvHeads: number
-  /** Width of each key/value head. */
+  /** Legacy uniform head width, or zero for heterogeneous layer geometry. */
   readonly headDim: number
   /** Number of KDA recurrent layers with per-sequence state. */
   readonly kdaLayers: number
@@ -533,8 +570,9 @@ export interface ExecutableDiagnostics {
 
 /**
  * Opaque backend-owned executable plus its optional public state contract.
- * Executables are immutable and may be invoked concurrently. Stateful
- * invocations must nevertheless use disjoint sequence handles. There is no
+ * Executables are immutable and may be invoked concurrently. Append
+ * invocations use disjoint sequence handles; read-only invocations may share
+ * immutable prefix handles. There is no
  * common explicit release operation; implementations must finalize the native
  * wrapper after executable and cache references become unreachable.
  *
@@ -581,7 +619,9 @@ export interface CompileRequest {
  * @since 0.1.0
  * @category models
  */
-export interface ExecutionStateInvocation {
+export interface AppendStateInvocation {
+  /** Append access publishes state only after successful execution. */
+  readonly access: "Append"
   /**
    * From `1` through the compiled batch width, distinct live sequences from
    * one schema-compatible pool, listed in API result order.
@@ -607,6 +647,108 @@ export interface ExecutionStateInvocation {
    * rolls every row back.
    */
   readonly tokens: ReadonlyArray<ReadonlyArray<number>>
+}
+
+/**
+ * Immutable prefix bindings with independently valid current query rows.
+ * Prefix handles may be repeated or borrowed by concurrent invocations.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ReadOnlyStateInvocation {
+  readonly access: "ReadOnly"
+  readonly prefixes: ReadonlyArray<KvPrefixHandle>
+  readonly slots: ReadonlyArray<number>
+  readonly activeMask: ReadonlyArray<boolean>
+  readonly validLengths: ReadonlyArray<number>
+}
+
+/**
+ * Explicit persistent-state access for one invocation.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type ExecutionStateInvocation = AppendStateInvocation | ReadOnlyStateInvocation
+
+/**
+ * One persistent attention layer with logical `[B, H, T, D]` K/V layout.
+ * Retention limits prefix rows without changing absolute logical positions.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface KvLayerDescriptor {
+  readonly layerId: number
+  readonly kvHeads: number
+  readonly headDim: number
+  readonly dtype: DType
+  /** Null retains the complete prefix. Zero retains no prefix rows. */
+  readonly retentionWindow: number | null
+}
+
+/**
+ * Compares ordered persistent layer identities, geometry, storage, and retention.
+ * Attention visibility and executable state access are independent of this schema.
+ *
+ * @since 0.1.0
+ * @category predicates
+ */
+export const sameKvSchema = (
+  left: ReadonlyArray<KvLayerDescriptor>,
+  right: ReadonlyArray<KvLayerDescriptor>
+): boolean =>
+  left.length === right.length && left.every((layer, index) => {
+    const other = right[index]!
+
+    return layer.layerId === other.layerId && layer.kvHeads === other.kvHeads &&
+      layer.headDim === other.headDim && layer.dtype === other.dtype &&
+      layer.retentionWindow === other.retentionWindow
+  })
+
+/** Compares the persistent state geometry of two compiled decode programs. */
+export const sameDecodeStateSchema = (left: DecodeStateSchema, right: DecodeStateSchema): boolean =>
+  sameKvSchema(left.kvLayers, right.kvLayers) &&
+  left.layers === right.layers && left.kvHeads === right.kvHeads && left.headDim === right.headDim &&
+  left.kdaLayers === right.kdaLayers && left.kdaHeads === right.kdaHeads &&
+  left.kdaHeadDim === right.kdaHeadDim && left.kdaValueDim === right.kdaValueDim &&
+  left.convLayers === right.convLayers && left.convChannels === right.convChannels &&
+  left.convKernel === right.convKernel && (left.kvLayers.length > 0 || left.window === right.window)
+
+/**
+ * Owned immutable prefix capability. Release it after its last borrower finishes.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface KvPrefixHandle {
+  readonly [KvPrefixHandleTypeId]: typeof KvPrefixHandleTypeId
+  readonly tokenCount: number
+  /** Physical native storage retained at snapshot acquisition, including shared pages. */
+  readonly retainedBytes: number
+}
+
+/**
+ * Diagnostic host export of an immutable prefix. Values use `[T, H, D]` order.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface KvSnapshotInspection {
+  readonly cursor: number
+  readonly retainedBytes: number
+  readonly sharedBytes: number
+  readonly copiedBytes: number
+  readonly layers: ReadonlyArray<{
+    readonly layerId: number
+    readonly startPosition: number
+    readonly kvHeads: number
+    readonly headDim: number
+    readonly dtype: DType
+    readonly keys: ReadonlyArray<number>
+    readonly values: ReadonlyArray<number>
+  }>
 }
 
 /**
@@ -709,27 +851,43 @@ export interface NodeOperationMap {
   /** Creates a scalar constant, optionally matching an exemplar placement. */
   readonly constant: {
     readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
-    readonly attributes: { readonly value: number; readonly dtype: DType }
+    readonly attributes: {
+      readonly value: number
+      readonly dtype: DType
+    }
   }
   /** Creates a zero-filled tensor. */
   readonly zeros: {
     readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
-    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+    readonly attributes: {
+      readonly shape: ReadonlyArray<number>
+      readonly dtype: DType
+    }
   }
   /** Creates a one-filled tensor. */
   readonly ones: {
     readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
-    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+    readonly attributes: {
+      readonly shape: ReadonlyArray<number>
+      readonly dtype: DType
+    }
   }
   /** Creates a tensor filled with one scalar value. */
   readonly full: {
     readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
-    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly value: number; readonly dtype: DType }
+    readonly attributes: {
+      readonly shape: ReadonlyArray<number>
+      readonly value: number
+      readonly dtype: DType
+    }
   }
   /** Creates a tensor sampled from a standard normal distribution. */
   readonly randn: {
     readonly inputs: readonly []
-    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+    readonly attributes: {
+      readonly shape: ReadonlyArray<number>
+      readonly dtype: DType
+    }
   }
   /** Creates a tensor sampled uniformly from `[lo, hi)`. */
   readonly uniform: {
@@ -744,18 +902,30 @@ export interface NodeOperationMap {
   /** Creates a one-dimensional arithmetic progression. */
   readonly arange: {
     readonly inputs: readonly []
-    readonly attributes: { readonly start: number; readonly end: number; readonly step: number; readonly dtype: DType }
+    readonly attributes: {
+      readonly start: number
+      readonly end: number
+      readonly step: number
+      readonly dtype: DType
+    }
   }
   /** Creates a square identity matrix. */
   readonly eye: {
     readonly inputs: readonly []
-    readonly attributes: { readonly n: number; readonly dtype: DType }
+    readonly attributes: {
+      readonly n: number
+      readonly dtype: DType
+    }
   }
   /** Imports a host byte snapshot as a tensor. */
   readonly fromBytes: {
     readonly inputs: readonly []
     /** The backend snapshots `data`; the caller retains ownership. */
-    readonly attributes: { readonly data: Uint8Array; readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+    readonly attributes: {
+      readonly data: Uint8Array
+      readonly shape: ReadonlyArray<number>
+      readonly dtype: DType
+    }
   }
   /** Declares a tensor input slot in a compiled program. */
   readonly input: {
@@ -770,7 +940,10 @@ export interface NodeOperationMap {
   /** Declares a scalar input slot in a compiled program. */
   readonly scalarInput: {
     readonly inputs: readonly []
-    readonly attributes: { readonly slot: number; readonly dtype: DType }
+    readonly attributes: {
+      readonly slot: number
+      readonly dtype: DType
+    }
   }
   /** Adds two tensors elementwise with broadcasting. */
   readonly add: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
@@ -867,6 +1040,11 @@ export interface NodeOperationMap {
   readonly whereCond: {
     readonly inputs: readonly [condition: TensorHandle, a: TensorHandle, b: TensorHandle]
   }
+  /** Returns stable descending top-k indices on the last axis of an F32 tensor. */
+  readonly topKIndices: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly k: number }
+  }
   /** Returns indices of maximum values along one dimension. */
   readonly argmax: {
     readonly inputs: readonly [self: TensorHandle]
@@ -911,6 +1089,18 @@ export interface NodeOperationMap {
       readonly window?: number | null | undefined
     }
   }
+  /** Computes attention with explicit rounding and persistent-state metadata. */
+  readonly scaledDotProductAttentionConfigured: {
+    readonly inputs: readonly [q: TensorHandle, k: TensorHandle, v: TensorHandle]
+    readonly attributes: {
+      readonly scale: number
+      readonly causal: boolean
+      readonly window?: number | null | undefined
+      readonly rounding: "fused" | "stepwise"
+      readonly layerId?: number | undefined
+      readonly retentionWindow?: number | null | undefined
+    }
+  }
   /** Computes Kimi Delta Attention (gated delta-rule linear attention) in chunked form. */
   readonly kdaChunk: {
     readonly inputs: readonly [
@@ -941,6 +1131,11 @@ export interface NodeOperationMap {
       readonly layout: "HalfSplit" | "InterleavedPairs"
     }
   }
+  /** Applies rotary embeddings with absolute positions and F32 angle arithmetic. */
+  readonly rotaryEmbeddingExplicit: {
+    readonly inputs: readonly [self: TensorHandle, positions: TensorHandle, inverseFrequencies: TensorHandle]
+    readonly attributes: { readonly layout: "HalfSplit" | "InterleavedPairs" }
+  }
   /** Normalizes the trailing dimensions and applies affine parameters. */
   readonly layerNorm: {
     readonly inputs: readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
@@ -954,6 +1149,14 @@ export interface NodeOperationMap {
   /** Applies a linear projection with a bias. */
   readonly linear: {
     readonly inputs: readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
+  }
+  /** Applies one row-oriented expert matrix per input row, selected by U32 indices. */
+  readonly expertLinearRows: {
+    readonly inputs: readonly [self: TensorHandle, weights: TensorHandle, indices: TensorHandle]
+  }
+  /** Stable exact-size expert groups with ordinary backend matrix-product numerics. */
+  readonly groupedExpertLinearRows: {
+    readonly inputs: readonly [self: TensorHandle, weights: TensorHandle, indices: TensorHandle]
   }
   /** Applies a row-oriented packed linear projection, with an optional dense bias. */
   readonly quantizedLinear: {
@@ -991,27 +1194,42 @@ export interface NodeOperationMap {
   /** Sums elements over selected dimensions. */
   readonly sum: {
     readonly inputs: readonly [self: TensorHandle]
-    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+    readonly attributes: {
+      readonly dims: ReadonlyArray<number>
+      readonly keepdims: boolean
+    }
   }
   /** Multiplies elements over selected dimensions. */
   readonly prod: {
     readonly inputs: readonly [self: TensorHandle]
-    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+    readonly attributes: {
+      readonly dims: ReadonlyArray<number>
+      readonly keepdims: boolean
+    }
   }
   /** Averages elements over selected dimensions. */
   readonly mean: {
     readonly inputs: readonly [self: TensorHandle]
-    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+    readonly attributes: {
+      readonly dims: ReadonlyArray<number>
+      readonly keepdims: boolean
+    }
   }
   /** Selects maximum values over selected dimensions. */
   readonly max: {
     readonly inputs: readonly [self: TensorHandle]
-    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+    readonly attributes: {
+      readonly dims: ReadonlyArray<number>
+      readonly keepdims: boolean
+    }
   }
   /** Selects minimum values over selected dimensions. */
   readonly min: {
     readonly inputs: readonly [self: TensorHandle]
-    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+    readonly attributes: {
+      readonly dims: ReadonlyArray<number>
+      readonly keepdims: boolean
+    }
   }
   /** Changes tensor dimensions without changing element order. */
   readonly reshape: {
@@ -1884,12 +2102,43 @@ export interface SamplingRuntime {
  */
 export interface DecodeRuntime {
   /**
+   * Optional read-only body, stateless readout, and stateless processor pipeline.
+   * Preparation performs no execution or random-number consumption. Undefined
+   * means unsupported; execution failures must never trigger fallback or retry.
+   * The first body binding is a U32 host input; remaining bindings are borrowed.
+   * Execution transfers one device output and an independent F32 host copy after
+   * transfer completion, reclaiming unpublished outputs on failure/interruption.
+   */
+  readonly prepareProcessedReadOnly?:
+    | ((request: {
+      readonly body: ExecutableHandle
+      readonly readout?: ExecutableHandle | undefined
+      readonly processor: ExecutableHandle
+      readonly hostShape: ReadonlyArray<number>
+    }) => Effect.Effect<
+      {
+        readonly execute: (request: {
+          readonly hostInput: Uint32Array
+          readonly bindings: ReadonlyArray<ConcreteTensorHandle>
+          readonly state: ReadOnlyStateInvocation
+          readonly scalar: number
+        }) => Effect.Effect<{
+          readonly device: ConcreteTensorHandle
+          readonly host: Float32Array
+        }, BackendError>
+      } | undefined,
+      BackendError
+    >)
+    | undefined
+  /**
    * Allocates a fixed-capacity decode-state pool. KV arenas and prefix-cache
    * content are shared by child sequences, while each sequence owns independent
    * mutable recurrent state. The returned pool belongs to this runtime and is
    * retained by its child sequences.
    */
   readonly makePool: (options: {
+    /** Ordered storage descriptors. When present these determine every layer allocation. */
+    readonly kvLayers?: ReadonlyArray<KvLayerDescriptor> | undefined
     /** Number of attention layers stored in the pool. */
     readonly layers: number
     /** Number of key/value heads per layer. */
@@ -1922,6 +2171,14 @@ export interface DecodeRuntime {
    * table, and recurrent state, retaining the supplied pool.
    */
   readonly makeSequence: (pool: KvPoolHandle) => Effect.Effect<KvSequenceHandle, BackendError>
+  /** Retains an immutable snapshot of the committed sequence without copying its prefix. */
+  readonly snapshot: (sequence: KvSequenceHandle) => Effect.Effect<KvPrefixHandle, BackendError>
+  /** Creates an independent appendable sequence sharing this prefix. */
+  readonly fork: (prefix: KvPrefixHandle) => Effect.Effect<KvSequenceHandle, BackendError>
+  /** Releases one snapshot owner after its last invocation borrower completes. */
+  readonly releasePrefix: (prefix: KvPrefixHandle) => Effect.Effect<void, BackendError>
+  /** Exports retained K/V and physical sharing counters for diagnostics. */
+  readonly inspectPrefix: (prefix: KvPrefixHandle) => Effect.Effect<KvSnapshotInspection, BackendError>
   /**
    * On an empty sequence, attaches the longest resident whole-block proper KV
    * prefix, leaving one token when input is nonempty. Hybrid pools with
@@ -2028,8 +2285,8 @@ export interface RuntimeService {
    * invocation. Inputs and state sequences are borrowed until completion.
    * Returned handles are distinct caller-owned capabilities, survive later
    * invocations, and should be passed to idempotent `release` for deterministic
-   * cleanup. Concurrent calls are supported for stateless invocations and for
-   * stateful invocations using disjoint sequences.
+   * cleanup. Concurrent calls support stateless execution, append execution
+   * using disjoint sequences, and read-only execution sharing immutable prefixes.
    *
    * On failure or interruption, no output ownership transfers. The runtime
    * must retire submitted work safely, release partial or late output handles,

@@ -476,7 +476,7 @@ onDevices("Model", () => (it) => {
       Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2]), [5])
         const cases: Array<
-          [Model.Model, (x: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>]
+          [Model.Definition, (x: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>]
         > = [
           [yield* Model.gelu(), (x) => Tensor.gelu(x)],
           [yield* Model.gelu({ approximate: "tanh" }), (x) => Tensor.gelu(x, { approximate: "tanh" })],

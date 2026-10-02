@@ -43,7 +43,7 @@ impl TargetDTypeCapabilities for CpuDTypeCapabilities {
         &self.fingerprint
     }
     fn policy_revision(&self) -> u64 {
-        2
+        6
     }
 
     fn storage_support(&self, value: &ValueSpec<'_>) -> StorageSupport {
@@ -228,7 +228,24 @@ impl TargetDTypeCapabilities for CpuDTypeCapabilities {
                     );
                 }
             }
-            NativeRegion::LinearResidual(_) | NativeRegion::LinearGelu(_) => {
+            NativeRegion::DualArgmax(_)
+            | NativeRegion::RouterTail(_)
+            | NativeRegion::AttentionFfnEntrance(_)
+            | NativeRegion::RmsResidual(_)
+            | NativeRegion::FfnNextNorm(_)
+            | NativeRegion::FfnTail(_)
+            | NativeRegion::VNormKvAttention(_)
+            | NativeRegion::NormRope(_)
+            | NativeRegion::GroupedExpertGated(_)
+            | NativeRegion::SmallSoftmax(_)
+            | NativeRegion::Entropy(_)
+            | NativeRegion::Bf16Softmax(_)
+            | NativeRegion::SharedRmsNorm(_)
+            | NativeRegion::ExpertRouteRank(_)
+            | NativeRegion::OrderedScatterReduce(_)
+            | NativeRegion::ElementwiseArgReduce(_)
+            | NativeRegion::LinearResidual(_)
+            | NativeRegion::LinearGelu(_) => {
                 return unsupported(
                     DTypeRequirement::Region,
                     "CPU linear epilogue regions are not implemented by this policy",
@@ -316,6 +333,9 @@ fn operand_role(operation: &NodeKind, index: usize) -> ValueRole {
             [ValueRole::Activation, ValueRole::Weight, ValueRole::Bias][index]
         }
         NodeKind::QuantizedEmbedding { .. } => [ValueRole::Indices, ValueRole::Weight][index],
+        NodeKind::ExpertLinearRows { .. } | NodeKind::GroupedExpertLinearRows { .. } => {
+            [ValueRole::Activation, ValueRole::Weight, ValueRole::Indices][index]
+        }
         NodeKind::AdamWStep { .. } => match index {
             0 => ValueRole::Parameter,
             1 => ValueRole::Gradient,
@@ -344,6 +364,9 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
         }
     };
     match kind {
+        NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+            Err("semantic operation requires native semantic preparation".into())
+        }
         NodeKind::Neg { a } if a.dtype == DType::U8 => {
             Err("neg does not support CPU dtype u8".into())
         }
@@ -409,8 +432,10 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
                 Err("chunked head CE requires CPU f32 or f64".into())
             }
         }
-        NodeKind::KvAttention { q, .. } if q.dtype != DType::F32 => {
-            Err("kv_attention requires CPU f32".into())
+        NodeKind::KvAttention { q, .. }
+            if !matches!(q.dtype, DType::F32 | DType::F16 | DType::BF16) =>
+        {
+            Err("kv_attention requires CPU f32, f16, or bf16".into())
         }
         NodeKind::LayerNorm {
             x, weight, bias, ..
@@ -486,6 +511,7 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
         | NodeKind::Min { .. }
         | NodeKind::Prod { .. }
         | NodeKind::Argmax { .. }
+        | NodeKind::TopKIndices { .. }
         | NodeKind::Argmin { .. }
         | NodeKind::Cumsum { .. }
         | NodeKind::IndexSelect { .. }
@@ -510,6 +536,8 @@ fn validate_operation(kind: &NodeKind) -> Result<(), String> {
         | NodeKind::RotaryEmbeddingBackward { .. }
         | NodeKind::LayerNormBackwardOut { .. }
         | NodeKind::QuantizedLinear { .. }
+        | NodeKind::ExpertLinearRows { .. }
+        | NodeKind::GroupedExpertLinearRows { .. }
         | NodeKind::QuantizedEmbedding { .. }
         | NodeKind::Conv1d { .. }
         | NodeKind::Conv2d { .. }

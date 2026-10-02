@@ -438,7 +438,9 @@ sync_worktree() {
   # shellcheck disable=SC2029
   git -C "${repository}" ls-files --cached --others --exclude-standard -z |
     while IFS= read -r -d '' file; do
-      if [[ -e ${repository}/${file} || -L ${repository}/${file} ]]; then
+      # Gitlinks appear as directory paths. Tar would recursively upload the
+      # submodule checkout (including its changing .git metadata).
+      if [[ ! -d ${repository}/${file} && ( -e ${repository}/${file} || -L ${repository}/${file} ) ]]; then
         printf '%s\0' "${file}"
       fi
     done |

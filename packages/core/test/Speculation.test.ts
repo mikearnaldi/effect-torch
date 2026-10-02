@@ -34,8 +34,8 @@ onDevices("Speculation", () => (it) => {
 
   it.effect("constructs a replayable parallel block", () =>
     Effect.gen(function*() {
-      const build = (_: Model.Params, input: Tensor.Any) => Tensor.relu(input)
-      const replay = (_: Model.Params, inputs: ReadonlyArray<Tensor.Any>) =>
+      const build = (_: Model.Parameters, input: Tensor.Any) => Tensor.relu(input)
+      const replay = (_: Model.Parameters, inputs: ReadonlyArray<Tensor.Any>) =>
         Effect.sync(() =>
           inputs.map((input) => {
             if (!Tensor.isLazyTensor(input)) throw new Error("replay inputs must be lazy tensors")

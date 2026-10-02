@@ -3,28 +3,31 @@
 //! [`specialize_decode`] converts training-style operations to their stateful
 //! autoregressive forms. It replaces causal attention with KV-cached attention,
 //! chunked KDA with a recurrence, and short convolutions with state updates. It
-//! also makes rotary positions cursor-relative and rebuilds learned position
-//! embeddings as cursor-indexed gathers. The function creates a new graph with
+//! also makes implicit rotary positions cursor-relative and rebuilds learned
+//! position embeddings as cursor-indexed gathers. Explicit rotary positions
+//! remain caller-bound. The function creates a new graph with
 //! fresh node IDs, preserves shared subgraphs, and does not mutate the source.
 //!
 //! The returned [`DecodeGeometry`] tells the runtime how to allocate state.
 //! Rewrite validation enforces these rules:
 //!
-//! - Stateful layers in each family use the same geometry. Mixed attention,
-//!   KDA, or convolution geometry is an error.
-//! - Layer ordinals follow the historical encounter order, with the last root
-//!   first. Repeated specialization of the same graph produces the same order.
+//! - Attention layers retain ordered per-layer geometry. KDA and convolution
+//!   families retain their existing uniform geometry contracts.
+//! - Explicit layer identities are zero-based and gap-free. Without them,
+//!   ordinals follow the historical encounter order, with the last root first.
+//!   Repeated specialization of the same graph produces the same order.
 //! - The runtime provides the state cursor at `cursor_slot`, one slot after
 //!   the highest caller input. It is not a caller argument. One dense graph row
 //!   uses a scalar. Multiple rows use an `i64 [graph_rows]` tensor.
-//! - `allows_window_eviction` is true only if every attention layer has a
-//!   finite window. A global retention window smaller than an explicit local
-//!   window is an error.
+//! - `allows_window_eviction` is true only if every attention layer has finite
+//!   retention. Query visibility and persistent retention are separate.
+//!   A legacy global window smaller than an explicit local window is an error.
 
 use effect_torch_graph::{
-    node_children, remap_children, KvAttentionMode, Node, NodeKind, PositionOffset,
+    node_children, remap_children, AttentionRounding, KvAttentionMode, Node, NodeKind,
+    PositionOffset,
 };
-use effect_torch_runtime::DType;
+use effect_torch_runtime::{DType, KvLayerDescriptor};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -62,13 +65,14 @@ pub struct ConvGeometry {
 
 /// Stateful decode geometry returned with the specialized roots.
 ///
-/// `layers` is the attention layer count. `kv_heads` and `head_dim` define
-/// their uniform KV-cache geometry. All three are zero when the graph has no
-/// attention. `cursor_slot` and `cursor_tensor` locate the runtime state
+/// `kv_layers` defines ordered persistent state. `layers`, `kv_heads`, and
+/// `head_dim` are legacy summaries; the latter two are zero for heterogeneous
+/// geometry. `cursor_slot` and `cursor_tensor` locate the runtime state
 /// cursor among the program inputs. `allows_window_eviction` says whether the
 /// runtime may evict KV state outside the maximum attention window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DecodeGeometry {
+    pub kv_layers: Vec<KvLayerDescriptor>,
     pub layers: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
@@ -385,7 +389,9 @@ pub fn specialize_decode_layout_outputs_with_attention(
     let mut kda_layers = 0usize;
     let mut conv_layers = 0usize;
     let mut cursor_tensor = false;
-    let mut geometry: Option<(usize, usize)> = None;
+    let mut kv_layers = Vec::new();
+    let mut explicit_layer_ids = None;
+    let mut layer_ids = HashSet::new();
     let mut allows_window_eviction = true;
     let mut maximum_attention_window = None;
     let mut kda_geometry: Option<(usize, usize, usize, DType)> = None;
@@ -405,6 +411,15 @@ pub fn specialize_decode_layout_outputs_with_attention(
                 scale,
                 causal,
                 window: attention_window,
+            }
+            | NodeKind::SdpaConfigured {
+                q,
+                k,
+                v,
+                scale,
+                causal,
+                window: attention_window,
+                ..
             } => {
                 if !causal && current_block_attention != CurrentBlockAttention::Bidirectional {
                     return Err(
@@ -419,27 +434,42 @@ pub fn specialize_decode_layout_outputs_with_attention(
                         k.shape
                     ));
                 }
-                let current = (k.shape[rank - 3], k.shape[rank - 1]);
-                if let Some(previous) = geometry {
-                    if previous != current {
-                        if k.device.is_metal() {
-                            return Err(format!(
-                                "decode: attention layers disagree on head geometry ([{}, {}] vs [{}, {}])",
-                                previous.0, previous.1, current.0, current.1
-                            ));
-                        }
-                        return Err(format!(
-                            "decode: attention layers disagree on head geometry ({previous:?} vs {current:?})"
-                        ));
-                    }
-                } else {
-                    geometry = Some(current);
-                }
-                let layer = layers;
-                layers += 1;
                 let resolved_window = attention_window.resolve(window);
-                allows_window_eviction &= resolved_window.is_some();
-                if let Some(resolved_window) = resolved_window {
+                let (layer_id, retention, rounding) = match &node.kind {
+                    NodeKind::SdpaConfigured {
+                        layer_id,
+                        retention,
+                        rounding,
+                        ..
+                    } => (*layer_id, retention.resolve(resolved_window), *rounding),
+                    _ => (None, resolved_window, AttentionRounding::Fused),
+                };
+                let explicit = layer_id.is_some();
+                if explicit_layer_ids.is_some_and(|previous| previous != explicit) {
+                    return Err("decode: attention layer identities must be explicit on every layer or none".into());
+                }
+                explicit_layer_ids = Some(explicit);
+                let layer = layer_id.unwrap_or(layers as u32);
+                if !layer_ids.insert(layer) {
+                    return Err(format!(
+                        "decode: duplicate attention layer identity {layer}"
+                    ));
+                }
+                kv_layers.push(KvLayerDescriptor {
+                    layer_id: layer,
+                    kv_heads: k.shape[rank - 3],
+                    head_dim: k.shape[rank - 1],
+                    dtype: k.dtype,
+                    retention,
+                });
+                layers += 1;
+                allows_window_eviction &= retention.is_some();
+                let legacy_retention = !matches!(
+                    &node.kind,
+                    NodeKind::SdpaConfigured { retention, .. }
+                        if !matches!(retention, effect_torch_graph::AttentionWindow::Inherit)
+                );
+                if let Some(resolved_window) = resolved_window.filter(|_| legacy_retention) {
                     maximum_attention_window = Some(
                         maximum_attention_window.map_or(resolved_window, |current: usize| {
                             current.max(resolved_window)
@@ -451,9 +481,10 @@ pub fn specialize_decode_layout_outputs_with_attention(
                     k: remap(k),
                     v: remap(v),
                     scale: *scale,
-                    layer: layer as u32,
+                    layer,
                     window: resolved_window,
                     mode: current_block_attention.kv_mode(),
+                    rounding,
                 }
             }
             NodeKind::KdaChunk {
@@ -635,7 +666,25 @@ pub fn specialize_decode_layout_outputs_with_attention(
         remapped.insert(node.id, Node::new(kind)?);
     }
 
-    let (kv_heads, head_dim) = geometry.unwrap_or((0, 0));
+    kv_layers.sort_by_key(|layer| layer.layer_id);
+    for (ordinal, layer) in kv_layers.iter().enumerate() {
+        if layer.layer_id as usize != ordinal {
+            return Err(
+                "decode: explicit attention layer identities must be zero-based and gap-free"
+                    .into(),
+            );
+        }
+    }
+    let (kv_heads, head_dim) = kv_layers.first().map_or((0, 0), |first| {
+        if kv_layers
+            .iter()
+            .all(|layer| layer.kv_heads == first.kv_heads && layer.head_dim == first.head_dim)
+        {
+            (first.kv_heads, first.head_dim)
+        } else {
+            (0, 0)
+        }
+    });
     let kda = kda_geometry
         .map(|(heads, head_dim, value_dim, dtype)| KdaGeometry {
             layers: kda_layers,
@@ -742,6 +791,7 @@ pub fn specialize_decode_layout_outputs_with_attention(
     Ok((
         selected,
         DecodeGeometry {
+            kv_layers,
             layers,
             kv_heads,
             head_dim,
@@ -1049,27 +1099,162 @@ mod tests {
     }
 
     #[test]
+    fn explicit_rotary_positions_remain_caller_bound_after_decode_specialization() {
+        for layout in [RotaryLayout::InterleavedPairs, RotaryLayout::HalfSplit] {
+            let x = input(0, &[1, 1, 3, 4], DType::BF16, Device::Cpu(0));
+            let positions = input(1, &[1, 3], DType::I64, Device::Cpu(0));
+            let inverse_frequencies = input(2, &[2], DType::F32, Device::Cpu(0));
+            let rotated = Node::new(NodeKind::RotaryEmbeddingExplicit {
+                x,
+                positions,
+                inverse_frequencies,
+                layout,
+            })
+            .unwrap();
+            let attention = Node::new(NodeKind::SdpaConfigured {
+                q: rotated.clone(),
+                k: rotated.clone(),
+                v: rotated,
+                scale: 0.5,
+                causal: false,
+                window: AttentionWindow::Inherit,
+                rounding: AttentionRounding::Stepwise,
+                layer_id: Some(0),
+                retention: AttentionWindow::Local(0),
+            })
+            .unwrap();
+            let (roots, schema) = specialize_decode_layout_outputs_with_attention(
+                &[attention],
+                None,
+                DecodeLayout::dense(1),
+                &[DecodeOutputSelection::AllRows],
+                CurrentBlockAttention::Bidirectional,
+            )
+            .unwrap();
+            assert_eq!(schema.kv_layers[0].retention, Some(0));
+            let order = graph_post_order(&roots);
+            let rotary = order
+                .iter()
+                .find(|node| matches!(node.kind, NodeKind::RotaryEmbeddingExplicit { .. }))
+                .unwrap();
+            let NodeKind::RotaryEmbeddingExplicit {
+                positions,
+                inverse_frequencies,
+                layout: actual,
+                ..
+            } = &rotary.kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(*actual, layout);
+            assert!(matches!(positions.kind, NodeKind::Input { slot: 1, .. }));
+            assert_eq!(positions.shape, [1, 3]);
+            assert!(matches!(
+                inverse_frequencies.kind,
+                NodeKind::Input { slot: 2, .. }
+            ));
+            assert!(!order
+                .iter()
+                .any(|node| matches!(node.kind, NodeKind::ScalarInput { .. })));
+        }
+    }
+
+    #[test]
+    fn explicit_layer_schema_is_stable_across_entry_points_and_visibility() {
+        let configured = |layer_id, heads, width, causal, retention| {
+            let q = tensor(&[1, heads, 3, width], DType::BF16, Device::Cpu(0));
+            Node::new(NodeKind::SdpaConfigured {
+                q: q.clone(),
+                k: q.clone(),
+                v: q,
+                scale: 0.5,
+                causal,
+                window: if causal {
+                    AttentionWindow::Local(4)
+                } else {
+                    AttentionWindow::Inherit
+                },
+                rounding: AttentionRounding::Stepwise,
+                layer_id: Some(layer_id),
+                retention,
+            })
+            .unwrap()
+        };
+        let (_, local_schema) = specialize_decode(
+            &[configured(0, 1, 4, true, AttentionWindow::Local(3))],
+            Some(3),
+            1,
+            false,
+        )
+        .unwrap();
+        assert!(local_schema.allows_window_eviction);
+        assert_eq!(local_schema.kv_layers[0].retention, Some(3));
+        let encoder = [
+            configured(1, 2, 8, true, AttentionWindow::Full),
+            configured(0, 1, 4, true, AttentionWindow::Local(3)),
+        ];
+        let decoder = [
+            configured(0, 1, 4, false, AttentionWindow::Local(3)),
+            configured(1, 2, 8, false, AttentionWindow::Full),
+        ];
+        let (_, encoder_schema) = specialize_decode(&encoder, None, 1, false).unwrap();
+        let (roots, decoder_schema) = specialize_decode_layout_outputs_with_attention(
+            &decoder,
+            None,
+            DecodeLayout::dense(1),
+            &[DecodeOutputSelection::AllRows; 2],
+            CurrentBlockAttention::Bidirectional,
+        )
+        .unwrap();
+        assert_eq!(encoder_schema.kv_layers, decoder_schema.kv_layers);
+        assert_eq!(decoder_schema.kv_layers[0].retention, Some(3));
+        assert_eq!(decoder_schema.kv_layers[1].retention, None);
+        assert!(!decoder_schema.allows_window_eviction);
+        for (layer, root) in roots.iter().enumerate() {
+            assert!(matches!(root.kind, NodeKind::KvAttention {
+                layer: actual, window: None, mode: KvAttentionMode::BidirectionalBlock,
+                rounding: AttentionRounding::Stepwise, ..
+            } if actual == layer as u32));
+        }
+        let duplicate = [
+            decoder[0].clone(),
+            configured(0, 1, 4, true, AttentionWindow::Full),
+        ];
+        assert!(specialize_decode_layout_outputs_with_attention(
+            &duplicate,
+            None,
+            DecodeLayout::dense(1),
+            &[DecodeOutputSelection::AllRows; 2],
+            CurrentBlockAttention::Bidirectional,
+        )
+        .err()
+        .unwrap()
+        .contains("duplicate attention layer identity"));
+    }
+
+    #[test]
     fn geometry_and_dtype_validation_preserve_backend_errors() {
-        let cpu_attention = [
-            attention(1, 2, 1, 4, 1.0, true, Device::Cpu(0)),
-            attention(1, 3, 1, 4, 1.0, true, Device::Cpu(0)),
-        ];
-        assert_eq!(
-            specialize_decode(&cpu_attention, None, 1, false)
-                .err()
-                .unwrap(),
-            "decode: attention layers disagree on head geometry ((3, 4) vs (2, 4))"
-        );
-        let metal_attention = [
-            attention(1, 2, 1, 4, 1.0, true, Device::Metal(0)),
-            attention(1, 3, 1, 4, 1.0, true, Device::Metal(0)),
-        ];
-        assert_eq!(
-            specialize_decode(&metal_attention, None, 1, false)
-                .err()
-                .unwrap(),
-            "decode: attention layers disagree on head geometry ([3, 4] vs [2, 4])"
-        );
+        for device in [Device::Cpu(0), Device::Metal(0), Device::Cuda(0)] {
+            let attention = [
+                attention(1, 2, 1, 4, 1.0, true, device.clone()),
+                attention(1, 3, 1, 8, 1.0, true, device),
+            ];
+            let (roots, geometry) = specialize_decode(&attention, None, 1, false).unwrap();
+            assert_eq!((geometry.kv_heads, geometry.head_dim), (0, 0));
+            assert_eq!(geometry.kv_layers.len(), 2);
+            assert_eq!(geometry.kv_layers[0].kv_heads, 3);
+            assert_eq!(geometry.kv_layers[0].head_dim, 8);
+            assert_eq!(geometry.kv_layers[1].kv_heads, 2);
+            assert_eq!(geometry.kv_layers[1].head_dim, 4);
+            assert!(matches!(
+                roots[0].kind,
+                NodeKind::KvAttention { layer: 1, .. }
+            ));
+            assert!(matches!(
+                roots[1].kind,
+                NodeKind::KvAttention { layer: 0, .. }
+            ));
+        }
         let cpu_kda = [
             kda(1, 2, 1, 4, 3, DType::F32, 1.0, Device::Cpu(0)),
             kda(1, 3, 1, 4, 3, DType::F32, 1.0, Device::Cpu(0)),

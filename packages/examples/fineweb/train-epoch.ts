@@ -101,7 +101,7 @@ const program = Effect.gen(function*() {
   // Use the resumable archive before the bare pilot artifact. Loading bare
   // parameters starts fresh optimizer and sampler state. If neither file
   // exists, initialize random model parameters.
-  let params: Model.Params
+  let params: Model.Parameters
   let step = 0
   let resume: Trainer.Resume<Optimizer.AdamState> | undefined
   let epoch = 1

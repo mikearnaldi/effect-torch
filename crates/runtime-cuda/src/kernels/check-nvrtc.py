@@ -76,14 +76,24 @@ def text(name):
 header = text("typed.cuh")
 prelude = re.search(r'const F32_PRELUDE: &str = r#"(.*?)"#;', (ROOT.parent / "device.rs").read_text(), re.S).group(1)
 modules = {}
-scalar_only = "--scalar-only" in sys.argv
-cache_only = "--cache-only" in sys.argv
+index_only = "--index-only" in sys.argv
+expert_replay = "--expert-replay" in sys.argv
+rms_replay = "--rms-replay" in sys.argv
+reduction_replay = "--reduction-replay" in sys.argv
+scalar_only = "--scalar-only" in sys.argv or index_only or expert_replay or rms_replay or reduction_replay
+cache_replay = "--cache-replay" in sys.argv
+cache_only = "--cache-only" in sys.argv or cache_replay
 for name in (["cache"] if cache_only else ["typed"] if scalar_only else ["typed", "quantized", "cache"]):
     modules[name] = compile_module(name, header + text(f"{name}.cu"))
 for name in ([] if scalar_only or cache_only else ["pointwise", "tensor", "linalg", "neural", "stateful"]):
     for dtype in ["f32", "f64"]:
         source = "\n".join([header, prelude if dtype == "f32" else "", text("common.cuh"), f"#define ET_{name.upper()}", text(f"{name}.cu"), text("compute.cu")])
         modules[f"{name}_{dtype}"] = compile_module(f"{name}_{dtype}", source)
+if rms_replay or reduction_replay:
+    wrapper = (Path(sys.argv[sys.argv.index("--reduction-old-source") + 1]).read_text()
+               if reduction_replay and "--reduction-old-source" in sys.argv else text("compute.cu"))
+    source = "\n".join([header, prelude, text("common.cuh"), "#define ET_TENSOR", text("tensor.cu"), wrapper])
+    modules["tensor_f32"] = compile_module("tensor_f32", source)
 
 allocations = []
 
@@ -106,7 +116,17 @@ def launch(module, name, args):
     function = c.c_void_p()
     checked(driver.cuModuleGetFunction(c.byref(function), modules[module], name.encode()))
     params = (c.c_void_p * 1)(c.addressof(args))
-    work_items = args.integers[5] * 32 if name == "et_kv_attention" else args.elements
+    if name == "et_kv_attention":
+        launch(module, "et_kv_store", args)
+        work_items = args.elements // args.integers[10] * 32
+    elif name == "et_kv_store":
+        work_items = args.integers[5] * args.integers[2] * args.integers[7]
+    elif name == "et_reduce" and module == "tensor_f32" and args.operation == 0:
+        work_items = min(65535 * 256, args.elements * 32)
+    elif name == "et_rms_norm" and "--rms-fixed" in sys.argv:
+        work_items = min(65535 * 256, args.elements // args.integers[0] * 32)
+    else:
+        work_items = args.elements
     checked(driver.cuLaunchKernel(function, (work_items + 255) // 256, 1, 1, 256, 1, 1, 0, None, params, None))
     checked(driver.cuCtxSynchronize())
 
@@ -125,9 +145,34 @@ def convert(data, src, dst, count, width):
     return result[8:-8]
 
 
+if cache_replay or expert_replay or rms_replay or reduction_replay:
+    try:
+        path = ROOT / ("reduction-replay.py" if reduction_replay else "rms-replay.py" if rms_replay else "expert-replay.py" if expert_replay else "cache-replay.py")
+        exec(compile(path.read_text(), str(path), "exec"))
+    finally:
+        for ptr in allocations:
+            checked(driver.cuMemFree_v2(ptr))
+        for module in modules.values():
+            checked(driver.cuModuleUnload(module))
+        checked(driver.cuDevicePrimaryCtxRelease_v2(0))
+    sys.exit(0)
+
+if index_only:
+    path = ROOT / "index-tests.py"
+    exec(compile(path.read_text(), str(path), "exec"))
+    for ptr in allocations:
+        checked(driver.cuMemFree_v2(ptr))
+    for module in modules.values():
+        checked(driver.cuModuleUnload(module))
+    checked(driver.cuDevicePrimaryCtxRelease_v2(0))
+    sys.exit(0)
+
 if cache_only:
     path = ROOT / "cache-tests.py"
     exec(compile(path.read_text(), str(path), "exec"))
+    if "--cache-full" in sys.argv:
+        path = ROOT / "cache-full-tests.py"
+        exec(compile(path.read_text(), str(path), "exec"))
     for ptr in allocations:
         checked(driver.cuMemFree_v2(ptr))
     checked(driver.cuModuleUnload(modules["cache"]))
@@ -205,6 +250,9 @@ if scalar_only:
     print("CUDA scalar rounding and descriptor-typed arg reduction checks passed")
     sys.exit(0)
 
+path = ROOT / "index-tests.py"
+exec(compile(path.read_text(), str(path), "exec"))
+
 probes = []
 for bits in range(0x7bff):
     x = struct.unpack("<e", struct.pack("<H", bits))[0]
@@ -267,12 +315,13 @@ a.elements = 2
 a.inputs[0] = upload(struct.pack("<ff", 0, 0))
 a.inputs[1] = upload(struct.pack("<ff", 1, -2))
 a.inputs[2] = upload(struct.pack("<ff", 3, -4))
-a.inputs[3] = upload(b"\xa5" * 8)
-a.inputs[4] = upload(b"\xa5" * 8)
-a.inputs[5] = upload(b"\0" * 4)
-a.inputs[6] = upload(b"\0" * 4)
+keys, values = upload(b"\xa5" * 8), upload(b"\xa5" * 8)
+key_scale, value_scale = upload(b"\0" * 4), upload(b"\0" * 4)
+a.inputs[3] = upload(struct.pack("<8Q", 0, 0, 1, 4, keys, values, key_scale, value_scale))
+a.inputs[4] = upload(bytes(4))
 a.inputs[7] = upload(b"\0" * 4)
 a.scratch[0] = upload(struct.pack("<I", 1))
+a.scratch[3] = upload(bytes(4))
 a.output = upload(b"\0" * 8)
 a.output_dtype = a.compute_dtype = 1
 for role in range(3):
@@ -281,11 +330,13 @@ metadata = [4, 4, 4, 4, 0, 0, 0, 0, 0] + [1, 1, 1, 2] * 4
 a.metadata = upload(struct.pack("<" + "Q" * len(metadata), *metadata))
 a.integers[0] = a.integers[2] = a.integers[5] = 1
 a.integers[1] = 6
+a.integers[7] = a.integers[9] = 1
+a.integers[10] = 2
 a.scalars[0] = 1
 launch("cache", "et_kv_attention", a)
-assert read(a.inputs[3], 8) == bytes([192, 1]) + b"\xa5" * 6
-assert read(a.inputs[4], 8)[2:] == b"\xa5" * 6
-assert struct.unpack("<f", read(a.inputs[5], 4))[0] == struct.unpack("<f", struct.pack("<f", 2 / 127))[0]
+assert read(keys, 8) == bytes([192, 1]) + b"\xa5" * 6
+assert read(values, 8)[2:] == b"\xa5" * 6
+assert struct.unpack("<f", read(key_scale, 4))[0] == struct.unpack("<f", struct.pack("<f", 2 / 127))[0]
 result = struct.unpack("<ff", read(a.output, 8))
 assert abs(result[0] - 3) <= 4 / 127 and result[1] == -4
 

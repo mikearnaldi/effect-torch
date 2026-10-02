@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "files": {
+    "packages/bench/diffusion-gemma/reference.py": "092ac1a922bd595d054bb80da90ce9a78b64268e6a3d4e0ff97943b3abef5630",
+    "packages/bench/diffusion-gemma/reference.sh": "4b7bc2f6d36ec27cc381731f5f474a43e156f601a9a97673b31798cd4902e087",
+    "packages/bench/diffusion-gemma/vllm_controlled_replay.py": "dc1a7f443d1f8b7b5a2f32ac8edfc710f1e0a8791ffb5c7c94f8bd2042c4d085",
+    "scripts/export-attention75.py": "14579228211e74b73e0bd05e06289818a0b0a76ac995b19e06f4f8c21c1c72d4",
+    "scripts/build-cuda-expert-merged.sh": "25ec4361dae15eaae513975eace298645156d72272fed702d219f2dcc83d88a5",
+    "scripts/build-cuda-ordinary-k16.sh": "6b53b6cfad83a001e886ef282997e699351c84880933947a077d68129bbeda7a"
+  },
+  "model": {
+    "repo": "google/diffusiongemma-26B-A4B-it",
+    "revision": "f7f5b7f5fa82ffc52addd066915886d497f5517b"
+  },
+  "oracle": {
+    "transformersRevision": "93ebf6b11127967f2725cf4d012aae55c3654f5a",
+    "torch": "2.10.0+cu128"
+  },
+  "bankGeneration": "Exact frozen run-distinct-replay-target.sh prepare/capture stages are in the release entry archive; preserved accepted banks required for matching bytes. Regeneration creates new evidence.",
+  "nativeModules": "Restore pinned cached PTX/SO bytes from external archive; generation alone does not promise binary identity."
+}

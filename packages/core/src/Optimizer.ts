@@ -381,7 +381,9 @@ export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> 
           }
         }
         const first = yield* Tensor.constantLike(params[0], 1)
-        return { velocity, first } satisfies SgdState
+        const sgdState: SgdState = { velocity, first }
+
+        return sgdState
       }),
     step: (params, grads, state, lr) =>
       Effect.gen(function*() {
@@ -483,7 +485,9 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
           v.push(yield* Tensor.zerosLike(param))
         }
         const t = yield* stepCount(0, params)
-        return { m, v, t } satisfies AdamState
+        const adamState: AdamState = { m, v, t }
+
+        return adamState
       }),
     step: (params, grads, state, lr) =>
       Effect.gen(function*() {

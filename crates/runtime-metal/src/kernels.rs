@@ -882,6 +882,34 @@ pub fn copy_into(
     Ok(())
 }
 
+/// Precompile the device-ordered state and copy-on-write byte copy.
+pub fn warm_byte_copy(dev: &MetalDevice) -> Result<(), String> {
+    let wide = MetalDevice::WIDE;
+    dev.compile_lazy(
+        key(&[0xBC09]),
+        "et_bcopy",
+        || {
+            format!(
+                r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_bcopy(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]], constant ulong& n [[buffer(2)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    const ulong base = i * 4ul;
+    if (base < n) {{
+        const ulong end = min(base + 4ul, n);
+        for (ulong j = base; j < end; j++) {{
+            dst[j] = src[j];
+        }}
+    }}
+}}
+"#
+            )
+        },
+    )?;
+    Ok(())
+}
+
 /// Copies `bytes` from `source` at `source_offset` into `destination` at
 /// `destination_offset` with a flat device kernel on the current stream.
 /// Used for GPU-ordered state-transaction copies between deferred
@@ -905,29 +933,9 @@ pub fn copy_bytes_into(
     {
         return Err("metal byte copy exceeds its buffer".to_string());
     }
-    let wide = MetalDevice::WIDE;
-    let pipeline = dev.compile_lazy(
-        key(&[0xBC09]),
-        "et_bcopy",
-        || {
-            format!(
-                r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void et_bcopy(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]], constant ulong& n [[buffer(2)]], uint2 gid2 [[thread_position_in_grid]]) {{
-    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
-    const ulong base = i * 4ul;
-    if (base < n) {{
-        const ulong end = min(base + 4ul, n);
-        for (ulong j = base; j < end; j++) {{
-            dst[j] = src[j];
-        }}
-    }}
-}}
-"#
-            )
-        },
-    )?;
+    let pipeline = dev
+        .pipeline_cached(key(&[0xBC09]))
+        .ok_or("metal byte-copy pipeline is not warm")?;
     let words = bytes.div_ceil(4);
     let padded = words.div_ceil(256) * 256;
     let n = bytes as u64;
@@ -1569,6 +1577,108 @@ pub fn argreduce_into(
             let (g, tg) = MetalDevice::grid_flat(padded);
             e.dispatchThreads_threadsPerThreadgroup(g, tg);
         }
+    });
+    Ok(())
+}
+
+/// Precompiles stable F32 last-axis top-k and its device-side NaN status reset.
+pub fn warm_top_k_indices(layout: &crate::runtime::layout::Layout, k: usize) -> Result<(), String> {
+    let dev = MetalDevice::get();
+    warm_fill(&[1], 0.0, DType::U32)?;
+    let shape = layout.shape();
+    let width = *shape.last().ok_or("topKIndices: missing last axis")?;
+    if k == 0 || k > width || width > u32::MAX as usize {
+        return Err("topKIndices: invalid k or last-axis width".into());
+    }
+    let rows: usize = shape[..shape.len() - 1].iter().product();
+    if rows == 0 {
+        return Ok(());
+    }
+    let stride = layout.strides()[shape.len() - 1];
+    let mut decompose = String::new();
+    for dim in (0..shape.len() - 1).rev() {
+        let size = shape[dim];
+        let step = layout.strides()[dim];
+        decompose.push_str(&format!(
+            "base += (remainder % {size}ul) * {step}ul; remainder /= {size}ul;\n"
+        ));
+    }
+    dev.compile_lazy(key(&[0x70_4B, k as u64, layout_key(layout)]), "et_top_k_indices", || format!(r#"
+#include <metal_stdlib>
+using namespace metal;
+inline uint top_k_order(float value) {{
+    uint bits = as_type<uint>(value);
+    if ((bits & 0x7fffffffu) == 0u) bits = 0u;
+    return (bits & 0x80000000u) ? ~bits : bits ^ 0x80000000u;
+}}
+kernel void et_top_k_indices(
+    device const float* x [[buffer(0)]],
+    device uint* output [[buffer(1)]],
+    device atomic_uint* status [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (ulong(gid) >= {rows}ul) return;
+    ulong base = 0ul, remainder = gid;
+    {decompose}
+    device uint* out = output + ulong(gid) * {k}ul;
+    for (uint i = 0; i < {width}u; ++i) {{
+        float value = x[base + ulong(i) * {stride}ul];
+        // Classify NaN by its bits, independently of floating comparisons.
+        if ((as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u) {{
+            for (uint slot = 0; slot < {k}u; ++slot) out[slot] = 0u;
+            atomic_store_explicit(status, 1u, memory_order_relaxed);
+            return;
+        }}
+        uint order = top_k_order(value);
+        uint used = min(i, {k}u), position = 0u;
+        while (position < used && order <= top_k_order(x[base + ulong(out[position]) * {stride}ul])) ++position;
+        if (position < {k}u) {{
+            for (uint j = min(used, {k}u - 1u); j > position; --j) out[j] = out[j - 1u];
+            out[position] = i;
+        }}
+    }}
+}}
+"#))?;
+    Ok(())
+}
+
+/// Writes U32 indices into the planned output, using it as insertion workspace.
+/// Only the one-word NaN status is read by the executable after the GPU fence.
+pub fn top_k_indices_into(
+    dev: &MetalDevice,
+    x: &MetalTensor,
+    k: usize,
+    out: &MetalTensor,
+    status: &MetalTensor,
+) -> Result<(), String> {
+    if x.dtype != DType::F32 {
+        return Err("topKIndices: expected f32".into());
+    }
+    let mut shape = x.layout.shape().to_vec();
+    let width = shape.last_mut().ok_or("topKIndices: missing last axis")?;
+    if k == 0 || k > *width {
+        return Err("topKIndices: invalid k".into());
+    }
+    *width = k;
+    out.validate_destination("topKIndices", &shape, DType::U32)?;
+    status.validate_destination("topKIndices status", &[1], DType::U32)?;
+    fill_into(dev, status, 0.0)?;
+    let rows = out.numel() / k;
+    if rows == 0 {
+        return Ok(());
+    }
+    let pipeline = precompiled_pipeline(
+        dev,
+        key(&[0x70_4B, k as u64, layout_key(&x.layout)]),
+        "et_top_k_indices",
+    )?;
+    dev.with_encoder(|encoder| {
+        encoder.setComputePipelineState(pipeline.as_raw());
+        set_buffer(encoder, 0, &x.buffer, x.layout.offset() * 4);
+        set_buffer(encoder, 1, &out.buffer, out.layout.offset() * 4);
+        set_buffer(encoder, 2, &status.buffer, status.layout.offset() * 4);
+        let (grid, group) = MetalDevice::grid_flat(rows.div_ceil(256) * 256);
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, group);
     });
     Ok(())
 }

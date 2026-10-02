@@ -327,7 +327,7 @@ parity vs composed-autodiff of the Phase-2 graph (finite-difference
 spot checks on gate parameters) <1e-3; training-step time and peak
 memory measured on a 30M hybrid preset.
 
-**Phase 5 — Model/program integration.** `Model.inference` compiles
+**Phase 5 — Model/program integration.** `AutoRegressive.compile` compiles
 hybrid prefill+decode programs with both pools bound; `Generation.step`
 works unchanged (pool selection is program-internal); `noRoPE` hybrid
 presets documented; CPU parity throughout per the standing rule.

@@ -10,6 +10,95 @@ const values = (t: Tensor.Any) =>
 // The matrix uses the real CPU backend and available Metal backend; unsupported
 // Metal operations must fail explicitly rather than fall back to CPU.
 onDevices("Tensor", (device) => (it) => {
+  describe("explicit rotary positions", () => {
+    for (const layout of ["HalfSplit", "InterleavedPairs"] as const) {
+      it.effect(layout + " supports explicit offsets and zero-frequency pairs", () =>
+        Effect.gen(function*() {
+          const input = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6, 7, 8]), [1, 2, 4])
+          const positions = yield* Tensor.fromTypedArray(new Uint32Array([0, 2]))
+          const inverseFrequencies = yield* Tensor.fromTypedArray(floats([1, 0]))
+          const output = yield* Tensor.rotaryEmbedding(input, 2, 10_000, { positions, inverseFrequencies, layout })
+          const cosine = Math.cos(2)
+          const sine = Math.sin(2)
+
+          const expected = layout === "HalfSplit"
+            ? [1, 2, 3, 4, 5 * cosine - 7 * sine, 6, 5 * sine + 7 * cosine, 8]
+            : [1, 2, 3, 4, 5 * cosine - 6 * sine, 5 * sine + 6 * cosine, 7, 8]
+
+          const actual = yield* values(output)
+          actual.forEach((value, index) => expect(value).toBeCloseTo(expected[index], 5))
+
+          const matrix = yield* Tensor.reshape(input, [2, 4])
+
+          const matrixOutput = yield* Tensor.rotaryEmbedding(matrix, 2, 10_000, {
+            positions,
+            inverseFrequencies,
+            layout
+          })
+
+          expect(yield* values(matrixOutput)).toEqual(actual)
+        }))
+    }
+
+    it.effect("rejects incompatible position and frequency metadata", () =>
+      Effect.gen(function*() {
+        const input = yield* Tensor.ones([2, 3, 4, 8])
+        const positions = yield* Tensor.zeros([1, 4], { dtype: "u32" })
+        const frequencies = yield* Tensor.ones([4])
+
+        const failures = [
+          Tensor.rotaryEmbedding(input, 4, 100, { positions: yield* Tensor.zeros([1, 4]) }),
+          Tensor.rotaryEmbedding(input, 4, 100, { positions: yield* Tensor.zeros([3, 4], { dtype: "u32" }) }),
+          Tensor.rotaryEmbedding(input, 4, 100, { positions, inverseFrequencies: yield* Tensor.ones([3]) }),
+          Tensor.rotaryEmbedding(input, 3, 100, { inverseFrequencies: frequencies })
+        ]
+
+        for (const failure of failures) {
+          expect((yield* Effect.flip(failure))._tag).toBe("TensorError")
+        }
+      }))
+  })
+
+  it.effect("gated experts support different output widths, duplicate routes and a ReLU gate", () =>
+    Effect.gen(function*() {
+      const input = yield* Tensor.fromTypedArray(floats([2, -1]), [1, 2])
+      const gateUp = yield* Tensor.fromTypedArray(floats([1, 0, 0, 1, 0, 1, 1, 0]), [2, 2, 2])
+      const down = yield* Tensor.fromTypedArray(floats([1, 2, -1, 3, -2, 5]), [2, 3, 1])
+      const indices = yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0]), [1, 3])
+      const weights = yield* Tensor.fromTypedArray(floats([0.5, 0.25, 0.75]), [1, 3])
+      const output = yield* Tensor.gatedExperts(input, gateUp, down, indices, weights, Tensor.relu)
+
+      expect(output.shape).toEqual([1, 3])
+      expect(yield* values(output)).toEqual([-2, -4, 2])
+    }))
+
+  it.effect("read-only prefixes account for heterogeneous layers and release their handles", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const [localKeys, localValues, globalKeys, globalValues] = yield* Tensor.compute([
+        yield* Tensor.ones([1, 2, 3, 4]),
+        yield* Tensor.ones([1, 2, 3, 5], { dtype: "f16" }),
+        yield* Tensor.ones([1, 1, 7, 2], { dtype: "bf16" }),
+        yield* Tensor.ones([1, 1, 7, 3], { dtype: "bf16" })
+      ]).pipe(Effect.flatMap(Tensor.clearAllScoped))
+
+      const prefix = Tensor.makeKvPrefix(1024, [
+        { keys: localKeys, values: localValues },
+        { keys: globalKeys, values: globalValues }
+      ])
+
+      expect(prefix.tokenCount).toBe(1024)
+      expect(prefix.bytes).toBe(96 + 60 + 28 + 42)
+
+      const [result] = yield* Tensor.compute([localKeys]).pipe(Effect.flatMap(Tensor.clearAllScoped))
+      yield* Tensor.clearKvPrefix(prefix)
+
+      for (const tensor of [localKeys, localValues, globalKeys, globalValues]) {
+        expect((yield* Effect.flip(Tensor.toNumberArray(tensor)))._tag).toBe("TensorError")
+      }
+
+      expect(yield* values(result)).toEqual(Array(24).fill(1))
+    })))
+
   describe("constructors", () => {
     it.effect("zeros/ones/full produce the right values and dtype", () =>
       Effect.gen(function*() {
@@ -92,8 +181,10 @@ onDevices("Tensor", (device) => (it) => {
         const bad = Effect.gen(function*() {
           const a = yield* Tensor.ones([2])
           const b = yield* Tensor.ones([2], { dtype: "i64" })
+
           return yield* Tensor.add(a, b)
         })
+
         assert.assertTrue(Exit.isFailure(yield* Effect.exit(bad)))
         const a = yield* Tensor.ones([2])
         const b = yield* Tensor.ones([2], { dtype: "i64" })
@@ -129,6 +220,7 @@ onDevices("Tensor", (device) => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([-1, 0, 1, 10]))
         const tanhValues = yield* values(yield* Tensor.tanh(x))
         const sigmoidValues = yield* values(yield* Tensor.sigmoid(x))
+
         for (let i = 0; i < 4; i++) {
           const v = [-1, 0, 1, 10][i]
           expect(Math.abs(tanhValues[i] - Math.tanh(v))).toBeLessThan(TOL)
@@ -183,6 +275,7 @@ onDevices("Tensor", (device) => (it) => {
       Effect.gen(function*() {
         const pred = yield* Tensor.fromTypedArray(floats([1, 2, 4]), [3])
         const target = yield* Tensor.fromTypedArray(floats([1, 1, 1]), [3])
+
         for (
           const loss of [yield* Loss.mse(pred, target), yield* Loss.mse(pred, yield* Tensor.constantLike(pred, 1))]
         ) {
@@ -274,10 +367,12 @@ onDevices("Tensor", (device) => (it) => {
         const empty = yield* Effect.exit(Effect.flatMap(matrix, (m) => Tensor.expose(m, "")))
         assert.assertTrue(Exit.isFailure(empty))
         const a = yield* matrix
+
         const root = yield* Tensor.add(
           yield* Tensor.expose(a, "dup"),
           yield* Tensor.expose(a, "dup")
         )
+
         const runtime = yield* Runtime.Runtime
         const duplicate = yield* Effect.exit(runtime.exposures(root))
         assert.assertTrue(Exit.isFailure(duplicate))
@@ -301,6 +396,7 @@ onDevices("Tensor", (device) => (it) => {
           floats([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
           [2, 2, 3]
         )
+
         const b = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [3, 2])
         const out = yield* Tensor.matmul(a, b)
         deep(out.shape, [2, 2, 2])
@@ -349,9 +445,11 @@ onDevices("Tensor", (device) => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([-1.5, 0.2, 0, 0.5, 2.7]))
         const erfValues = yield* values(yield* Tensor.erf(x))
         const ref = [-0.9661051, 0.2227026, 0, 0.5204999, 0.9998657]
+
         for (let i = 0; i < 5; i++) {
           expect(Math.abs(erfValues[i] - ref[i])).toBeLessThan(TOL)
         }
+
         deep(yield* values(yield* Tensor.floor(x)), [-2, 0, 0, 0, 2])
         deep(yield* values(yield* Tensor.ceil(x)), [-1, 1, 0, 1, 3])
         deep(yield* values(yield* Tensor.round(x)), [-2, 0, 0, 1, 3])
@@ -363,14 +461,17 @@ onDevices("Tensor", (device) => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([0.5, 1, 4]))
         deep(yield* values(yield* Tensor.square(x)), [0.25, 1, 16])
         const rsqrt = yield* values(yield* Tensor.rsqrt(x))
+
         for (let i = 0; i < 3; i++) {
           expect(Math.abs(rsqrt[i] - 1 / Math.sqrt([0.5, 1, 4][i]))).toBeLessThan(TOL)
         }
+
         deep(yield* values(yield* Tensor.reciprocal(x)), [2, 1, 0.25])
         const expm1 = yield* values(yield* Tensor.expm1(x))
         const log1p = yield* values(yield* Tensor.log1p(x))
         const log2 = yield* values(yield* Tensor.log2(x))
         const log10 = yield* values(yield* Tensor.log10(x))
+
         for (let i = 0; i < 3; i++) {
           const v = [0.5, 1, 4][i]
           expect(Math.abs(expm1[i] - (Math.exp(v) - 1))).toBeLessThan(TOL)
@@ -386,6 +487,7 @@ onDevices("Tensor", (device) => (it) => {
         const sinh = yield* values(yield* Tensor.sinh(x))
         const cosh = yield* values(yield* Tensor.cosh(x))
         const tan = yield* values(yield* Tensor.tan(x))
+
         for (let i = 0; i < 3; i++) {
           const v = [0.5, -1, 2][i]
           expect(Math.abs(sinh[i] - Math.sinh(v))).toBeLessThan(TOL)
@@ -405,6 +507,7 @@ onDevices("Tensor", (device) => (it) => {
         deep(yield* values(yield* Tensor.logicalNot(c1)), [0, 0, 1, 1])
         const b = yield* Tensor.fromTypedArray(floats([5.5, -5.5, 7]))
         const r = yield* values(yield* Tensor.remainder(b, yield* Tensor.constantLike(b, 3)))
+
         for (let i = 0; i < 3; i++) {
           const v = [5.5, -5.5, 7][i]
           expect(Math.abs(r[i] - ((v % 3) + 3) % 3)).toBeLessThan(TOL)
@@ -479,6 +582,7 @@ onDevices("Tensor", (device) => (it) => {
       Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
         const lse = yield* values(yield* Tensor.logsumexp(x, { dims: [1] }))
+
         for (let i = 0; i < 2; i++) {
           const row = [1, 2, 3, 4, 5, 6].slice(i * 3, i * 3 + 3)
           const m = Math.max(...row)
@@ -505,11 +609,13 @@ onDevices("Tensor", (device) => (it) => {
         const eps = 1e-5
         const input = yield* Tensor.fromTypedArray(floats(inputValues), [2, 2, 4])
         const weight = yield* Tensor.fromTypedArray(floats(weightValues), [4])
+
         const expected = (weighted: boolean) =>
           inputValues.map((value, index) => {
             const rowStart = Math.floor(index / 4) * 4
             const row = inputValues.slice(rowStart, rowStart + 4)
             const scale = 1 / Math.sqrt(row.reduce((sum, x) => sum + x * x, 0) / row.length + eps)
+
             return value * scale * (weighted ? weightValues[index % 4] : 1)
           })
 
@@ -522,6 +628,7 @@ onDevices("Tensor", (device) => (it) => {
         const wideValues = yield* values(yield* Tensor.rmsNorm(wide, undefined, eps))
         const wideExpected = 1 / Math.sqrt(1 + eps)
         expect(wideValues).toHaveLength(2048)
+
         for (const value of wideValues) {
           expect(Math.abs(value - wideExpected)).toBeLessThan(TOL)
         }
@@ -545,11 +652,14 @@ onDevices("Tensor", (device) => (it) => {
         const sm = yield* Tensor.softmax(x)
         deep(sm.shape, [2, 3])
         const rows = yield* values(yield* Tensor.sum(sm, { dims: [1] }))
+
         for (const r of rows) {
           expect(Math.abs(r - 1)).toBeLessThan(TOL)
         }
+
         const lsm = yield* values(yield* Tensor.logSoftmax(x))
         const smValues = yield* values(sm)
+
         for (let i = 0; i < 6; i++) {
           expect(Math.abs(lsm[i] - Math.log(smValues[i]))).toBeLessThan(TOL)
         }
@@ -567,6 +677,7 @@ onDevices("Tensor", (device) => (it) => {
         const gelu = yield* values(yield* Tensor.gelu(x))
         const geluT = yield* values(yield* Tensor.gelu(x, { approximate: "tanh" }))
         const mish = yield* values(yield* Tensor.mish(x))
+
         for (let i = 0; i < 3; i++) {
           const v = vs[i]
           const sp = Math.max(v, 0) + Math.log1p(Math.exp(-Math.abs(v)))
@@ -580,6 +691,7 @@ onDevices("Tensor", (device) => (it) => {
           expect(Math.abs(geluT[i] - v * 0.5 * (1 + Math.tanh(inner)))).toBeLessThan(TOL)
           expect(Math.abs(mish[i] - v * Math.tanh(sp))).toBeLessThan(TOL)
         }
+
         deep(yield* values(yield* Tensor.hardtanh(x)), [0.5, -1, 1])
         deep(yield* values(yield* Tensor.clamp(x, { min: 0, max: 1 })), [0.5, 0, 1])
       }))
@@ -686,12 +798,14 @@ onDevices("Tensor", (device) => (it) => {
         deep(g.shape, [2, 2])
         deep(yield* values(g), [2, 1, 3, 4])
         const base = yield* Tensor.zeros([3, 2], { dtype: floatDtype })
+
         const s = yield* Tensor.scatterAdd(
           base,
           yield* Tensor.fromTypedArray(new BigInt64Array([1n, 0n, 0n, 1n, 1n, 0n]), [3, 2]),
           yield* Tensor.fromTypedArray(floats([10, 20, 30, 40, 50, 60]), [3, 2]),
           { dim: 1 }
         )
+
         deep(yield* values(s), [20, 10, 30, 40, 60, 50])
       }))
 
@@ -702,22 +816,62 @@ onDevices("Tensor", (device) => (it) => {
         const t = yield* Tensor.take(x, idx)
         deep(t.shape, [2, 2])
         deep(yield* values(t), [5, 6, 1, 2])
+
         const g = yield* Tensor.gather(
           x,
           yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0, 1]), [2, 2]),
           { dim: 1 }
         )
+
         deep(yield* values(g), [2, 1, 3, 4])
+
         const s = yield* Tensor.scatterAdd(
           yield* Tensor.zeros([3, 2], { dtype: floatDtype }),
           yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0, 1, 1, 0]), [3, 2]),
           yield* Tensor.fromTypedArray(floats([10, 20, 30, 40, 50, 60]), [3, 2]),
           { dim: 1 }
         )
+
         deep(yield* values(s), [20, 10, 30, 40, 60, 50])
         const loss = yield* Tensor.sum(yield* Tensor.take(x, idx))
         const [gradX] = yield* Gradient.grad(loss, [x])
         deep(yield* values(gradX), [1, 1, 0, 0, 1, 1])
+      }))
+
+    it.effect("scatterAdd accumulates duplicate routes with transposed and broadcast inputs", () =>
+      Effect.gen(function*() {
+        const [base, source] = yield* Tensor.compute([
+          yield* Tensor.fromTypedArray(new Float32Array(12).fill(10), [2, 2, 3]),
+          yield* Tensor.fromTypedArray(floats([1, 2, 4, 8]), [1, 4, 1])
+        ])
+
+        for (
+          const indexes of [
+            new Uint32Array([0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0]),
+            new BigInt64Array([0n, 0n, 1n, 1n, 0n, 1n, 0n, 1n, 1n, 1n, 0n, 0n])
+          ]
+        ) {
+          const [routes] = yield* Tensor.compute([yield* Tensor.fromTypedArray(indexes, [3, 4])])
+
+          const root = yield* Tensor.scatterAdd(
+            yield* Tensor.makeInput(0, base),
+            yield* Tensor.broadcastTo(yield* Tensor.transpose(yield* Tensor.makeInput(1, routes), [1, 0]), [2, 4, 3]),
+            yield* Tensor.broadcastTo(yield* Tensor.makeInput(2, source), [2, 4, 3]),
+            { dim: 1 }
+          )
+
+          for (const optimize of [false, true]) {
+            const program = yield* Tensor.freezeProgram([root], { optimize })
+            const [output] = yield* Tensor.runProgram(program, [base, routes, source])
+            deep(yield* Tensor.toNumberArray(output), [13, 15, 22, 22, 20, 13, 13, 15, 22, 22, 20, 13])
+            deep(yield* Tensor.toNumberArray(base), Array(12).fill(10))
+            yield* Tensor.clear(output)
+          }
+
+          yield* Tensor.clear(routes)
+        }
+
+        yield* Tensor.clearAll([base, source])
       }))
 
     it.effect("embedding", () =>
@@ -726,10 +880,12 @@ onDevices("Tensor", (device) => (it) => {
           floats([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
           [4, 3]
         )
+
         const out = yield* Tensor.embedding(
           yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 1n, 3n]), [2, 2]),
           { weight }
         )
+
         deep(out.shape, [2, 2, 3])
         deep(yield* values(out), [7, 8, 9, 1, 2, 3, 4, 5, 6, 10, 11, 12])
       }))
@@ -740,6 +896,7 @@ onDevices("Tensor", (device) => (it) => {
           floats([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
           [4, 3]
         )
+
         const indexes = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
         const out = yield* Tensor.embedding(indexes, { paddingIndex: 0, weight })
         deep(yield* values(out), [7, 8, 9, 1, 2, 3, 7, 8, 9])
@@ -751,16 +908,20 @@ onDevices("Tensor", (device) => (it) => {
       Effect.gen(function*() {
         const weight = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
         const indexes = yield* Tensor.fromTypedArray(new BigInt64Array([0n]))
+
         const badRank = yield* Effect.flip(Tensor.embedding(indexes, {
           weight: yield* Tensor.reshape(weight, [1, 2, 2])
         }))
+
         deep(badRank.op, "embedding")
         const badPadding = yield* Effect.flip(Tensor.embedding(indexes, { paddingIndex: 2, weight }))
         deep(badPadding.op, "embedding")
+
         const badDtype = yield* Effect.flip(Tensor.embedding(
           yield* Tensor.cast(indexes, "f32"),
           { weight }
         ))
+
         deep(badDtype.op, "embedding")
       }))
 
@@ -771,24 +932,31 @@ onDevices("Tensor", (device) => (it) => {
         const logits = yield* Tensor.fromTypedArray(floats(rows.flat()), [2, 3])
         const target = yield* Tensor.fromTypedArray(new BigInt64Array(targets.map(BigInt)), [2])
         const loss = yield* Tensor.crossEntropy(logits, { target })
+
         const lse = (r: Array<number>) => {
           const m = Math.max(...r)
+
           return m + Math.log(r.reduce((acc, v) => acc + Math.exp(v - m), 0))
         }
+
         const expected = (lse(rows[0]) - rows[0][2] + lse(rows[1]) - rows[1][1]) / 2
         const [lossValue] = yield* values(loss)
         expect(Math.abs(lossValue - expected)).toBeLessThan(TOL)
         const [grad] = yield* Gradient.grad(loss, [logits])
+
         const softmax = (r: Array<number>) => {
           const m = Math.max(...r)
           const e = r.map((v) => Math.exp(v - m))
           const s = e.reduce((a, b) => a + b, 0)
+
           return e.map((v) => v / s)
         }
+
         const expectedGrad = [
           ...softmax(rows[0]).map((p, c) => (p - (c === 2 ? 1 : 0)) / 2),
           ...softmax(rows[1]).map((p, c) => (p - (c === 1 ? 1 : 0)) / 2)
         ]
+
         const gradValues = yield* values(grad)
         gradValues.forEach((g, i) => expect(Math.abs(g - expectedGrad[i])).toBeLessThan(TOL))
       }))
@@ -813,10 +981,13 @@ onDevices("Tensor", (device) => (it) => {
         const logits = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6, 7, 8]), [2, 2, 2])
         const target = yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0, 1]), [2, 2])
         const loss = yield* Tensor.crossEntropy(logits, { target })
+
         const lse = (a: number, b: number) => {
           const m = Math.max(a, b)
+
           return m + Math.log(Math.exp(a - m) + Math.exp(b - m))
         }
+
         const expected = (lse(1, 2) - 2 + lse(3, 4) - 3 + lse(5, 6) - 5 + lse(7, 8) - 8) / 4
         const [lossValue] = yield* values(loss)
         expect(Math.abs(lossValue - expected)).toBeLessThan(TOL)
@@ -833,6 +1004,7 @@ onDevices("Tensor", (device) => (it) => {
         // The stable log-sum-exp still ends with f32 subtraction near 1e4, so
         // cancellation requires a wider absolute tolerance than ordinary ops.
         expect(Math.abs(lossValue - expected)).toBeLessThan(5e-3)
+
         const [grad] = yield* Gradient.grad(loss, [logits])
         ;(yield* values(grad)).forEach((g) => expect(Number.isFinite(g)).toBe(true))
       }))
@@ -840,14 +1012,18 @@ onDevices("Tensor", (device) => (it) => {
     it.effect("crossEntropy fails at evaluation on an empty active set or out-of-range target", () =>
       Effect.gen(function*() {
         const logits = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
+
         const allIgnored = yield* Tensor.crossEntropy(logits, {
           target: yield* Tensor.fromTypedArray(new BigInt64Array([-100n, -100n]), [2])
         })
+
         const emptyError = yield* Effect.flip(Tensor.toTypedArray(allIgnored))
         expect(emptyError.message).toContain("no active targets")
+
         const outOfRange = yield* Tensor.crossEntropy(logits, {
           target: yield* Tensor.fromTypedArray(new BigInt64Array([5n, 0n]), [2])
         })
+
         const rangeError = yield* Effect.flip(Tensor.toTypedArray(outOfRange))
         expect(rangeError.message).toContain("out of range")
       }))
@@ -855,13 +1031,17 @@ onDevices("Tensor", (device) => (it) => {
     it.effect("crossEntropy validates its arguments at construction", () =>
       Effect.gen(function*() {
         const logits = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
+
         const badShape = yield* Effect.flip(Tensor.crossEntropy(logits, {
           target: yield* Tensor.fromTypedArray(new BigInt64Array([0n, 1n, 2n]), [3])
         }))
+
         deep(badShape.op, "crossEntropy")
+
         const badDtype = yield* Effect.flip(Tensor.crossEntropy(logits, {
           target: yield* Tensor.fromTypedArray(floats([0, 1]), [2])
         }))
+
         deep(badDtype.op, "crossEntropy")
       }))
 
@@ -897,15 +1077,18 @@ onDevices("Tensor", (device) => (it) => {
         const m = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
         deep(yield* values(yield* Tensor.trace(m)), [5])
       }))
+
     if (device !== "metal") {
       it.effect("inverse/det/solve", () =>
         Effect.gen(function*() {
           const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3]), [2, 2])
           const inv = yield* Tensor.inverse(a)
           const identity = yield* values(yield* Tensor.matmul(a, inv))
+
           for (let i = 0; i < 4; i++) {
             expect(Math.abs(identity[i] - [1, 0, 0, 1][i])).toBeLessThan(TOL)
           }
+
           const [d] = yield* values(yield* Tensor.det(a))
           expect(Math.abs(d - 11)).toBeLessThan(TOL)
           const b = yield* Tensor.fromTypedArray(floats([9, 8]), [2, 1])
@@ -925,9 +1108,11 @@ onDevices("Tensor", (device) => (it) => {
           deep(inv.shape, [2, 2, 2])
           const identity = yield* values(yield* Tensor.matmul(a, inv))
           const expectedIdentity = [1, 0, 0, 1, 1, 0, 0, 1]
+
           for (let i = 0; i < 8; i++) {
             expect(Math.abs(identity[i] - expectedIdentity[i])).toBeLessThan(TOL)
           }
+
           const dets = yield* values(yield* Tensor.det(a))
           deep(dets.length, 2)
           expect(Math.abs(dets[0] - 11)).toBeLessThan(TOL)
@@ -946,6 +1131,7 @@ onDevices("Tensor", (device) => (it) => {
         Effect.gen(function*() {
           const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3]), [2, 2])
           const b = yield* Tensor.fromTypedArray(floats([9, 8]), [2, 1])
+
           for (const operation of [Tensor.inverse(a), Tensor.det(a), Tensor.solve(a, b)]) {
             const error = yield* Effect.flip(Effect.flatMap(operation, values))
             expect(error.message).toContain("not supported on Metal")
@@ -972,17 +1158,22 @@ onDevices("Tensor", (device) => (it) => {
       const oh = Math.floor((h + 2 * padding - dilation * (kh - 1) - 1) / stride) + 1
       const ow = Math.floor((wid + 2 * padding - dilation * (kw - 1) - 1) / stride) + 1
       const out = new Array<number>(n * cOut * oh * ow).fill(0)
+
       const xAt = (b: number, c: number, y: number, z: number) =>
         y < 0 || y >= h || z < 0 || z >= wid ? 0 : x[((b * cIn + c) * h + y) * wid + z]
+
       for (let b = 0; b < n; b++) {
         for (let g = 0; g < groups; g++) {
           for (let co = 0; co < cOut / groups; co++) {
             const oc = g * (cOut / groups) + co
+
             for (let oy = 0; oy < oh; oy++) {
               for (let oz = 0; oz < ow; oz++) {
                 let acc = 0
+
                 for (let ci = 0; ci < cPer; ci++) {
                   const ic = g * cPer + ci
+
                   for (let ky = 0; ky < kh; ky++) {
                     for (let kz = 0; kz < kw; kz++) {
                       acc += xAt(b, ic, oy * stride + ky * dilation - padding, oz * stride + kz * dilation - padding) *
@@ -990,12 +1181,14 @@ onDevices("Tensor", (device) => (it) => {
                     }
                   }
                 }
+
                 out[((b * cOut + oc) * oh + oy) * ow + oz] = acc
               }
             }
           }
         }
       }
+
       return { out, shape: [n, cOut, oh, ow] }
     }
 
@@ -1010,12 +1203,14 @@ onDevices("Tensor", (device) => (it) => {
       Effect.gen(function*() {
         const xData = Array.from({ length: 2 * 4 * 5 * 5 }, (_, i) => ((i * 7) % 13) - 6)
         const wData = Array.from({ length: 6 * 4 * 3 * 3 }, (_, i) => ((i * 5) % 7) - 3)
+
         for (const cfg of configs) {
           const cPer = 4 / cfg.groups
           const wFlat = wData.slice(0, 6 * cPer * 3 * 3)
           const x = yield* Tensor.fromTypedArray(floats(xData), [2, 4, 5, 5])
           const w = yield* Tensor.fromTypedArray(floats(wFlat), [6, cPer, 3, 3])
           const out = yield* Tensor.conv2d(x, w, cfg)
+
           const ref = refConv2d(
             xData,
             [2, 4, 5, 5],
@@ -1026,8 +1221,10 @@ onDevices("Tensor", (device) => (it) => {
             cfg.dilation,
             cfg.groups
           )
+
           deep([...out.shape], ref.shape)
           const actual = yield* values(out)
+
           for (let i = 0; i < ref.out.length; i++) {
             expect(Math.abs(actual[i] - ref.out[i])).toBeLessThan(TOL)
           }
@@ -1074,6 +1271,7 @@ onDevices("Tensor", (device) => (it) => {
           const oh = (h - 1) * stride - 2 * padding + kh + outputPadding
           const ow = (wid - 1) * stride - 2 * padding + kw + outputPadding
           const out = new Array<number>(n * cOut * oh * ow).fill(0)
+
           for (let b = 0; b < n; b++) {
             for (let ci = 0; ci < cIn; ci++) {
               for (let iy = 0; iy < h; iy++) {
@@ -1083,6 +1281,7 @@ onDevices("Tensor", (device) => (it) => {
                       for (let kz = 0; kz < kw; kz++) {
                         const oy = iy * stride - padding + ky
                         const oz = iz * stride - padding + kz
+
                         if (oy >= 0 && oy < oh && oz >= 0 && oz < ow) {
                           out[((b * cOut + co) * oh + oy) * ow + oz] += x[((b * cIn + ci) * h + iy) * wid + iz] *
                             w[((ci * cOut + co) * kh + ky) * kw + kz]
@@ -1094,15 +1293,19 @@ onDevices("Tensor", (device) => (it) => {
               }
             }
           }
+
           return { out, shape: [n, cOut, oh, ow] }
         }
+
         const xData = Array.from({ length: 1 * 2 * 3 * 4 }, (_, i) => ((i * 7) % 11) - 5)
         const wData = Array.from({ length: 2 * 3 * 2 * 3 }, (_, i) => ((i * 5) % 7) - 3)
+
         const configs = [
           { stride: 1, padding: 0, outputPadding: 0 },
           { stride: 2, padding: 0, outputPadding: 1 },
           { stride: 2, padding: 1, outputPadding: 0 }
         ] as const
+
         for (const cfg of configs) {
           const x = yield* Tensor.fromTypedArray(floats(xData), [1, 2, 3, 4])
           const w = yield* Tensor.fromTypedArray(floats(wData), [2, 3, 2, 3])
@@ -1110,6 +1313,7 @@ onDevices("Tensor", (device) => (it) => {
           const expected = ref(xData, [1, 2, 3, 4], wData, [2, 3, 2, 3], cfg.stride, cfg.padding, cfg.outputPadding)
           deep([...out.shape], expected.shape)
           const actual = yield* values(out)
+
           for (let i = 0; i < expected.out.length; i++) {
             expect(Math.abs(actual[i] - expected.out[i])).toBeLessThan(TOL)
           }

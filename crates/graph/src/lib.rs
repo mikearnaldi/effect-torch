@@ -53,6 +53,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod semantic;
+pub use semantic::decompose_semantic;
+
 // Node::new issues monotonic IDs that are unique within the process. External
 // code that constructs Node directly must preserve this identity.
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
@@ -522,6 +525,16 @@ impl AttentionWindow {
     }
 }
 
+/// Rounding boundaries of scaled dot-product attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AttentionRounding {
+    /// A fused attention implementation rounds the final result.
+    Fused,
+    /// QK, scaling, mask addition, probabilities, and PV round to the input dtype.
+    /// Scaling and softmax use F32 arithmetic.
+    Stepwise,
+}
+
 /// Pairing layout for the last dimension of a rotary embedding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RotaryLayout {
@@ -800,6 +813,12 @@ pub enum NodeKind {
         a: Arc<Node>,
         dim: usize,
     },
+    /// Stable descending last-axis top-k indices, with U32 output and F32 input.
+    /// Ties use ascending indices. Infinities are valid; NaN fails execution.
+    TopKIndices {
+        a: Arc<Node>,
+        k: usize,
+    },
     /// Indices of the minima along `dim` with i64 output.
     Argmin {
         a: Arc<Node>,
@@ -863,6 +882,19 @@ pub enum NodeKind {
         causal: bool,
         window: AttentionWindow,
     },
+    /// Attention with explicit numerical and persistent-state semantics.
+    /// Retention controls stored prefix rows independently of the query mask.
+    SdpaConfigured {
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        scale: f64,
+        causal: bool,
+        window: AttentionWindow,
+        rounding: AttentionRounding,
+        layer_id: Option<u32>,
+        retention: AttentionWindow,
+    },
     // The closed-form backward pass recomputes P = softmax(scores) from q and
     // k, then produces dq, dk, and dv in one evaluation. Consumers read them
     // through SdpaBackwardOut. On Metal, the forward flash kernel stores the
@@ -914,6 +946,7 @@ pub enum NodeKind {
         layer: u32,
         window: Option<usize>,
         mode: KvAttentionMode,
+        rounding: AttentionRounding,
     },
     // RFC 0018 Kimi Delta Attention implements gated delta-rule linear
     // attention as one operation. q, k, and log_decay are [.., H, T, Dk].
@@ -1066,6 +1099,15 @@ pub enum NodeKind {
         offset: PositionOffset,
         layout: RotaryLayout,
     },
+    /// Explicit absolute positions and inverse frequencies. Angles and trig use
+    /// F32; cosine, sine, products, and the final sum round to the input dtype.
+    /// Decode specialization must never rebase these positions.
+    RotaryEmbeddingExplicit {
+        x: Arc<Node>,
+        positions: Arc<Node>,
+        inverse_frequencies: Arc<Node>,
+        layout: RotaryLayout,
+    },
     // Backward pass for RotaryEmbedding with absolute positions only. It
     // applies the transpose rotation through the same fused kernel with
     // negated angles. The input shape and seq_len provide metadata.
@@ -1114,6 +1156,24 @@ pub enum NodeKind {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Arc<Node>,
+    },
+    /// Row-selected dense expert projection: x [N,I], weight [E,O,I], indexes [N].
+    /// F32/BF16 storage, F32 dot accumulation, one rounding to x's dtype.
+    /// Invalid U32 expert indexes fail execution, even with zero output width.
+    ExpertLinearRows {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        indexes: Arc<Node>,
+    },
+    /// Stable expert grouping with ordinary backend matrix-product numerics.
+    /// Groups retain input row order and use their exact active row count, then
+    /// scatter results back to input order. BF16 GEMM may round split-K partials.
+    /// The weight bank is borrowed without replication. Shape, dtype and index
+    /// validation match ExpertLinearRows; this operation is inference-only.
+    GroupedExpertLinearRows {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        indexes: Arc<Node>,
     },
     /// A linear layer with packed K-quant weights. It multiplies f32
     /// `x [.., columns]` by the dequantized
@@ -1652,6 +1712,23 @@ impl NodeKind {
                 shape.remove(*dim);
                 (shape, DType::I64, a.device.clone())
             }
+            NodeKind::TopKIndices { a, k } => {
+                let width = *a
+                    .shape
+                    .last()
+                    .ok_or("topKIndices: input must have rank >= 1")?;
+                if *k == 0 || *k > width || width > u32::MAX as usize {
+                    return Err(format!(
+                        "topKIndices: require 0 < k <= width <= u32::MAX, got k={k}, width={width}"
+                    ));
+                }
+                if a.dtype != DType::F32 {
+                    return Err(format!("topKIndices: expected f32, got {}", a.dtype));
+                }
+                let mut shape = a.shape.clone();
+                *shape.last_mut().unwrap() = *k;
+                (shape, DType::U32, a.device.clone())
+            }
             NodeKind::Cumsum { a, dim } => {
                 if a.shape.is_empty() || *dim >= a.shape.len() {
                     return Err(format!(
@@ -1795,6 +1872,14 @@ impl NodeKind {
                 causal,
                 window,
                 ..
+            }
+            | NodeKind::SdpaConfigured {
+                q,
+                k,
+                v,
+                causal,
+                window,
+                ..
             } => {
                 if matches!(window, AttentionWindow::Local(0)) {
                     return Err("sdpa: window must be positive".to_string());
@@ -1803,6 +1888,15 @@ impl NodeKind {
                     return Err("sdpa: explicit window requires causal attention".to_string());
                 }
                 let out = sdpa_check("sdpa", q, k, v)?;
+                if let NodeKind::SdpaConfigured {
+                    rounding: AttentionRounding::Stepwise,
+                    ..
+                } = self
+                {
+                    if !matches!(q.dtype, DType::F32 | DType::F16 | DType::BF16) {
+                        return Err("stepwise attention requires F32, F16, or BF16".into());
+                    }
+                }
                 (out, q.dtype, q.device.clone())
             }
             NodeKind::SdpaBackward {
@@ -2080,6 +2174,45 @@ impl NodeKind {
                 }
                 (x.shape.clone(), x.dtype, x.device.clone())
             }
+            NodeKind::RotaryEmbeddingExplicit {
+                x,
+                positions,
+                inverse_frequencies,
+                ..
+            } => {
+                let rank = x.shape.len();
+                if rank < 2 || x.shape[rank - 1] == 0 || x.shape[rank - 1] % 2 != 0 {
+                    return Err(
+                        "rotary_embedding: expected [..., T, D] with positive even D".into(),
+                    );
+                }
+                if !matches!(x.dtype, DType::F32 | DType::F16 | DType::BF16) {
+                    return Err(
+                        "rotary_embedding: explicit rotation requires F32, F16, or BF16".into(),
+                    );
+                }
+                let batch = &x.shape[..rank.saturating_sub(3)];
+                if !matches!(positions.dtype, DType::U32 | DType::I64)
+                    || positions.shape.len() != batch.len() + 1
+                    || positions.shape.last() != Some(&x.shape[rank - 2])
+                    || batch
+                        .iter()
+                        .zip(&positions.shape)
+                        .any(|(size, actual)| *actual != 1 && actual != size)
+                {
+                    return Err("rotary_embedding: positions must be u32/i64 [...batch, T] with broadcastable batch axes".into());
+                }
+                if !matches!(
+                    inverse_frequencies.dtype,
+                    DType::F32 | DType::F16 | DType::BF16
+                ) || inverse_frequencies.shape != [x.shape[rank - 1] / 2]
+                {
+                    return Err(
+                        "rotary_embedding: inverse frequencies must be floating-point [D/2]".into(),
+                    );
+                }
+                (x.shape.clone(), x.dtype, x.device.clone())
+            }
             NodeKind::RotaryEmbeddingBackward {
                 g, shape, seq_len, ..
             } => {
@@ -2096,6 +2229,34 @@ impl NodeKind {
                 require_same_dtype("linear", &[x, weight, bias])?;
                 let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
                 (out, x.dtype, x.device.clone())
+            }
+            NodeKind::ExpertLinearRows { x, weight, indexes }
+            | NodeKind::GroupedExpertLinearRows { x, weight, indexes } => {
+                let op = if matches!(self, NodeKind::GroupedExpertLinearRows { .. }) {
+                    "groupedExpertLinearRows"
+                } else {
+                    "expertLinearRows"
+                };
+                require_same_dtype(op, &[x, weight])?;
+                if !matches!(x.dtype, DType::F32 | DType::BF16) || indexes.dtype != DType::U32 {
+                    return Err(format!(
+                        "{op}: expected F32/BF16 input and weights, U32 indices"
+                    ));
+                }
+                if x.shape.len() != 2
+                    || weight.shape.len() != 3
+                    || indexes.shape.len() != 1
+                    || x.shape[1] != weight.shape[2]
+                    || x.shape[0] != indexes.shape[0]
+                {
+                    return Err(format!(
+                        "{op}: expected input [N,I], weights [E,O,I], and indices [N]"
+                    ));
+                }
+                if weight.shape[0] == 0 || weight.shape[0] > u32::MAX as usize {
+                    return Err(format!("{op}: E must be positive and fit U32"));
+                }
+                (vec![x.shape[0], weight.shape[1]], x.dtype, x.device.clone())
             }
             NodeKind::QuantizedLinear { x, weight, bias } => {
                 let (_, [rows, columns]) = weight.packed_matrix()?;
@@ -2653,6 +2814,7 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Round { a }
         | NodeKind::Sign { a }
         | NodeKind::Argmax { a, .. }
+        | NodeKind::TopKIndices { a, .. }
         | NodeKind::Argmin { a, .. }
         | NodeKind::Inverse { a }
         | NodeKind::Det { a }
@@ -2678,7 +2840,9 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::CrossEntropyBackward { logits, target, .. } => {
             vec![logits.clone(), target.clone()]
         }
-        NodeKind::Sdpa { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
+        NodeKind::Sdpa { q, k, v, .. } | NodeKind::SdpaConfigured { q, k, v, .. } => {
+            vec![q.clone(), k.clone(), v.clone()]
+        }
         NodeKind::KvAttention { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
         NodeKind::KdaChunk {
             q,
@@ -2757,6 +2921,12 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         NodeKind::PositionEmbedding { weight, .. } => vec![weight.clone()],
         NodeKind::LastTokenRow { a } => vec![a.clone()],
         NodeKind::RotaryEmbedding { x, .. } => vec![x.clone()],
+        NodeKind::RotaryEmbeddingExplicit {
+            x,
+            positions,
+            inverse_frequencies,
+            ..
+        } => vec![x.clone(), positions.clone(), inverse_frequencies.clone()],
         NodeKind::RotaryEmbeddingBackward { g, .. } => vec![g.clone()],
         NodeKind::LayerNorm {
             x, weight, bias, ..
@@ -2771,6 +2941,10 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         }
         NodeKind::LayerNormBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::Linear { x, weight, bias } => vec![x.clone(), weight.clone(), bias.clone()],
+        NodeKind::ExpertLinearRows { x, weight, indexes }
+        | NodeKind::GroupedExpertLinearRows { x, weight, indexes } => {
+            vec![x.clone(), weight.clone(), indexes.clone()]
+        }
         NodeKind::QuantizedLinear {
             x, weight, bias, ..
         } => {
@@ -3014,6 +3188,27 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             causal: *causal,
             window: *window,
         },
+        NodeKind::SdpaConfigured {
+            q,
+            k,
+            v,
+            scale,
+            causal,
+            window,
+            rounding,
+            layer_id,
+            retention,
+        } => NodeKind::SdpaConfigured {
+            q: f(q),
+            k: f(k),
+            v: f(v),
+            scale: *scale,
+            causal: *causal,
+            window: *window,
+            rounding: *rounding,
+            layer_id: *layer_id,
+            retention: *retention,
+        },
         NodeKind::SdpaBackward {
             q,
             k,
@@ -3049,6 +3244,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             layer,
             window,
             mode,
+            rounding,
         } => NodeKind::KvAttention {
             q: f(q),
             k: f(k),
@@ -3057,6 +3253,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             layer: *layer,
             window: *window,
             mode: *mode,
+            rounding: *rounding,
         },
         NodeKind::KdaChunk {
             q,
@@ -3176,6 +3373,17 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             offset: *offset,
             layout: *layout,
         },
+        NodeKind::RotaryEmbeddingExplicit {
+            x,
+            positions,
+            inverse_frequencies,
+            layout,
+        } => NodeKind::RotaryEmbeddingExplicit {
+            x: f(x),
+            positions: f(positions),
+            inverse_frequencies: f(inverse_frequencies),
+            layout: *layout,
+        },
         NodeKind::RotaryEmbeddingBackward {
             g,
             shape,
@@ -3220,6 +3428,18 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             weight: f(weight),
             bias: f(bias),
         },
+        NodeKind::ExpertLinearRows { x, weight, indexes } => NodeKind::ExpertLinearRows {
+            x: f(x),
+            weight: f(weight),
+            indexes: f(indexes),
+        },
+        NodeKind::GroupedExpertLinearRows { x, weight, indexes } => {
+            NodeKind::GroupedExpertLinearRows {
+                x: f(x),
+                weight: f(weight),
+                indexes: f(indexes),
+            }
+        }
         NodeKind::QuantizedLinear { x, weight, bias } => NodeKind::QuantizedLinear {
             x: f(x),
             weight: f(weight),
@@ -3366,6 +3586,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
         NodeKind::Round { a } => NodeKind::Round { a: f(a) },
         NodeKind::Sign { a } => NodeKind::Sign { a: f(a) },
         NodeKind::Argmax { a, dim } => NodeKind::Argmax { a: f(a), dim: *dim },
+        NodeKind::TopKIndices { a, k } => NodeKind::TopKIndices { a: f(a), k: *k },
         NodeKind::Argmin { a, dim } => NodeKind::Argmin { a: f(a), dim: *dim },
         NodeKind::Inverse { a } => NodeKind::Inverse { a: f(a) },
         NodeKind::Det { a } => NodeKind::Det { a: f(a) },
@@ -3783,6 +4004,16 @@ mod tests {
                 name: "packed".into(),
             },
             NodeKind::StopGradient { a: packed.clone() },
+            NodeKind::ExpertLinearRows {
+                x: typed(&[1, 256], DType::F32),
+                weight: packed.clone(),
+                indexes: typed(&[1], DType::U32),
+            },
+            NodeKind::GroupedExpertLinearRows {
+                x: typed(&[1, 256], DType::F32),
+                weight: packed.clone(),
+                indexes: typed(&[1], DType::U32),
+            },
         ] {
             assert!(Node::new(kind).err().unwrap().contains("packed storage"));
         }
@@ -3811,6 +4042,69 @@ mod tests {
             storage: StorageMetadata::packed(GgmlKQuant::Q4K)
         })
         .is_err());
+    }
+
+    #[test]
+    fn expert_rows_native_metadata_checks_types_shapes_and_expert_index_width() {
+        for grouped in [false, true] {
+            let make = |x: &[usize], w: &[usize], ids: &[usize], dtype, id_dtype| {
+                let x = typed(x, dtype);
+                let weight = typed(w, dtype);
+                let indexes = typed(ids, id_dtype);
+                Node::new(if grouped {
+                    NodeKind::GroupedExpertLinearRows { x, weight, indexes }
+                } else {
+                    NodeKind::ExpertLinearRows { x, weight, indexes }
+                })
+            };
+            for dtype in [DType::F32, DType::BF16] {
+                for (x, w, ids, output) in [
+                    (vec![16, 13], vec![3, 64, 13], vec![16], vec![16, 64]),
+                    (vec![0, 13], vec![3, 64, 13], vec![0], vec![0, 64]),
+                    (vec![16, 0], vec![3, 64, 0], vec![16], vec![16, 64]),
+                    (vec![16, 13], vec![3, 0, 13], vec![16], vec![16, 0]),
+                    (
+                        vec![1, 0],
+                        vec![u32::MAX as usize, 0, 0],
+                        vec![1],
+                        vec![1, 0],
+                    ),
+                ] {
+                    let node = make(&x, &w, &ids, dtype, DType::U32).unwrap();
+                    assert_eq!(node.shape, output);
+                    assert_eq!(node.dtype, dtype);
+                    let children = node_children(&node.kind);
+                    assert_eq!(children.len(), 3);
+                    let rebuilt =
+                        Node::new(remap_children(&node.kind, &|child| child.clone())).unwrap();
+                    assert_eq!(rebuilt.value_spec(), node.value_spec());
+                }
+            }
+            for dtype in [DType::F16, DType::F64, DType::I64, DType::U32, DType::U8] {
+                assert!(make(&[1, 2], &[3, 4, 2], &[1], dtype, DType::U32).is_err());
+            }
+            for (x, w, ids) in [
+                (vec![2], vec![3, 4, 2], vec![1]),
+                (vec![1, 2], vec![3, 2], vec![1]),
+                (vec![1, 2], vec![3, 4, 2], vec![1, 1]),
+                (vec![2, 2], vec![3, 4, 2], vec![1]),
+                (vec![1, 2], vec![3, 4, 5], vec![1]),
+                (vec![1, 2], vec![0, 4, 2], vec![1]),
+                (vec![1, 0], vec![u32::MAX as usize + 1, 0, 0], vec![1]),
+            ] {
+                assert!(make(&x, &w, &ids, DType::F32, DType::U32).is_err());
+            }
+            assert!(make(&[1, 2], &[3, 4, 2], &[1], DType::F32, DType::I64).is_err());
+            let x = typed(&[1, 2], DType::F32);
+            let weight = typed(&[3, 4, 2], DType::BF16);
+            let indexes = typed(&[1], DType::U32);
+            assert!(Node::new(if grouped {
+                NodeKind::GroupedExpertLinearRows { x, weight, indexes }
+            } else {
+                NodeKind::ExpertLinearRows { x, weight, indexes }
+            })
+            .is_err());
+        }
     }
 
     #[test]

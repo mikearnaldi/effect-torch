@@ -48,13 +48,15 @@ Repository setup and contributor workflows are documented in
 
 ## Packages
 
-| Package                              | Responsibility                                                                    |
-| ------------------------------------ | --------------------------------------------------------------------------------- |
-| `@effect-torch/core`                 | Backend-neutral tensors, compilation, models, training, GGUF, chat, and inference |
-| `@effect-torch/backend-cpu`          | CPU Runtime Layer and CPU-owned native addon                                      |
-| `@effect-torch/backend-apple-native` | Apple Metal Runtime Layer and Metal-owned native addon                            |
-| `@effect-torch/backend-cuda`         | Experimental CUDA Runtime Layer and Linux x64 native addon                        |
-| `@effect-torch/tokenizers`           | Native tokenizer loading, encoding, decoding, and training                        |
+| Package                                           | Responsibility                                                                    |
+| ------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `@effect-torch/core`                              | Backend-neutral tensors, compilation, models, training, GGUF, chat, and inference |
+| `@effect-torch/models`                            | Concrete model definitions, checkpoint interpretation, and serving integrations   |
+| `@effect-torch/backend-cpu`                       | CPU Runtime Layer and CPU-owned native addon                                      |
+| `@effect-torch/backend-apple-native`              | Apple Metal Runtime Layer and Metal-owned native addon                            |
+| `@effect-torch/backend-cuda`                      | Experimental CUDA Runtime Layer and Linux x64 native addon                        |
+| `@effect-torch/tokenizers`                        | Native tokenizer loading, encoding, decoding, and training                        |
+| [`@effect-torch/serve`](packages/serve/README.md) | Effect HttpApi serving for OpenAI-compatible generation and independent decisions |
 
 `@effect-torch/core` has no dependency on a concrete backend. Applications
 select a backend by providing its runtime Layer to the Effect program.
@@ -476,10 +478,10 @@ peak memory. Full-model peak-memory and performance validation for the
 
 Built-in architectures live at explicit subpath exports:
 
-| Entry point                    | Export        | Purpose                               |
-| ------------------------------ | ------------- | ------------------------------------- |
-| `@effect-torch/core/models`    | `MuseGlimmer` | Muse-Glimmer model and GGUF loader    |
-| `@effect-torch/core/proposers` | `DFlash`      | DFlash proposer graph and GGUF loader |
+| Entry point            | Export        | Purpose                               |
+| ---------------------- | ------------- | ------------------------------------- |
+| `@effect-torch/models` | `MuseGlimmer` | Muse-Glimmer model and GGUF loader    |
+| `@effect-torch/models` | `DFlash`      | DFlash proposer graph and GGUF loader |
 
 ### Tensor constructors
 
@@ -724,24 +726,24 @@ runBatchedDecodeProgram
 runBatchedDecodeProgramSampled
 ```
 
-Most applications should use `Tensor.compile`, a model's `execute` method,
-`Trainer.make`, or `Model.inference` instead.
+Most applications should use `Model.compile`, `Tensor.compile`, `Trainer.make`,
+or `AutoRegressive.compile` instead.
 
 ## Models and training
 
 ### Models
 
-A `Model.Model` defines a functional model with:
+A `Model.Definition` defines a functional model with:
 
 - Ordered parameter names.
 - An Effect that initializes a flat parameter array.
 - A lazy `forward` graph builder.
-- A compiled `execute` path.
-- Compilation cache statistics and explicit cache clearing.
 
-Models do not mutate learned parameters or running tensor state, and they have
-no model-specific backward method. After the first `execute` call, a model
-memoizes its compiled execution function. `stats` and `clear` expose that cache.
+Definitions do not contain parameter values or compiled state. Models do not
+mutate learned parameters or running tensor state, and they have no
+model-specific backward method. `Model.compile` pairs a definition with one
+parameter generation and returns a `Model.Program` with `run`, `stats`, and
+`clear`.
 
 Parameterized layers include:
 
@@ -784,14 +786,14 @@ const runModel = (input: Tensor.Any) =>
 
     const params = yield* Tensor.compute(yield* Model.initialize(model))
     const lazyOutput = yield* model.forward(params, input)
-    const concreteOutput = yield* model.execute(params, input)
+    const program = yield* Model.compile(model, params)
+    const concreteOutput = yield* program.run(input)
     return { lazyOutput, concreteOutput }
   })
 ```
 
-Use `forward` for composition and differentiation. Use `execute` for repeated
-materialized evaluation. It creates the compiled function on first use and
-reuses it.
+Use `forward` for composition and differentiation. Use a `Model.Program` for
+repeated materialized evaluation.
 
 Multi-head attention uses fused QKV parameters named:
 
@@ -852,7 +854,7 @@ for each input signature. `Trainer.makeUncompiled` provides the reference loop.
 import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "@effect-torch/core"
 import { Effect } from "effect"
 
-const train = (model: Model.Model, input: Tensor.Any, target: Tensor.Any) =>
+const train = (model: Model.Definition, input: Tensor.Any, target: Tensor.Any) =>
   Effect.gen(function*() {
     const trainer = yield* Trainer.make(model, {
       optimizer: yield* Optimizer.adam(),
@@ -927,21 +929,24 @@ exhausting that permutation uses a new random event.
 
 ## Compiled inference
 
-`Model.inference` transforms a causal attention model into compiled prefill and
+Autoregressive APIs live in `AutoRegressive`. See the
+[symbol migration map](docs/autoregressive-model-migration.md) for the former `Model` names.
+
+`AutoRegressive.compile` transforms a causal attention model into compiled prefill and
 decode programs backed by a paged KV cache:
 
 ```ts
-import { Model, Tensor } from "@effect-torch/core"
+import { AutoRegressive, Model, Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 
 const generate = (
-  model: Model.Model,
-  params: Model.Params,
+  model: Model.Definition,
+  params: Model.Parameters,
   promptTensor: Tensor.Any,
   maxNewTokens: number
 ) =>
   Effect.gen(function*() {
-    const inference = yield* Model.inference(model, params, {
+    const inference = yield* AutoRegressive.compile(model, params, {
       maxTokens: 8192,
       blockSize: 16,
       prefillChunks: [16],
@@ -991,18 +996,18 @@ Generation sessions support:
 
 Speculative decoding uses the same token-page API. `Speculation` constructs
 autoregressive draft-model, deterministic history-lookup, and replayable
-parallel-block proposers. `Model.inference` accepts one proposer and currently
+parallel-block proposers. `AutoRegressive.compile` accepts one proposer and currently
 uses a fixed proposal width:
 
 ```ts
-import { Model, Speculation } from "@effect-torch/core"
+import { AutoRegressive, Model, Speculation } from "@effect-torch/core"
 
 const proposer = Speculation.autoregressive(draftModel, draftParams, {
   vocabulary: 32_000,
   maxDraftTokens: 4
 })
 
-const inference = yield* Model.inference(targetModel, targetParams, {
+const inference = yield* AutoRegressive.compile(targetModel, targetParams, {
   maxTokens: 8192,
   prefillChunks: [32, 64, 128, 256],
   speculation: { proposer, maxDraftTokens: 4 },
@@ -1024,12 +1029,12 @@ queries, prefix matching, decode compilation, and direct decode execution.
 
 ## GGUF models
 
-`Gguf.loadModel` inspects a GGUF v3 file, validates its exact architecture and
-tensor catalog against a `Gguf.ModelDefinition`, then loads the parameters on
-the selected runtime. `Gguf.loadParameters` provides the same catalog and
+`Gguf.load` inspects a GGUF v3 file, validates its exact architecture and
+tensor catalog against a `Gguf.ModelLoader`, then loads the parameters on
+the selected runtime. `Gguf.load` provides the same catalog and
 ownership checks for target-coupled artifacts such as speculative proposers.
 
-Pass `names` to `Gguf.loadParameters` to load part of a file. Only selected
+Pass `names` to `Gguf.load` to load part of a file. Only selected
 payloads are read and allocated, and `params` follows the requested name order.
 Names must be unique and present in both the parameter catalog and the file.
 An empty array loads no tensors. Omitting `names` retains exact full-catalog
@@ -1042,7 +1047,7 @@ import { Gguf } from "@effect-torch/core"
 import { Effect } from "effect"
 
 const loadSelected = (file: string, architecture: string, names: ReadonlyArray<string>) =>
-  Gguf.loadParameters(file, {
+  Gguf.load(file, {
     architecture,
     parameterSpecs: (_, tensors) =>
       Effect.succeed(tensors.map(({ name, logicalShape }) => ({ name, shape: logicalShape })))
@@ -1051,18 +1056,18 @@ const loadSelected = (file: string, architecture: string, names: ReadonlyArray<s
 
 The definition can instead supply expected shapes for validation. Selection is
 at whole-tensor granularity; selected packed weights retain their encoded bytes.
-Release the returned handles with `Tensor.clearAll(loaded.params)` after use.
+Release the returned handles with `Tensor.clearAll(loaded.parameters)` after use.
 
 The built-in Muse-Glimmer loader wraps the generic model path:
 
 ```ts
-import { Model, Tensor } from "@effect-torch/core"
-import { MuseGlimmer } from "@effect-torch/core/models"
+import { AutoRegressive, Model, Tensor } from "@effect-torch/core"
+import { MuseGlimmer } from "@effect-torch/models"
 import { Effect } from "effect"
 
 const prepare = Effect.gen(function*() {
   const loaded = yield* MuseGlimmer.loadGGUF("model.gguf")
-  const program = yield* Model.inference(loaded.model, loaded.params, {
+  const program = yield* AutoRegressive.compile(loaded.definition, loaded.parameters, {
     maxTokens: 4096,
     blockSize: 16,
     prefillChunks: [32, 64, 128, 256],
@@ -1070,18 +1075,110 @@ const prepare = Effect.gen(function*() {
     batchSize: 1
   })
 
-  // Model.inference retains its own immutable parameter generation.
-  yield* Tensor.clearAll(loaded.params)
+  // AutoRegressive.compile retains its own immutable parameter generation.
+  yield* Tensor.clearAll(loaded.parameters)
   return { program, metadata: loaded.metadata }
 })
 ```
 
 The loader accepts dense F32 and `Q2_K` through `Q6_K` tensor payloads. Loaded
-parameters are caller-owned concrete handles. `Model.inference` retains its
+parameters are caller-owned concrete handles. `AutoRegressive.compile` retains its
 parameter generation independently, so clear the loader's handles after it
-succeeds. The `DFlash.loadGGUF` export from `@effect-torch/core/proposers`
-similarly returns caller-owned parameters plus a ready `artifact` for
-`Model.inference`.
+succeeds. The `DFlash.loadGGUF` export from `@effect-torch/models` similarly
+returns caller-owned parameters plus a ready `artifact` for
+`AutoRegressive.compile`.
+
+## Diffusion and decision inference
+
+`Diffusion.compile` compiles separate encoder and denoiser programs with
+one retained parameter generation. It exposes immutable prefixes, read-only
+canvas evaluation, selected logits, causal block commits, and generation.
+`DiffusionGemma.generate` supplies the model-specific refinement and sampling
+policy. `Decision` scores independently initialized reads through the same
+artifact.
+
+```ts
+import { Decision, Diffusion } from "@effect-torch/core"
+import { DiffusionGemma } from "@effect-torch/models"
+import { Effect } from "effect"
+
+const evaluateAndGenerate = (
+  loaded: DiffusionGemma.LoadedParameters,
+  prompt: Uint32Array,
+  canvases: ReadonlyArray<Uint32Array>,
+  answerRow: number,
+  answerTokenIds: ReadonlyArray<number>
+) =>
+  Effect.gen(function*() {
+    const model = DiffusionGemma.fromLoaded(loaded)
+    const definition = model.definition
+    const program = yield* Diffusion.compile(definition, model.parameters, {
+      maxTokens: 4096,
+      blockSize: 16,
+      prefillChunks: [16, 64],
+      canvasLengths: [...new Set([definition.canvasLength, ...canvases.map((canvas) => canvas.length)])]
+        .sort((a, b) => a - b),
+      selectedReadouts: [{ rows: 1, labels: answerTokenIds.length }]
+    })
+    const probabilities = yield* Effect.scoped(Effect.gen(function*() {
+      const prefix = yield* Effect.acquireRelease(
+        program.encode(prompt),
+        (prefix) => Effect.orDie(program.release(prefix)),
+        { interruptible: true }
+      )
+      return yield* Decision.scoreIndependently(
+        Decision.fromDiffusion(program),
+        [{
+          inputs: canvases.map((canvas) => ({ prefix, canvas })),
+          selection: { rows: [answerRow], labels: answerTokenIds }
+        }],
+        { batchSize: 1, concurrency: 2 }
+      )
+    }))
+    const generated = yield* DiffusionGemma.generate(program, prompt, {
+      maxNewTokens: 64,
+      outputLimit: "exact",
+      seed: 42
+    })
+    return { probabilities, generated }
+  })
+```
+
+The caller owns `loaded.ownedParameters`; compile captures them independently.
+Canvases must match a configured width. Answer codes must be verified single
+tokens in the supplied order. Independent reads average per-read probabilities.
+They start with fresh conditioning, while normal generation carries feedback
+between refinements and encoder-commits completed blocks when continuing.
+
+Raw `evaluate` and `score` results are caller-owned tensors. Clear them with
+`Tensor.clear`; release prefixes after their final borrower completes.
+Refinement feedback uses the model-declared `predictionDtype`, while full
+readout logits remain F32. The generation policy keeps full logits on device,
+but currently prepares exponential random inputs on the host and reports their
+preparation time and upload size separately.
+
+Run the [generation validation program](packages/examples/scripts/diffusion-gemma/verify-generation.ts)
+with a checkpoint and tokenized input. It scores selected answers and generates
+with the same artifact:
+
+```sh
+pnpm --filter @effect-torch/examples exec tsx scripts/diffusion-gemma/verify-generation.ts \
+  cuda /path/to/checkpoint /path/to/inputs.json /path/to/tokenizer.json
+```
+
+Choose `cpu`, `metal`, or `cuda`. The tokenizer path is optional and enables
+decoded output. `inputs.json` requires `promptIds`, `labelIds`, `answerRow`,
+`maxNewTokens`, and `seed`. Prompt IDs must include the model's chat template.
+Optional `canvasIds` supplies an independent decision canvas; the artifact
+compiles that width alongside the checkpoint's generation width.
+
+The program reports compilation and execution phases, random-input preparation,
+and sampler costs. Set `evidenceDirectory` to a fresh directory to retain
+partial execution records. Recorded-reference replay uses `generationReference`
+and verifies random-file hashes, refinement argmax tokens, and final output.
+See the [DiffusionGemma benchmarks](packages/bench/diffusion-gemma/README.md)
+and [reproduction bundle](packages/bench/diffusion-gemma/reproduction/README.txt)
+for measured CUDA results, validation evidence, and reproduction instructions.
 
 ## Chat
 
@@ -1090,12 +1187,11 @@ and caller-supplied chat template. It renders and encodes the prompt once,
 prefills the model, samples tokens, and emits ordered stream events:
 
 ```ts
-import { Chat } from "@effect-torch/core"
-import type { Model } from "@effect-torch/core"
+import { type AutoRegressive, Chat } from "@effect-torch/core"
 import * as Tokenizers from "@effect-torch/tokenizers"
 import { Effect, Stream } from "effect"
 
-const chat = (program: Model.InferenceProgram, template: string, eosTokenId: number) =>
+const chat = (program: AutoRegressive.Artifact, template: string, eosTokenId: number) =>
   Effect.gen(function*() {
     const tokenizer = yield* Tokenizers.fromFile("tokenizer.json", {
       ...Tokenizers.strictConfig,
@@ -1125,6 +1221,38 @@ A successful stream starts with `prefill` and ends with `done`. Between them,
 controls parse models that use Chat's segmented control-token protocol.
 Standard sampling stays in the native generation session. A custom sampler
 function receives each logits row as a host typed array instead.
+
+`Chat.streamWith` consumes committed token pages from a required generation
+callback. It uses the same template, tokenizer, parser, and events as
+`Chat.stream`. Family-specific controls belong to the callback:
+
+```ts
+import { Chat, type Diffusion } from "@effect-torch/core"
+import { DiffusionGemma } from "@effect-torch/models"
+import { Effect } from "effect"
+
+const diffusionChat = (
+  program: Diffusion.Artifact,
+  options: Chat.ChatOptions
+) =>
+  Chat.streamWith(({ prompt, maxTokens, eosTokens, onPage }) =>
+    DiffusionGemma.generate(program, prompt, {
+      maxNewTokens: maxTokens ?? 128,
+      eosTokenIds: eosTokens,
+      outputLimit: "exact",
+      seed: 7,
+      onPage: (tokens) => onPage({ tokens })
+    }).pipe(Effect.map((result) => result.stop === "length" ? "maxTokens" : "stop")), options)
+```
+
+The callback receives the encoded prompt, requested token limit, resolved stop
+IDs, and `onPage`. It must await each nonempty page before publishing the next
+one, then return `"stop"` or `"maxTokens"`. Refinements that commit no tokens
+stay inside the generator. Chat enforces EOS and its token limit within pages;
+normal stopping, parser failure, and downstream cancellation interrupt the
+producer and run its scoped cleanup. Errors and Effect requirements propagate
+through the stream. For block generation, `prefill` measures time until the
+first committed page, including that block's refinement.
 
 ## Safetensors
 
@@ -1200,20 +1328,20 @@ Save and load parameters in model-specification order:
 import { Model, Safetensors } from "@effect-torch/core"
 import { Effect } from "effect"
 
-const roundTrip = (model: Model.Model, params: Model.Params) =>
+const roundTrip = (model: Model.Definition, params: Model.Parameters) =>
   Effect.gen(function*() {
-    yield* Safetensors.saveModel(model, params, "model.safetensors")
-    return yield* Safetensors.loadModel(model, "model.safetensors")
+    yield* Safetensors.saveParameters(model, params, "model.safetensors")
+    return yield* Safetensors.loadParameters(model, "model.safetensors")
   })
 ```
 
 Trainer checkpoints extend the same format with optimizer, step, and optional
 sampler state.
-`Safetensors.loadModel` inspects headers and loads only its declared parameter names.
+`Safetensors.loadParameters` inspects headers and loads only its declared parameter names.
 
 Migration: tensor-level `save`, `load`, `loadArchive`, and `inspectArchive`
 have moved from `Tensor` to `Safetensors`. Model-level `save` and `load` have
-moved to `Safetensors.saveModel` and `Safetensors.loadModel`, keeping their
+moved to `Safetensors.saveParameters` and `Safetensors.loadParameters`, keeping their
 argument order. Archive types now live under `Safetensors`: `SaveOptions`,
 `LoadOptions`, `Archive`, `TensorInfo`, and `Inspection`.
 
@@ -1266,18 +1394,18 @@ until explicitly imported into a tensor runtime.
 
 The public error hierarchy includes:
 
-| Error                        | Scope                                                   |
-| ---------------------------- | ------------------------------------------------------- |
-| `Chat.ChatError`             | Chat validation, sampling, and protocol failures        |
-| `Runtime.BackendError`       | Structured backend operation and ownership failures     |
-| `Tensor.TensorError`         | Graph, evaluation, readback, and serialization failures |
-| `Gradient.GradError`         | Autodiff contract failures                              |
-| `Gguf.GgufError`             | GGUF inspection, validation, loading, and ownership     |
-| `Model.ModelError`           | Model construction, arity, and checkpoint failures      |
-| `Model.InferenceError`       | Inference transform and generation-session failures     |
-| `Checkpoint.CheckpointError` | Invalid or incomplete trainer checkpoints               |
-| `Sampler.SamplerError`       | Invalid sampler configuration or state                  |
-| `Tokenizer.TokenizerError`   | Tokenizer load, train, encode, and decode failures      |
+| Error                           | Scope                                                   |
+| ------------------------------- | ------------------------------------------------------- |
+| `Chat.ChatError`                | Chat validation, sampling, and protocol failures        |
+| `Runtime.BackendError`          | Structured backend operation and ownership failures     |
+| `Tensor.TensorError`            | Graph, evaluation, readback, and serialization failures |
+| `Gradient.GradError`            | Autodiff contract failures                              |
+| `Gguf.GgufError`                | GGUF inspection, validation, loading, and ownership     |
+| `Model.ModelError`              | Model construction, arity, and checkpoint failures      |
+| `AutoRegressive.InferenceError` | Inference transform and generation-session failures     |
+| `Checkpoint.CheckpointError`    | Invalid or incomplete trainer checkpoints               |
+| `Sampler.SamplerError`          | Invalid sampler configuration or state                  |
+| `Tokenizer.TokenizerError`      | Tokenizer load, train, encode, and decode failures      |
 
 `Runtime.BackendError` records a reason, backend, operation, phase, message,
 and optional details. The reason distinguishes unsupported dtypes or placements,

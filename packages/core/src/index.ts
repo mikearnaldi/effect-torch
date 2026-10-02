@@ -1,4 +1,12 @@
 /**
+ * Autoregressive inference compilation, sampled generation, and stateful logits execution.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as AutoRegressive from "./AutoRegressive.ts"
+
+/**
  * Safetensors checkpoint persistence for parameters, positional optimizer
  * tensor state, global training step, and optional sampler continuation state.
  *
@@ -16,12 +24,36 @@ export * as Checkpoint from "./Checkpoint.ts"
 export * as Chat from "./Chat.ts"
 
 /**
+ * Selected-answer scoring and independent-read probability aggregation.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as Decision from "./Decision.ts"
+
+/**
+ * Compiled diffusion inference, immutable prefixes, and block generation.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as Diffusion from "./Diffusion.ts"
+
+/**
  * Reverse-mode automatic differentiation and lazy graph-to-graph transforms.
  *
  * @since 0.1.0
  * @category modules
  */
 export * as Gradient from "./Gradient.ts"
+
+/**
+ * Family-neutral token generation contracts.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as Generation from "./Generation.ts"
 
 /**
  * Native GGUF v3 inspection, explicit model definition, validation, and owned

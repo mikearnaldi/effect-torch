@@ -86,6 +86,19 @@ impl SlabWriter<'_> {
 }
 
 impl Slab {
+    /// Copies a page within its slab while holding one exclusive lock.
+    pub fn copy_rows(&self, source: usize, destination: usize, rows: usize) {
+        let mut data = self.data.write().unwrap();
+        let source = source * self.row_width;
+        let destination = destination * self.row_width;
+        let elements = rows * self.row_width;
+        match &mut *data {
+            SlabData::F32(values) => values.copy_within(source..source + elements, destination),
+            SlabData::F16(values) => values.copy_within(source..source + elements, destination),
+            SlabData::BF16(values) => values.copy_within(source..source + elements, destination),
+            SlabData::U8(values) => values.copy_within(source..source + elements, destination),
+        }
+    }
     /// Allocates a zero-initialized slab. Supports only `F32`, `F16`, `BF16`,
     /// and `U8`. Other dtypes panic.
     pub fn new(rows: usize, row_width: usize, dtype: DType) -> Self {

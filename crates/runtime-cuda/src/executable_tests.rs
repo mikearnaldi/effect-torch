@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "paged_state_tests.rs"]
+mod paged_state_tests;
 use crate::capabilities::CudaCapabilities;
 use crate::executable::CudaKernelArgs;
 use effect_torch_compiler::{
@@ -58,8 +61,15 @@ fn lower_with(
     let mut builder =
         CudaProgramBuilder::new(&prepared.index, layout, driver.legalization()).unwrap();
     driver
-        .lower(|unit, index, _, plan| {
+        .lower(|unit, index, optimization, plan| {
             let LoweringUnit::Node(id) = unit else {
+                if let LoweringUnit::Region(region_id) = unit {
+                    if let NativeRegion::VNormKvAttention(region) =
+                        &optimization.regions[region_id.index()]
+                    {
+                        return builder.add_vnorm_region(index, optimization, region, plan);
+                    }
+                }
                 return Err("unexpected CUDA region".into());
             };
             let node = index.node(id).unwrap();
@@ -78,6 +88,48 @@ fn lower_with(
                     a: child(a),
                     parameters: dims.iter().map(|dim| *dim as u64).collect(),
                 },
+                NodeKind::Reshape { a, .. } => Instruction::Alias { a: child(a) },
+                NodeKind::BroadcastTo { a, .. } => Instruction::Reindex {
+                    op: 0,
+                    a: child(a),
+                    parameters: Vec::new(),
+                },
+                NodeKind::Slice { a, ranges } => Instruction::Reindex {
+                    op: 2,
+                    a: child(a),
+                    parameters: ranges
+                        .iter()
+                        .flat_map(|(start, end, step)| [*start as u64, *end as u64, *step as u64])
+                        .collect(),
+                },
+                NodeKind::Neg { a } => Instruction::Unary {
+                    op: 0,
+                    a: child(a),
+                    parameter: 0.0,
+                },
+                NodeKind::Concat { a, b, dim } => Instruction::Concat {
+                    a: child(a),
+                    b: child(b),
+                    dim: *dim as u32,
+                },
+                NodeKind::ExpertLinearRows { x, weight, indexes } => {
+                    Instruction::ExpertLinearRows {
+                        x: child(x),
+                        weight: child(weight),
+                        indexes: child(indexes),
+                        rows: x.shape[0],
+                        columns: weight.shape[1],
+                        inner: x.shape[1],
+                        experts: weight.shape[0],
+                    }
+                }
+                NodeKind::GroupedExpertLinearRows { x, weight, indexes } => {
+                    Instruction::GroupedExpertLinearRows {
+                        x: child(x),
+                        weight: child(weight),
+                        indexes: child(indexes),
+                    }
+                }
                 NodeKind::Linear { x, weight, bias } => Instruction::Linear {
                     x: child(x),
                     weight: child(weight),
@@ -90,12 +142,33 @@ fn lower_with(
                     a: child(a),
                     b: child(b),
                 },
+                NodeKind::RmsNorm { x, weight, eps } => Instruction::RmsNorm {
+                    x: child(x),
+                    weight: weight.as_ref().map(child),
+                    eps: *eps,
+                },
                 NodeKind::Gather { a, indexes, dim } => Instruction::Index {
                     op: 4,
                     a: child(a),
                     indexes: Some(child(indexes)),
                     src: None,
                     dim: *dim as u32,
+                    width: a.shape[*dim],
+                    trailing: *dim + 1 == a.shape.len(),
+                },
+                NodeKind::ScatterAdd {
+                    a,
+                    dim,
+                    indexes,
+                    src,
+                } => Instruction::Index {
+                    op: 5,
+                    a: child(a),
+                    indexes: Some(child(indexes)),
+                    src: Some(child(src)),
+                    dim: *dim as u32,
+                    width: a.shape[*dim],
+                    trailing: *dim + 1 == a.shape.len(),
                 },
                 NodeKind::QuantizedLinear { x, weight, bias } => {
                     let StorageRepresentation::Packed(PackedFormat::GgmlKQuant(codec)) =
@@ -157,7 +230,7 @@ fn lower_with(
                     layer,
                     window,
                     mode,
-                    ..
+                    rounding,
                 } => Instruction::KvAttention {
                     q: child(q),
                     k: child(k),
@@ -167,14 +240,16 @@ fn lower_with(
                     scale: *scale,
                     layer: *layer as usize,
                     window: *window,
+                    rounding: *rounding,
                     bidirectional: matches!(
                         mode,
                         effect_torch_graph::KvAttentionMode::BidirectionalBlock
                     ),
+                    sequence_major: false,
                 },
                 _ => return Err("unsupported host-test instruction".into()),
             };
-            builder.add(id, node, index, instruction, plan)
+            builder.add(id, node, index, optimization, instruction, plan)
         })
         .unwrap();
     let count = builder.conversion_count;
@@ -199,6 +274,521 @@ fn kernel_descriptor_matches_cuda_layout() {
     assert_eq!(std::mem::size_of::<CudaKernelArgs>(), 360);
     assert_eq!(std::mem::offset_of!(CudaKernelArgs, metadata), 104);
     assert_eq!(std::mem::offset_of!(CudaKernelArgs, input_dtypes), 312);
+}
+
+#[test]
+fn independent_dense_branch_is_found_after_lowering_dtype_boundaries() {
+    let x = input(0, &[65, 37], DType::BF16);
+    let norm = |x: Arc<Node>| {
+        Node::new(NodeKind::RmsNorm {
+            x,
+            weight: None,
+            eps: 1e-6,
+        })
+        .unwrap()
+    };
+    let projection = |x: Arc<Node>, slot: u32, n: usize, k: usize| {
+        Node::new(NodeKind::Matmul {
+            a: x,
+            b: Node::new(NodeKind::Permute {
+                a: input(slot, &[n, k], DType::BF16),
+                dims: vec![1, 0],
+            })
+            .unwrap(),
+        })
+        .unwrap()
+    };
+    let dense_input = norm(x.clone());
+    let gate = projection(dense_input.clone(), 1, 53, 37);
+    let gate = Node::new(NodeKind::Reshape {
+        a: gate,
+        shape: vec![1, 65, 53],
+    })
+    .unwrap();
+    let gate = Node::new(NodeKind::Reshape {
+        a: gate,
+        shape: vec![65, 53],
+    })
+    .unwrap();
+    let up = projection(dense_input, 2, 53, 37);
+    let product = Node::new(NodeKind::Mul { a: gate, b: up }).unwrap();
+    let dense = norm(projection(product, 3, 37, 53));
+    let expert_input = norm(x);
+    let experts = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: expert_input,
+        weight: input(4, &[7, 37, 37], DType::BF16),
+        indexes: input(5, &[65], DType::U32),
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::Mul {
+        a: dense,
+        b: norm(experts),
+    })
+    .unwrap();
+    let (mut program, mut commands, _, _, _) = lower(vec![root], false, None);
+    assert_eq!(
+        crate::planned_overlap::plan_dense_overlap(&mut program, &mut commands).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn grouped_experts_plan_bounded_scratch_borrow_banks_and_report_host_completion() {
+    for dtype in [DType::F32, DType::BF16] {
+        for (rows, experts, columns, inner) in [
+            (69, 7, 13, 37),
+            (2, 512, 4096, 4096),
+            (3, 2, 0, 5),
+            (0, 1, 4, 5),
+            (3, 2, 4, 0),
+        ] {
+            let root = Node::new(NodeKind::GroupedExpertLinearRows {
+                x: input(0, &[rows, inner], dtype),
+                weight: input(1, &[experts, columns, inner], dtype),
+                indexes: input(2, &[rows], DType::U32),
+            })
+            .unwrap();
+            let (program, commands, _, conversions, _) = lower(vec![root], true, None);
+            assert_eq!(conversions, 0);
+            let group = commands
+                .iter()
+                .find(|c| matches!(c.kind, CommandKind::GroupedExpert { .. }))
+                .unwrap();
+            let CommandKind::GroupedExpert {
+                control,
+                row_map,
+                gathered,
+                projected,
+                weight,
+                workspace,
+                ..
+            } = &group.kind
+            else {
+                unreachable!()
+            };
+            let bytes = |id: &ValueId| program.values[id.index()].decl.bytes;
+            assert_eq!(bytes(control), (experts + 2) * 4);
+            assert_eq!(bytes(row_map), rows * 4);
+            assert_eq!(bytes(gathered), rows * inner * dtype.size_in_bytes());
+            assert_eq!(bytes(projected), rows * columns * dtype.size_in_bytes());
+            assert_eq!(
+                bytes(weight),
+                experts * columns * inner * dtype.size_in_bytes()
+            );
+            assert!(matches!(
+                program.values[weight.index()].decl.storage,
+                ValueStorage::Fixed {
+                    class: StorageClass::ExternalInput,
+                    ..
+                }
+            ));
+            assert_eq!(
+                workspace.is_some(),
+                dtype == DType::BF16 && rows != 0 && columns != 0 && inner != 0
+            );
+            if let Some(workspace) = workspace {
+                assert_eq!(
+                    bytes(workspace),
+                    CUBLAS_WORKSPACE_BYTES * EXPERT_BLAS_STREAMS + EXPERT_GROUPED_POINTER_BYTES
+                );
+            }
+            assert_eq!(
+                crate::executable::physical_counts(&program, &commands).1,
+                1 + usize::from(rows != 0)
+            );
+            assert!(program
+                .instructions
+                .iter()
+                .any(|i| i.kind == "grouped_expert_linear_rows_host_control_non_capturable"));
+        }
+    }
+}
+
+#[test]
+fn grouped_experts_reuse_unchanged_routing_control_and_row_map() {
+    let (rows, experts, inner, middle, columns) = (64, 128, 2816, 704, 2816);
+    let indexes = input(2, &[rows], DType::U32);
+    let first = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: input(0, &[rows, inner], DType::BF16),
+        weight: input(1, &[experts, middle, inner], DType::BF16),
+        indexes: indexes.clone(),
+    })
+    .unwrap();
+    let second = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: first,
+        weight: input(3, &[experts, columns, middle], DType::BF16),
+        indexes,
+    })
+    .unwrap();
+    let (_, commands, _, _, _) = lower(vec![second], true, None);
+    let groups = commands
+        .iter()
+        .filter_map(|command| match &command.kind {
+            CommandKind::GroupedExpert {
+                control,
+                row_map,
+                reuse_routing,
+                ..
+            } => Some((*control, *row_map, *reuse_routing)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(groups.len(), 2);
+    assert!(!groups[0].2);
+    assert!(groups[1].2);
+    assert_eq!(groups[0].0, groups[1].0);
+    assert_eq!(groups[0].1, groups[1].1);
+}
+
+#[test]
+fn grouped_experts_gather_repeated_routes_from_compact_rows() {
+    let rows = Node::new(NodeKind::Reshape {
+        a: input(0, &[2, 5], DType::BF16),
+        shape: vec![1, 2, 5],
+    })
+    .unwrap();
+    let routed = Node::new(NodeKind::BroadcastTo {
+        a: rows,
+        shape: vec![3, 2, 5],
+    })
+    .unwrap();
+    let expanded = Node::new(NodeKind::Reshape {
+        a: routed,
+        shape: vec![6, 5],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: expanded,
+        weight: input(1, &[4, 7, 5], DType::BF16),
+        indexes: input(2, &[6], DType::U32),
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let CommandKind::GroupedExpert {
+        x,
+        rows,
+        inner,
+        source_rows,
+        ..
+    } = &commands
+        .iter()
+        .find(|command| matches!(command.kind, CommandKind::GroupedExpert { .. }))
+        .expect("grouped expert command")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!((*rows, *inner, *source_rows), (6, 5, 2));
+    assert_eq!(program.values[x.index()].shape, [1, 2, 5]);
+    assert!(!commands.iter().any(|command| {
+        matches!(
+            command.kind,
+            CommandKind::Kernel {
+                name: "et_reindex",
+                ..
+            }
+        ) && command
+            .output
+            .is_some_and(|output| program.values[output.index()].shape == [3, 2, 5])
+    }));
+}
+
+#[test]
+fn grouped_experts_materialize_general_broadcast_inputs() {
+    let broadcast = Node::new(NodeKind::BroadcastTo {
+        a: input(0, &[1, 2], DType::BF16),
+        shape: vec![4, 2],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::GroupedExpertLinearRows {
+        x: broadcast,
+        weight: input(1, &[3, 2, 2], DType::BF16),
+        indexes: input(2, &[4], DType::U32),
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let CommandKind::GroupedExpert {
+        x,
+        rows,
+        source_rows,
+        ..
+    } = &commands
+        .iter()
+        .find(|command| matches!(command.kind, CommandKind::GroupedExpert { .. }))
+        .expect("grouped expert command")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!((*rows, *source_rows), (4, 4));
+    assert_eq!(program.values[x.index()].shape, [4, 2]);
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command.kind,
+            CommandKind::Kernel {
+                name: "et_reindex",
+                ..
+            }
+        ) && command
+            .output
+            .is_some_and(|output| program.values[output.index()].shape == [4, 2])
+    }));
+}
+
+#[test]
+fn rms_norm_reads_outer_permutation_as_a_row_view() {
+    let source = input(0, &[1, 2, 3, 5], DType::BF16);
+    let permuted = Node::new(NodeKind::Permute {
+        a: source,
+        dims: vec![0, 2, 1, 3],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::RmsNorm {
+        x: permuted,
+        weight: Some(input(1, &[5], DType::BF16)),
+        eps: 1e-6,
+    })
+    .unwrap();
+    let (_, commands, _, _, _) = lower(vec![root], true, None);
+    assert!(!commands.iter().any(|command| matches!(
+        command.kind,
+        CommandKind::Kernel {
+            name: "et_reindex",
+            ..
+        }
+    )));
+    let CommandKind::Kernel { args, .. } = &commands
+        .iter()
+        .find(|command| {
+            matches!(
+                command.kind,
+                CommandKind::Kernel {
+                    name: "et_rms_norm_f32",
+                    ..
+                }
+            )
+        })
+        .expect("RMS command")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(&args.integers[..9], &[5, 3, 0, 1, 3, 2, 6, 1, 3]);
+
+    let f64_source = input(0, &[1, 2, 3, 5], DType::F64);
+    let f64_permuted = Node::new(NodeKind::Permute {
+        a: f64_source,
+        dims: vec![0, 2, 1, 3],
+    })
+    .unwrap();
+    let f64_root = Node::new(NodeKind::RmsNorm {
+        x: f64_permuted,
+        weight: None,
+        eps: 1e-6,
+    })
+    .unwrap();
+    let (_, f64_commands, _, _, _) = lower(vec![f64_root], true, None);
+    assert!(f64_commands.iter().any(|command| matches!(
+        command.kind,
+        CommandKind::Kernel {
+            name: "et_reindex",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn rotary_half_reindex_folds_slices_negation_and_concat() {
+    let source = input(0, &[2, 3, 8], DType::BF16);
+    let first = Node::new(NodeKind::Slice {
+        a: source.clone(),
+        ranges: vec![(0, 2, 1), (0, 3, 1), (0, 4, 1)],
+    })
+    .unwrap();
+    let second = Node::new(NodeKind::Slice {
+        a: source.clone(),
+        ranges: vec![(0, 2, 1), (0, 3, 1), (4, 8, 1)],
+    })
+    .unwrap();
+    let negative = Node::new(NodeKind::Neg { a: second }).unwrap();
+    let root = Node::new(NodeKind::Concat {
+        a: negative,
+        b: first,
+        dim: 2,
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let rotary = commands
+        .iter()
+        .find(|command| {
+            matches!(
+                command.kind,
+                CommandKind::Kernel {
+                    name: "et_rotary_reindex",
+                    ..
+                }
+            )
+        })
+        .expect("rotary reindex command");
+    let CommandKind::Kernel { args, inputs, .. } = &rotary.kind else {
+        unreachable!()
+    };
+    assert_eq!(args.integers[0], 8);
+    assert_eq!(program.values[inputs[0].unwrap().index()].shape, [2, 3, 8]);
+    let kernels = commands
+        .iter()
+        .filter_map(|command| match &command.kind {
+            CommandKind::Kernel { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !kernels
+            .iter()
+            .any(|name| matches!(*name, "et_reindex" | "et_unary" | "et_concat")),
+        "{kernels:?}"
+    );
+}
+
+#[test]
+fn scatter_add_uses_compact_indexes_for_an_inner_broadcast() {
+    let compact = input(1, &[2, 3], DType::U32);
+    let columns = Node::new(NodeKind::Reshape {
+        a: compact.clone(),
+        shape: vec![2, 3, 1],
+    })
+    .unwrap();
+    let indexes = Node::new(NodeKind::BroadcastTo {
+        a: columns,
+        shape: vec![2, 3, 5],
+    })
+    .unwrap();
+    let root = Node::new(NodeKind::ScatterAdd {
+        a: input(0, &[2, 3, 5], DType::BF16),
+        dim: 1,
+        indexes,
+        src: input(2, &[2, 3, 5], DType::BF16),
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![root], true, None);
+    let CommandKind::Kernel { name, inputs, .. } = &commands
+        .iter()
+        .find(|command| {
+            matches!(
+                command.kind,
+                CommandKind::Kernel {
+                    name: "et_scatter_add_inner",
+                    ..
+                }
+            )
+        })
+        .expect("compact scatter kernel")
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(*name, "et_scatter_add_inner");
+    assert_eq!(program.values[inputs[1].unwrap().index()].shape, [2, 3]);
+    assert!(!commands.iter().any(|command| {
+        matches!(
+            command.kind,
+            CommandKind::Kernel {
+                name: "et_reindex",
+                ..
+            }
+        ) && command
+            .output
+            .is_some_and(|output| program.values[output.index()].shape == [2, 3, 5])
+    }));
+    assert_eq!(compact.shape, [2, 3]);
+}
+
+#[test]
+fn expert_rows_keep_native_banks_and_u64_geometry_without_tensor_scratch() {
+    for optimize in [false, true] {
+        for dtype in [DType::F32, DType::BF16] {
+            for (rows, experts, columns, inner) in [
+                (64, 3, 13, 65),
+                (1, 2, 65536, 65536), // Bank spans more than 2^32 elements.
+                (u32::MAX as usize + 1, 1, 1, 0), // Row/grid arithmetic is also u64.
+                (3, 2, 0, 13),        // Route validation still launches when O=0.
+                (0, 2, 13, 65),
+            ] {
+                let root = Node::new(NodeKind::ExpertLinearRows {
+                    x: input(0, &[rows, inner], dtype),
+                    weight: input(1, &[experts, columns, inner], dtype),
+                    indexes: input(2, &[rows], DType::U32),
+                })
+                .unwrap();
+                // This direct F32 dot kernel does not require tensor core hardware.
+                let (program, commands, memory, count, bytes) =
+                    lower_with(vec![root], optimize, None, false);
+                assert_eq!((count, bytes), (0, 0));
+                let CommandKind::Kernel {
+                    name,
+                    args,
+                    inputs,
+                    scratch,
+                    ..
+                } = &commands
+                    .iter()
+                    .find(|command| {
+                        matches!(
+                            command.kind,
+                            CommandKind::Kernel {
+                                name: "et_expert_linear_rows",
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap()
+                    .kind
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*name, "et_expert_linear_rows");
+                assert_eq!(
+                    &args.integers[..4],
+                    &[rows as u64, columns as u64, inner as u64, experts as u64]
+                );
+                assert_eq!(args.elements, (rows * columns) as u64);
+                assert!(scratch.iter().all(Option::is_none));
+                let weight = inputs[1].unwrap();
+                assert_eq!(
+                    program.values[weight.index()].decl.bytes,
+                    experts * columns * inner * dtype.size_in_bytes()
+                );
+                assert!(matches!(
+                    memory.locations[weight.index()],
+                    Location::External { slot: 1 }
+                ));
+                assert_eq!(
+                    &args.input_dtypes[..3],
+                    &[dtype_code(dtype), dtype_code(dtype), dtype_code(DType::U32)]
+                );
+                assert_eq!(args.output_dtype, dtype_code(dtype));
+                assert_eq!(
+                    program.values[program.outputs[0].index()].decl.bytes,
+                    rows * columns * dtype.size_in_bytes()
+                );
+                assert!(!program
+                    .values
+                    .iter()
+                    .any(|value| value.decl.name.starts_with("scratch")));
+                let statuses: Vec<_> = program
+                    .values
+                    .iter()
+                    .filter(|value| value.decl.name.starts_with("status"))
+                    .collect();
+                assert_eq!(statuses.len(), 1);
+                assert_eq!(statuses[0].decl.bytes, 8);
+                assert_eq!(
+                    crate::executable::physical_counts(&program, &commands).0,
+                    2 + usize::from(rows != 0)
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -651,18 +1241,48 @@ fn zero_dimensions_have_an_explicit_materialized_legalization() {
 }
 
 #[test]
-fn physical_diagnostics_include_status_transfers_and_host_waits() {
+fn infallible_physical_diagnostics_omit_status_transfers_and_host_waits() {
     for elements in [0, 6] {
         let x = input(0, &[elements], DType::F32);
         let root = Node::new(NodeKind::Mul { a: x.clone(), b: x }).unwrap();
         let (program, commands, _, _, _) = lower(vec![root], false, None);
-        // Reset status, launch only for nonempty outputs, read status, then
-        // complete the stream before publishing results.
+        // Infallible arithmetic only launches for nonempty outputs. The final
+        // stream completion still precedes result publication.
         assert_eq!(
             crate::executable::physical_counts(&program, &commands),
-            (2 + usize::from(elements != 0), 2)
+            (usize::from(elements != 0), 1)
         );
     }
+}
+
+#[test]
+fn checked_kernels_share_one_deferred_status_and_final_completion() {
+    let values = input(0, &[4], DType::F32);
+    let indexes = input(1, &[2], DType::U32);
+    let first = Node::new(NodeKind::Gather {
+        a: values.clone(),
+        indexes: indexes.clone(),
+        dim: 0,
+    })
+    .unwrap();
+    let second = Node::new(NodeKind::Gather {
+        a: values,
+        indexes,
+        dim: 0,
+    })
+    .unwrap();
+    let (program, commands, _, _, _) = lower(vec![first, second], false, None);
+    let statuses = program
+        .values
+        .iter()
+        .filter(|value| value.decl.name.starts_with("status"))
+        .collect::<Vec<_>>();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].decl.bytes, 8);
+    assert_eq!(
+        crate::executable::physical_counts(&program, &commands),
+        (4, 1)
+    );
 }
 
 #[test]
@@ -684,7 +1304,35 @@ fn bf16_matmul_partial_broadcast_falls_back_to_f32() {
 }
 
 #[test]
-fn scalar_coercion_rounds_to_half_before_widening() {
+fn rms_norm_converts_half_storage_inside_the_kernel() {
+    let x = input(0, &[3, 2816], DType::BF16);
+    let weight = input(1, &[2816], DType::BF16);
+    let root = Node::new(NodeKind::RmsNorm {
+        x,
+        weight: Some(weight),
+        eps: 1e-6,
+    })
+    .unwrap();
+    let (_, commands, _, count, _) = lower(vec![root], false, None);
+    assert_eq!(count, 0);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(command.kind, CommandKind::Kernel { .. }))
+            .count(),
+        1
+    );
+    assert!(commands.iter().any(|command| matches!(
+        command.kind,
+        CommandKind::Kernel {
+            name: "et_rms_norm_f32",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn scalar_coercion_rounds_to_half_before_inline_opmath() {
     let tensor = input(0, &[1], DType::BF16);
     let scalar = input(1, &[], DType::F32);
     let root = Node::new(NodeKind::Mul {
@@ -693,7 +1341,7 @@ fn scalar_coercion_rounds_to_half_before_widening() {
     })
     .unwrap();
     let (program, commands, _, count, _) = lower(vec![root], false, None);
-    assert_eq!(count, 4);
+    assert_eq!(count, 1);
     let scalar_conversions = commands
         .iter()
         .filter_map(|command| match &command.kind {
@@ -712,10 +1360,35 @@ fn scalar_coercion_rounds_to_half_before_widening() {
             )
         })
         .collect::<Vec<_>>();
+    assert_eq!(scalar_conversions, [(DType::F32, DType::BF16)]);
+}
+
+#[test]
+fn binary_broadcast_source_geometry_preserves_contiguous_scalar_and_row_indexes() {
+    use crate::lowering::binary_source_geometry;
+    assert_eq!(binary_source_geometry(&[], &[]), (1, 0));
     assert_eq!(
-        scalar_conversions,
-        [(DType::F32, DType::BF16), (DType::BF16, DType::F32)]
+        binary_source_geometry(&[1, 256, 262144], &[1, 256, 262144]),
+        (1, 0)
     );
+    assert_eq!(binary_source_geometry(&[1, 256, 262144], &[]), (2, 0));
+    assert_eq!(
+        binary_source_geometry(&[1, 256, 262144], &[1, 1, 1]),
+        (2, 0)
+    );
+    assert_eq!(
+        binary_source_geometry(&[1, 256, 262144], &[1, 256, 1]),
+        (4, 18)
+    );
+    assert_eq!(
+        binary_source_geometry(&[1, 256, 262144], &[256, 1]),
+        (4, 18)
+    );
+    assert_eq!(binary_source_geometry(&[2, 7, 2816], &[2, 7, 1]), (3, 2816));
+    assert_eq!(binary_source_geometry(&[2, 7, 2816], &[1, 7, 1]), (0, 0));
+    assert_eq!(binary_source_geometry(&[2, 7, 2816], &[7, 1]), (0, 0));
+    assert_eq!(binary_source_geometry(&[2, 7, 2816], &[2816]), (0, 0));
+    assert_eq!(binary_source_geometry(&[2, 7, 0], &[2, 7, 1]), (0, 0));
 }
 
 #[test]
@@ -872,6 +1545,7 @@ fn kv_state_and_transaction_bytes_follow_configured_storage() {
             layer: 0,
             window: None,
             mode: effect_torch_graph::KvAttentionMode::Causal,
+            rounding: effect_torch_graph::AttentionRounding::Fused,
         })
         .unwrap();
         let layout = CudaStateLayout {
@@ -879,6 +1553,14 @@ fn kv_state_and_transaction_bytes_follow_configured_storage() {
             dtype,
             slots: 2,
             packed_rows_per_sequence: None,
+            access: effect_torch_runtime::StateAccessMode::Append,
+            kv_layers: vec![effect_torch_runtime::KvLayerDescriptor {
+                layer_id: 0,
+                kv_heads: 2,
+                head_dim: 8,
+                dtype,
+                retention: None,
+            }],
         };
         let (program, commands, memory, _, _) = lower(vec![root], false, Some(layout));
         let expected = 2 * 2 * 16 * 2 * 8 * dtype.size_in_bytes()
@@ -916,16 +1598,20 @@ fn kv_state_and_transaction_bytes_follow_configured_storage() {
             .map(|v| v.decl.bytes)
             .sum::<usize>();
         assert_eq!(state_bytes, expected);
-        assert_eq!(staging_bytes, expected);
+        // A one-row private tail replaces the old whole-cache transaction.
+        assert_eq!(staging_bytes, expected / 16);
         assert!(memory
             .segments
             .iter()
             .any(|s| s.ownership == SegmentOwnership::StateTransaction));
-        let commits = commands
+        let state_copies = commands
             .iter()
-            .filter(|c| matches!(c.kind, CommandKind::StateCopy { commit: true, .. }))
+            .filter(|c| matches!(c.kind, CommandKind::Prepare))
             .count();
-        assert_eq!(commits, if dtype == DType::U8 { 4 } else { 2 });
+        assert_eq!(
+            state_copies, 1,
+            "only scratch/status preparation is submitted"
+        );
     }
 }
 
@@ -944,4 +1630,899 @@ fn every_dense_dtype_has_one_exact_allocation() {
         assert_eq!(program.values.len(), 1);
         assert_eq!(program.values[0].decl.bytes, 15 * dtype.size_in_bytes());
     }
+}
+
+#[test]
+#[ignore = "CPU-only; requires EFFECT_TORCH_CUDA_EXPERT_GEMV=1 and split-K flags disabled"]
+fn gemv_only_lowering_plans_second_projection_descriptors() {
+    assert_eq!(
+        std::env::var("EFFECT_TORCH_CUDA_EXPERT_GEMV").as_deref(),
+        Ok("1")
+    );
+    for key in [
+        "EFFECT_TORCH_CUDA_EXPERT_SPLITK",
+        "EFFECT_TORCH_CUDA_EXPERT_GROUPED_PARTIALS",
+    ] {
+        assert!(!std::env::var(key).is_ok_and(|value| value == "1"));
+    }
+    let ordinary = CUBLAS_WORKSPACE_BYTES * EXPERT_BLAS_STREAMS + EXPERT_GROUPED_POINTER_BYTES;
+    for (rows, columns, inner, expected_custom) in [
+        (2, 1408, 2816, false),
+        (2, 2816, 704, true),
+        (0, 2816, 704, false),
+        (2, 2816, 705, false),
+    ] {
+        let root = Node::new(NodeKind::GroupedExpertLinearRows {
+            x: input(0, &[rows, inner], DType::BF16),
+            weight: input(1, &[128, columns, inner], DType::BF16),
+            indexes: input(2, &[rows], DType::U32),
+        })
+        .unwrap();
+        let (program, commands, _, _, _) = lower(vec![root], false, None);
+        let grouped = commands
+            .iter()
+            .find_map(|command| match &command.kind {
+                CommandKind::GroupedExpert {
+                    splitk_workspace,
+                    workspace,
+                    ..
+                } => Some((*splitk_workspace, *workspace)),
+                _ => None,
+            })
+            .expect("full lowering must emit the grouped expert command");
+        assert_eq!(grouped.0, expected_custom, "shape={rows}/{columns}/{inner}");
+        if rows == 0 {
+            assert!(grouped.1.is_none());
+        } else {
+            let workspace = grouped.1.expect("BF16 grouped command needs a workspace");
+            assert_eq!(
+                program.values[workspace.index()].decl.bytes,
+                ordinary + usize::from(expected_custom) * EXPERT_SPLITK_DESCRIPTOR_BYTES,
+                "GEMV-only lowering must not allocate split-K partials"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_binary_lowering_preserves_physical_types_and_original_status_planning() {
+    for (enabled, rhs, expected) in [
+        (true, vec![257], "et_binary_fixed_2_3_3_3_1"),
+        (true, vec![1], "et_binary_fixed_2_3_3_3_2"),
+        (false, vec![257], "et_binary"),
+    ] {
+        let root = Node::new(NodeKind::Mul {
+            a: input(0, &[257], DType::BF16),
+            b: input(1, &rhs, DType::BF16),
+        })
+        .unwrap();
+        let prepared = ProgramRequest::from_roots(
+            vec![root],
+            CompileOptions {
+                optimize: false,
+                ..Default::default()
+            },
+        )
+        .prepare()
+        .unwrap();
+        let caps = CudaCapabilities::new(0, 12, 0);
+        let mut driver = CompilerDriver::new(&prepared, &caps).unwrap();
+        let mut builder =
+            CudaProgramBuilder::new(&prepared.index, None, driver.legalization()).unwrap();
+        builder.typed_binary = enabled;
+        driver
+            .lower(|unit, index, optimization, plan| {
+                let LoweringUnit::Node(id) = unit else {
+                    panic!()
+                };
+                let node = index.node(id).unwrap();
+                let instruction = match &node.kind {
+                    NodeKind::Input { slot, .. } => Instruction::Input {
+                        binding: *slot as usize,
+                        scalar: false,
+                    },
+                    NodeKind::Mul { a, b } => Instruction::Binary {
+                        op: 2,
+                        a: index.dense_id(a.id).unwrap().index(),
+                        b: index.dense_id(b.id).unwrap().index(),
+                    },
+                    _ => panic!(),
+                };
+                builder.add(id, node, index, optimization, instruction, plan)
+            })
+            .unwrap();
+        let command = builder
+            .commands
+            .iter()
+            .find_map(|c| match &c.kind {
+                CommandKind::Kernel {
+                    name,
+                    args,
+                    checked,
+                    status,
+                    ..
+                } if *name == expected => Some((args, checked, status)),
+                _ => None,
+            })
+            .expect("missing specialized physical command");
+        assert_eq!(command.0.input_dtypes[..2], [3, 3]);
+        assert_eq!(command.0.output_dtype, 3);
+        assert_eq!(command.0.compute_dtype, 1);
+        assert!(!command.1);
+        assert!(command.2.is_none());
+    }
+}
+
+#[test]
+#[ignore = "CPU-only; requires EXPERT_GEMV_OVERLAP=1 and a configured merged PTX path"]
+fn gemv_overlap_lowering_declares_independent_second_projection_bank() {
+    assert!(crate::device::expert_gemv_overlap::enabled());
+    assert!(std::env::var("EFFECT_TORCH_CUDA_EXPERT_MERGED_PTX").is_ok_and(|v| !v.is_empty()));
+    for key in [
+        "EFFECT_TORCH_CUDA_EXPERT_SPLITK",
+        "EFFECT_TORCH_CUDA_EXPERT_GROUPED_PARTIALS",
+    ] {
+        assert!(std::env::var(key).as_deref() != Ok("1"));
+    }
+    let base = CUBLAS_WORKSPACE_BYTES * EXPERT_BLAS_STREAMS + EXPERT_GROUPED_POINTER_BYTES;
+    for (rows, columns, inner, banks) in [
+        (2, 1408, 2816, 1),
+        (2, 2816, 704, 2),
+        (0, 2816, 704, 0),
+        (2, 2816, 705, 0),
+    ] {
+        let root = Node::new(NodeKind::GroupedExpertLinearRows {
+            x: input(0, &[rows, inner], DType::BF16),
+            weight: input(1, &[128, columns, inner], DType::BF16),
+            indexes: input(2, &[rows], DType::U32),
+        })
+        .unwrap();
+        let (program, commands, _, _, _) = lower(vec![root], false, None);
+        let (custom, workspace) = commands
+            .iter()
+            .find_map(|c| match c.kind {
+                CommandKind::GroupedExpert {
+                    splitk_workspace,
+                    workspace,
+                    ..
+                } => Some((splitk_workspace, workspace)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(custom, banks != 0);
+        if rows == 0 {
+            assert!(workspace.is_none());
+        } else {
+            let bytes = program.values[workspace.unwrap().index()].decl.bytes;
+            assert_eq!(bytes, base + banks * EXPERT_SPLITK_DESCRIPTOR_BYTES);
+            if banks == 2 {
+                assert_eq!(
+                    crate::device::expert_gemv_overlap::descriptor_offset(256, bytes).unwrap(),
+                    base + EXPERT_SPLITK_DESCRIPTOR_BYTES
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn kv_bf16_inputs_preserve_f32_output_and_guard_other_realizations() {
+    use effect_torch_graph::{AttentionRounding, KvAttentionMode};
+    use effect_torch_runtime::{KvLayerDescriptor, StateAccessMode};
+    for dtype in [DType::BF16, DType::F16, DType::F32, DType::F64] {
+        for state_dtype in [DType::BF16, DType::F32] {
+            for stepwise in [false, true] {
+                for supported in [false, true] {
+                    let root = Node::new(NodeKind::KvAttention {
+                        q: input(0, &[1, 4, 3, 8], dtype),
+                        k: input(1, &[1, 2, 3, 8], dtype),
+                        v: input(2, &[1, 2, 3, 8], dtype),
+                        scale: 0.3,
+                        layer: 0,
+                        window: None,
+                        mode: KvAttentionMode::Causal,
+                        rounding: if stepwise {
+                            AttentionRounding::Stepwise
+                        } else {
+                            AttentionRounding::Fused
+                        },
+                    })
+                    .unwrap();
+                    let layout = CudaStateLayout {
+                        capacity: 16,
+                        dtype: state_dtype,
+                        slots: 1,
+                        packed_rows_per_sequence: None,
+                        access: StateAccessMode::Append,
+                        kv_layers: vec![KvLayerDescriptor {
+                            layer_id: 0,
+                            kv_heads: 2,
+                            head_dim: 8,
+                            dtype: state_dtype,
+                            retention: None,
+                        }],
+                    };
+                    let expected =
+                        dtype == DType::BF16 && state_dtype == DType::BF16 && stepwise && supported;
+                    let run = |enabled| {
+                        with_kv_bf16_input_test_policy(enabled, || {
+                            lower_with(vec![root.clone()], false, Some(layout.clone()), supported)
+                        })
+                    };
+                    let (_, off, _, off_count, _) = run(false);
+                    let (_, on, _, on_count, _) = run(true);
+                    assert_eq!(
+                        off_count - on_count,
+                        if expected { 3 } else { 0 },
+                        "{dtype:?} {state_dtype:?} stepwise={stepwise} supported={supported}"
+                    );
+                    let kernel = |commands: &[Command]| {
+                        commands
+                            .iter()
+                            .find_map(|command| match &command.kind {
+                                CommandKind::Kernel {
+                                    name: "et_kv_attention",
+                                    args,
+                                    kv_matmul,
+                                    ..
+                                } => Some((*args, kv_matmul.is_some())),
+                                _ => None,
+                            })
+                            .unwrap()
+                    };
+                    let (off_args, off_matmul) = kernel(&off);
+                    let (on_args, on_matmul) = kernel(&on);
+                    assert_eq!(off_matmul, on_matmul);
+                    assert_eq!(off_args.output_dtype, on_args.output_dtype);
+                    assert_eq!(off_args.compute_dtype, on_args.compute_dtype);
+                    if expected {
+                        assert!(on_matmul);
+                        assert_eq!(on_args.output_dtype, dtype_code(DType::F32));
+                        assert_eq!(&on_args.input_dtypes[..3], &[3; 3]);
+                        assert_eq!(on_count, 1);
+                    }
+                    let (_, direct, _, direct_count, _) =
+                        with_attention82_test_policy(true, || {
+                            // The82 flag implies operand inlining; the older flag
+                            // is independently disabled to check the actual option.
+                            with_kv_bf16_input_test_policy(false, || {
+                                lower_with(
+                                    vec![root.clone()],
+                                    false,
+                                    Some(layout.clone()),
+                                    supported,
+                                )
+                            })
+                        });
+                    let (direct_args, direct_matmul) = kernel(&direct);
+                    assert_eq!(off_count - direct_count, if expected { 4 } else { 0 });
+                    assert_eq!(direct_matmul, off_matmul);
+                    assert_eq!(direct_args.compute_dtype, off_args.compute_dtype);
+                    assert_eq!(
+                        direct_args.output_dtype,
+                        if expected { 3 } else { off_args.output_dtype }
+                    );
+                    if expected {
+                        assert_eq!(&direct_args.input_dtypes[..3], &[3; 3]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mean256_requires_exact_shape_axes_dtype_scalar_and_opt_in() {
+    for (shape, dims, keepdims, expected) in [
+        (vec![1, 256], vec![0, 1], false, true),
+        (vec![256], vec![0], false, false),
+        (vec![1, 255], vec![0, 1], false, false),
+        (vec![2, 256], vec![0, 1], false, false),
+        (vec![1, 256], vec![1], false, false),
+        (vec![1, 256], vec![0, 1], true, false),
+    ] {
+        for dtype in [DType::F32, DType::F64, DType::BF16] {
+            let root = Node::new(NodeKind::Mean {
+                a: input(0, &shape, dtype),
+                dims: dims.clone(),
+                keepdims,
+            })
+            .unwrap();
+            assert!(!mean256_eligible(&root, false));
+            assert_eq!(
+                mean256_eligible(&root, true),
+                expected && dtype == DType::F32
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA and EFFECT_TORCH_CUDA_MEAN256=1"]
+fn mean256_exact_special_values_views_concurrent_cancel_and_retained_outputs() {
+    use effect_torch_runtime::CancellationFlag;
+    assert_eq!(
+        std::env::var("EFFECT_TORCH_CUDA_MEAN256").as_deref(),
+        Ok("1")
+    );
+    let device = crate::CudaDevice::get(0).unwrap();
+    for view in 0..3 {
+        let input_shape = match view {
+            0 => vec![1, 256],
+            1 => vec![256, 1],
+            _ => vec![16, 16],
+        };
+        let source = input(0, &input_shape, DType::F32);
+        let source = if view == 0 {
+            source
+        } else {
+            let transposed = Node::new(NodeKind::Permute {
+                a: source,
+                dims: vec![1, 0],
+            })
+            .unwrap();
+            if view == 2 {
+                Node::new(NodeKind::Reshape {
+                    a: transposed,
+                    shape: vec![1, 256],
+                })
+                .unwrap()
+            } else {
+                transposed
+            }
+        };
+        let candidate = Node::new(NodeKind::Mean {
+            a: source.clone(),
+            dims: vec![0, 1],
+            keepdims: false,
+        })
+        .unwrap();
+        let reference = Node::new(NodeKind::Mean {
+            a: Node::new(NodeKind::Reshape {
+                a: source,
+                shape: vec![256],
+            })
+            .unwrap(),
+            dims: vec![0],
+            keepdims: false,
+        })
+        .unwrap();
+        let candidate = Arc::new(crate::compile(vec![candidate], 0).unwrap());
+        let reference = crate::compile(vec![reference], 0).unwrap();
+        assert!(candidate
+            .diagnostics()
+            .instructions
+            .iter()
+            .any(|i| i.kind == "et_mean256_f32"));
+        assert!(!reference
+            .diagnostics()
+            .instructions
+            .iter()
+            .any(|i| i.kind == "et_mean256_f32"));
+        let mut retained = Vec::new();
+        for pattern in 0..10 {
+            let bytes = (0..256)
+                .flat_map(|i| {
+                    let bits = match pattern {
+                        0 => (i as f32 / 255.).to_bits(),
+                        1 => {
+                            if i % 2 == 0 {
+                                0x3f800000
+                            } else {
+                                0xbf800000
+                            }
+                        }
+                        2 => {
+                            if i == 1 {
+                                0x4b800000
+                            } else if i == 16 {
+                                0xcb800000
+                            } else {
+                                0x3f800000
+                            }
+                        }
+                        3 => i as u32,
+                        4 => 0x80000000,
+                        5 => 0x7f7fffff,
+                        6 => {
+                            if i == 255 {
+                                0x7f800000
+                            } else {
+                                0x3f800000
+                            }
+                        }
+                        7 => {
+                            if i < 128 {
+                                0x7f800000
+                            } else {
+                                0xff800000
+                            }
+                        }
+                        8 => {
+                            if i == 127 {
+                                0x7fc01234
+                            } else {
+                                0x3f800000
+                            }
+                        }
+                        _ => {
+                            if i == 255 {
+                                0xff801234
+                            } else {
+                                0x3f800000
+                            }
+                        }
+                    };
+                    bits.to_le_bytes()
+                })
+                .collect::<Vec<_>>();
+            let input = crate::CudaValue::from_dense_bytes(
+                device.clone(),
+                input_shape.clone(),
+                DType::F32,
+                &bytes,
+            )
+            .unwrap();
+            let reference_outputs = reference
+                .execute(std::slice::from_ref(&input), &[], &CancellationFlag::new())
+                .unwrap();
+            let expected = reference_outputs[0].read_storage_bytes().unwrap();
+            if view == 0 {
+                use cudarc::driver::{LaunchConfig, PushKernelArg};
+                let poison = expected.iter().map(|byte| byte ^ 0xff).collect::<Vec<_>>();
+                let direct =
+                    crate::CudaValue::from_dense_bytes(device.clone(), vec![], DType::F32, &poison)
+                        .unwrap();
+                let mut args = CudaKernelArgs {
+                    output: direct.storage_address(),
+                    elements: 1,
+                    output_dtype: 1,
+                    compute_dtype: 1,
+                    ..Default::default()
+                };
+                args.inputs[0] = input.storage_address();
+                args.input_dtypes[0] = 1;
+                let mut launch = device
+                    .stream
+                    .launch_builder(device.kernel("et_mean256_f32").unwrap());
+                launch.arg(&args);
+                unsafe {
+                    launch.launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .unwrap();
+                assert_eq!(direct.read_storage_bytes().unwrap(), expected);
+            }
+            let actual = candidate
+                .execute(std::slice::from_ref(&input), &[], &CancellationFlag::new())
+                .unwrap();
+            assert_eq!(
+                actual[0].read_storage_bytes().unwrap(),
+                expected,
+                "view={view} pattern={pattern}"
+            );
+            drop(reference_outputs);
+            retained.push((actual, expected));
+            let cancelled = CancellationFlag::new();
+            cancelled.cancel();
+            assert!(candidate
+                .execute(std::slice::from_ref(&input), &[], &cancelled)
+                .is_err());
+            if pattern == 0 {
+                let barrier = Arc::new(std::sync::Barrier::new(3));
+                let mut workers = Vec::new();
+                for _ in 0..2 {
+                    let executable = candidate.clone();
+                    let input = input.clone();
+                    let barrier = barrier.clone();
+                    workers.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        executable
+                            .execute(&[input], &[], &CancellationFlag::new())
+                            .unwrap()
+                    }));
+                }
+                barrier.wait();
+                for worker in workers {
+                    let outputs = worker.join().unwrap();
+                    assert_eq!(
+                        outputs[0].read_storage_bytes().unwrap(),
+                        retained.last().unwrap().1
+                    );
+                }
+            }
+        }
+        drop(candidate);
+        drop(reference);
+        for (actual, expected) in retained {
+            assert_eq!(actual[0].read_storage_bytes().unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn kv_pair_real_lowering_reports_dependency_safe_coverage() {
+    let x = input(0, &[1, 256, 2816], DType::BF16);
+    let projection = |slot| {
+        let w = input(slot, &[2048, 2816], DType::BF16);
+        let wt = Node::new(NodeKind::Permute {
+            a: w,
+            dims: vec![1, 0],
+        })
+        .unwrap();
+        Node::new(NodeKind::Matmul {
+            a: x.clone(),
+            b: wt,
+        })
+        .unwrap()
+    };
+    let (mut program, mut commands, _, _, _) =
+        lower(vec![projection(1), projection(2)], true, None);
+    let count = crate::kv_pair::fuse(&mut program, &mut commands).unwrap();
+    eprintln!(
+        "kv pair independent projections coverage={count}; schedule={:?}",
+        program
+            .instructions
+            .iter()
+            .map(|i| i.kind)
+            .collect::<Vec<_>>()
+    );
+    // Coverage is diagnostic until model scheduling is measured. Liveness must
+    // remain valid even when late weight bindings prevent this conservative pass.
+    effect_torch_compiler::analyze_liveness(&program).unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn kv_pair_keeps_existing_normalization_consumers_in_order() {
+    for case in 0..6 {
+        let x = input(0, &[1, 256, 2816], DType::BF16);
+        let projection = |slot| {
+            let w = input(slot, &[2048, 2816], DType::BF16);
+            let wt = Node::new(NodeKind::Permute {
+                a: w,
+                dims: vec![1, 0],
+            })
+            .unwrap();
+            let projected = Node::new(NodeKind::Matmul {
+                a: x.clone(),
+                b: wt,
+            })
+            .unwrap();
+            Node::new(NodeKind::RmsNorm {
+                x: projected,
+                weight: None,
+                eps: 1e-6,
+            })
+            .unwrap()
+        };
+        let (mut program, mut commands, _, _, _) =
+            lower(vec![projection(1), projection(2)], true, None);
+        let norms_before = program
+            .instructions
+            .iter()
+            .filter(|i| i.kind == "et_rms_norm_f32")
+            .map(|i| (i.inputs.clone(), i.outputs.clone()))
+            .collect::<Vec<_>>();
+        let norm = commands
+            .iter()
+            .position(|c| {
+                matches!(
+                    c.kind,
+                    CommandKind::Kernel {
+                        name: "et_rms_norm_f32",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        match case {
+            1 => {
+                if let CommandKind::Kernel { checked, .. } = &mut commands[norm].kind {
+                    *checked = true;
+                }
+            }
+            2 => {
+                if let CommandKind::Kernel { status, .. } = &mut commands[norm].kind {
+                    *status = Some(ValueId::new(0));
+                }
+            }
+            3 => {
+                if let CommandKind::Kernel { name, .. } = &mut commands[norm].kind {
+                    *name = "et_random_f32";
+                }
+            }
+            4 => program.instructions[norm].effects.has_side_effects = true,
+            5 => {
+                let value = commands
+                    .iter()
+                    .filter_map(|c| {
+                        if let CommandKind::Gemm { weight, .. } = c.kind {
+                            Some(weight)
+                        } else {
+                            None
+                        }
+                    })
+                    .nth(1)
+                    .unwrap();
+                program.instructions[norm].scratch =
+                    vec![effect_torch_compiler::ValueUse::read_write(value)].into_boxed_slice();
+            }
+            _ => {}
+        }
+        let count = crate::kv_pair::fuse(&mut program, &mut commands).unwrap();
+        assert_eq!(count, usize::from(case == 0), "barrier case {case}");
+        if case == 0 {
+            let norms_after = program
+                .instructions
+                .iter()
+                .filter(|i| i.kind == "et_rms_norm_f32")
+                .map(|i| (i.inputs.clone(), i.outputs.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(norms_before, norms_after);
+            effect_torch_compiler::analyze_liveness(&program).unwrap();
+            effect_torch_compiler::plan_memory(
+                &program,
+                &MemoryPlannerConfig::uniform(CudaMemorySpace::Device, usize::MAX / 2, 256, 256),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn vnorm_store_lowering_retains_raw_alias_lifetime_and_decomposes_unsupported_views() {
+    use effect_torch_runtime::{KvLayerDescriptor, StateAccessMode};
+    for (heads, dim) in [(8, 256), (2, 512)] {
+        for tokens in [64, 256] {
+            for variant in 0..9 {
+                let raw_shape = if variant == 1 {
+                    [1, heads, tokens, dim]
+                } else if variant == 7 {
+                    [1, tokens + 1, heads, dim]
+                } else if variant == 8 {
+                    [1, tokens * 2, heads, dim]
+                } else {
+                    [1, tokens, heads, dim]
+                };
+                let raw = input(2, &raw_shape, DType::BF16);
+                let view = if variant == 1 {
+                    raw.clone()
+                } else {
+                    Node::new(NodeKind::Permute {
+                        a: if variant == 7 || variant == 8 {
+                            Node::new(NodeKind::Slice {
+                                a: raw.clone(),
+                                ranges: vec![
+                                    (0, 1, 1),
+                                    if variant == 7 {
+                                        (1, tokens + 1, 1)
+                                    } else {
+                                        (0, tokens * 2, 2)
+                                    },
+                                    (0, heads, 1),
+                                    (0, dim, 1),
+                                ],
+                            })
+                            .unwrap()
+                        } else {
+                            raw.clone()
+                        },
+                        dims: vec![0, 2, 1, 3],
+                    })
+                    .unwrap()
+                };
+                let normalized = Node::new(NodeKind::RmsNorm {
+                    x: view.clone(),
+                    weight: if variant == 2 {
+                        Some(input(3, &[dim], DType::BF16))
+                    } else {
+                        None
+                    },
+                    eps: if variant == 3 { 1e-5 } else { 1e-6 },
+                })
+                .unwrap();
+                let root = Node::new(NodeKind::KvAttention {
+                    q: input(0, &[1, 16, tokens, dim], DType::BF16),
+                    k: if variant == 6 {
+                        Node::new(NodeKind::RmsNorm {
+                            x: view,
+                            weight: Some(input(1, &[dim], DType::BF16)),
+                            eps: 1e-6,
+                        })
+                        .unwrap()
+                    } else {
+                        input(1, &[1, heads, tokens, dim], DType::BF16)
+                    },
+                    v: normalized.clone(),
+                    scale: 1.,
+                    layer: 0,
+                    window: None,
+                    mode: effect_torch_graph::KvAttentionMode::BidirectionalBlock,
+                    rounding: effect_torch_graph::AttentionRounding::Stepwise,
+                })
+                .unwrap();
+                let mut roots = vec![root, raw];
+                if variant == 4 {
+                    roots.push(normalized);
+                }
+                let layout = CudaStateLayout {
+                    capacity: 1024,
+                    dtype: if variant == 5 {
+                        DType::F32
+                    } else {
+                        DType::BF16
+                    },
+                    slots: 1,
+                    packed_rows_per_sequence: None,
+                    access: StateAccessMode::ReadOnly,
+                    kv_layers: vec![KvLayerDescriptor {
+                        layer_id: 0,
+                        kv_heads: heads,
+                        head_dim: dim,
+                        dtype: if variant == 5 {
+                            DType::F32
+                        } else {
+                            DType::BF16
+                        },
+                        retention: None,
+                    }],
+                };
+                let (program, commands, _, _, _) =
+                    crate::vnorm_store::with_test_policy(true, || lower(roots, true, Some(layout)));
+                let fused = commands
+                    .iter()
+                    .filter_map(|c| match &c.kind {
+                        CommandKind::Kernel {
+                            kv_matmul: Some(p),
+                            inputs,
+                            status,
+                            checked,
+                            ..
+                        } if p.vnorm_store.is_some() => Some((inputs, status, checked)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    fused.len(),
+                    usize::from(variant == 0 || variant >= 6),
+                    "H{heads} T{tokens} variant{variant}"
+                );
+                if let Some((inputs, status, checked)) = fused.first() {
+                    assert!(**checked);
+                    assert!(status.is_some());
+                    assert!(inputs[6].is_some());
+                    assert!(inputs[2].is_none());
+                    if variant >= 7 {
+                        // Slice is materialized before the supported permute view;
+                        // fusion reads that dense copy, never the offset/strided raw input.
+                        assert!(commands.iter().any(|c| matches!(
+                            c.kind,
+                            CommandKind::Kernel {
+                                name: "et_reindex",
+                                ..
+                            }
+                        )));
+                    }
+
+                    let instruction = program
+                        .instructions
+                        .iter()
+                        .find(|i| i.kind == "kv_stepwise_bf16_gemm_vnorm_store")
+                        .unwrap();
+                    assert!(instruction.effects.has_side_effects && instruction.effects.may_fail);
+                    assert!(instruction
+                        .inputs
+                        .iter()
+                        .any(|u| Some(u.value) == inputs[6]));
+                    assert_eq!(
+                        program
+                            .instructions
+                            .iter()
+                            .filter(|i| i.kind == "et_rms_norm_f32")
+                            .count(),
+                        usize::from(variant == 6)
+                    );
+                } else {
+                    assert!(program
+                        .instructions
+                        .iter()
+                        .any(|i| i.kind == "et_rms_norm_f32"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn norm_rope_classification_preserves_genuinely_checked_kernels() {
+    let args = CudaKernelArgs::default();
+    assert!(!kernel_can_report_error("et_norm_rope_bf16", &args));
+    assert!(kernel_can_report_error("et_top_k_indices", &args));
+    let mut index = args;
+    index.operation = 3;
+    assert!(kernel_can_report_error("et_index", &index));
+    let mut integer_div = args;
+    integer_div.compute_dtype = 5;
+    integer_div.operation = 3;
+    assert!(kernel_can_report_error("et_binary", &integer_div));
+    assert!(kernel_can_report_error("unknown_kernel", &args));
+}
+
+#[test]
+fn kv_pair_norm_rope_classification_allows_proved_pure_gap() {
+    let x = input(0, &[1, 256, 2816], DType::BF16);
+    let projection = |slot| {
+        let w = input(slot, &[2048, 2816], DType::BF16);
+        let wt = Node::new(NodeKind::Permute {
+            a: w,
+            dims: vec![1, 0],
+        })
+        .unwrap();
+        let projected = Node::new(NodeKind::Matmul {
+            a: x.clone(),
+            b: wt,
+        })
+        .unwrap();
+        Node::new(NodeKind::RmsNorm {
+            x: projected,
+            weight: None,
+            eps: 1e-6,
+        })
+        .unwrap()
+    };
+    let (mut program, mut commands, _, _, _) =
+        lower(vec![projection(1), projection(2)], true, None);
+    let norm = commands
+        .iter()
+        .position(|c| {
+            matches!(
+                c.kind,
+                CommandKind::Kernel {
+                    name: "et_rms_norm_f32",
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    // Schedule-only fixture: preserve the real producer/consumer IDs and use
+    // the audited NormRoPE error contract. This does not execute RMS arguments
+    // as NormRoPE or claim a numerical NormRoPE test.
+    let CommandKind::Kernel {
+        name,
+        args,
+        checked,
+        status,
+        ..
+    } = &mut commands[norm].kind
+    else {
+        unreachable!()
+    };
+    *name = "et_norm_rope_bf16";
+    *checked = kernel_can_report_error(name, args);
+    assert!(!*checked);
+    assert!(status.is_none());
+    program.instructions[norm].kind = "et_norm_rope_bf16";
+    let inputs = program.instructions[norm].inputs.clone();
+    let outputs = program.instructions[norm].outputs.clone();
+    assert_eq!(
+        crate::kv_pair::fuse(&mut program, &mut commands).unwrap(),
+        1
+    );
+    let preserved = program
+        .instructions
+        .iter()
+        .find(|i| i.kind == "et_norm_rope_bf16")
+        .unwrap();
+    assert_eq!(preserved.inputs, inputs);
+    assert_eq!(preserved.outputs, outputs);
+    effect_torch_compiler::analyze_liveness(&program).unwrap();
+    effect_torch_compiler::plan_memory(
+        &program,
+        &MemoryPlannerConfig::uniform(CudaMemorySpace::Device, usize::MAX / 2, 256, 256),
+    )
+    .unwrap();
 }

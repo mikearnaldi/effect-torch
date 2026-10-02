@@ -1,0 +1,59 @@
+{
+  "name": "@effect-torch/serve",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./Decision": "./src/Decision.ts",
+    "./DecisionPlanner": "./src/DecisionPlanner.ts",
+    "./DecisionReadout": "./src/DecisionReadout.ts",
+    "./DecisionNoise": "./src/DecisionNoise.ts",
+    "./DecisionScaffold": "./src/DecisionScaffold.ts",
+    "./DecisionEngine": "./src/DecisionEngine.ts",
+    "./Api": "./src/Api.ts",
+    "./Model": "./src/Model.ts",
+    "./OpenAi": "./src/OpenAi.ts",
+    "./Server": "./src/Server.ts",
+    "./package.json": "./package.json"
+  },
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "exports": {
+      ".": "./dist/index.js",
+      "./Decision": "./dist/Decision.js",
+      "./DecisionPlanner": "./dist/DecisionPlanner.js",
+      "./DecisionReadout": "./dist/DecisionReadout.js",
+      "./DecisionNoise": "./dist/DecisionNoise.js",
+      "./DecisionScaffold": "./dist/DecisionScaffold.js",
+      "./DecisionEngine": "./dist/DecisionEngine.js",
+      "./Api": "./dist/Api.js",
+      "./Model": "./dist/Model.js",
+      "./OpenAi": "./dist/OpenAi.js",
+      "./Server": "./dist/Server.js",
+      "./package.json": "./package.json"
+    },
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@effect-torch/core": "workspace:^",
+    "effect": "4.0.0-beta.101",
+    "@effect-torch/tokenizers": "workspace:^"
+  },
+  "devDependencies": {
+    "@effect-torch/backend-cpu": "workspace:*",
+    "@effect/platform-node": "4.0.0-beta.101",
+    "@effect/vitest": "4.0.0-beta.101",
+    "@types/node": "^22.0.0",
+    "vitest": "^4.1.10"
+  }
+}

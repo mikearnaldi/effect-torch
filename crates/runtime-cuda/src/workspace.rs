@@ -115,15 +115,46 @@ fn request(
 struct SegmentAllocation {
     owner: Arc<CudaSlice<u8>>,
     retention: Option<Arc<dyn Send + Sync>>,
+    full_buffer: Option<CudaBuffer<u8>>,
 }
 
 pub(crate) struct InvocationResources {
     segments: Box<[SegmentAllocation]>,
+    selected71: Option<Box<[bool]>>,
     _workspace: CudaWorkspaceLease,
     pub(crate) _actual_workspace_bytes: usize,
 }
 
 impl InvocationResources {
+    /// Pure range validation against the current lease, without querying any
+    /// device pointer or materializing a buffer/event. Used before graph admission.
+    pub(crate) fn preflight_graph61(
+        &self,
+        location: &Location,
+        extra: usize,
+        bytes: usize,
+    ) -> Result<(), String> {
+        let Location::Segment {
+            segment,
+            offset,
+            bytes: available,
+        } = location
+        else {
+            return Err("graph61 requires planned segment storage".into());
+        };
+        if self
+            .selected71
+            .as_ref()
+            .is_some_and(|selected| !selected.get(segment.index()).copied().unwrap_or(false))
+        {
+            return Err("whole-read71 segment is outside the admitted body".into());
+        }
+        let allocation = self
+            .segments
+            .get(segment.index())
+            .ok_or("graph61 missing current lease")?;
+        validate_graph61_range(*offset, extra, bytes, *available, allocation.owner.len())
+    }
     pub(crate) fn buffer<T: Send + Sync + 'static>(
         &self,
         location: &Location,
@@ -140,6 +171,13 @@ impl InvocationResources {
                 "CUDA planned output requires a segment location, found {location:?}"
             ));
         };
+        if self
+            .selected71
+            .as_ref()
+            .is_some_and(|selected| !selected.get(segment.index()).copied().unwrap_or(false))
+        {
+            return Err("whole-read71 segment is outside the admitted body".into());
+        }
         let requested_bytes = len
             .checked_mul(std::mem::size_of::<T>())
             .ok_or_else(|| "CUDA planned buffer byte size overflowed usize".to_string())?;
@@ -158,6 +196,9 @@ impl InvocationResources {
             .segments
             .get(segment.index())
             .ok_or_else(|| format!("CUDA memory segment {segment} is out of range"))?;
+        if let Some(buffer) = &allocation.full_buffer {
+            return buffer.planned_view(byte_offset, len);
+        }
         CudaBuffer::from_segment(
             Arc::clone(&allocation.owner),
             byte_offset,
@@ -171,6 +212,67 @@ pub(crate) fn acquire(
     device_ordinal: u32,
     segments: &[SegmentDecl<CudaMemorySpace>],
 ) -> Result<InvocationResources, String> {
+    let cache_segment_buffers =
+        std::env::var("EFFECT_TORCH_CUDA_CACHE_SEGMENT_BUFFERS").as_deref() == Ok("1");
+    acquire_with_policy(device_ordinal, segments, cache_segment_buffers)
+}
+
+/// A separately retained private replay allocation, charged to the same device
+/// pool as invocation segments. It cannot escape as a caller output.
+pub(crate) fn acquire_private71(
+    device_ordinal: u32,
+    bytes: usize,
+) -> Result<CudaBuffer<u8>, String> {
+    let segment = SegmentDecl {
+        bytes,
+        alignment: CUDA_STORAGE_ALIGNMENT,
+        memory_space: CudaMemorySpace::Device,
+        ownership: SegmentOwnership::InvocationStaging,
+    };
+    let lease = Arc::new(
+        workspace_pool(device_ordinal)?
+            .acquire(std::slice::from_ref(&request(device_ordinal, &segment)?))
+            .map_err(|error| format!("CUDA private replay acquisition failed: {error}"))?,
+    );
+    let owner = Arc::clone(lease.segments()[0].workspace());
+    CudaBuffer::from_segment(owner, 0, bytes, Some(lease))
+}
+
+pub(crate) fn acquire_private_segments71(
+    device_ordinal: u32,
+    segments: &[SegmentDecl<CudaMemorySpace>],
+    selected: &[effect_torch_runtime::SegmentId],
+) -> Result<InvocationResources, String> {
+    let mut included = vec![false; segments.len()];
+    for id in selected {
+        *included
+            .get_mut(id.index())
+            .ok_or("whole-read71 selected segment out of bounds")? = true;
+    }
+    let declarations = segments
+        .iter()
+        .zip(&included)
+        .map(|(segment, included)| {
+            let mut segment = segment.clone();
+            if !included {
+                // Preserve original indices without retaining any excluded arena.
+                // The pool's minimum allocation is one byte; buffer() rejects access.
+                segment.bytes = 0;
+                segment.ownership = SegmentOwnership::Workspace;
+            }
+            segment
+        })
+        .collect::<Vec<_>>();
+    let mut resources = acquire_with_policy(device_ordinal, &declarations, true)?;
+    resources.selected71 = Some(included.into_boxed_slice());
+    Ok(resources)
+}
+
+fn acquire_with_policy(
+    device_ordinal: u32,
+    segments: &[SegmentDecl<CudaMemorySpace>],
+    cache_segment_buffers: bool,
+) -> Result<InvocationResources, String> {
     let pool = workspace_pool(device_ordinal)?;
     let mut workspace_indices = Vec::new();
     let mut workspace_requests = Vec::new();
@@ -178,7 +280,10 @@ pub(crate) fn acquire(
         if segment.memory_space != CudaMemorySpace::Device {
             return Err(format!("unsupported CUDA memory space for segment {index}"));
         }
-        if segment.ownership != SegmentOwnership::ProvisionalOutput {
+        if !matches!(
+            segment.ownership,
+            SegmentOwnership::ProvisionalOutput | SegmentOwnership::StateTransaction
+        ) {
             workspace_indices.push(index);
             workspace_requests.push(request(device_ordinal, segment)?);
         }
@@ -194,6 +299,7 @@ pub(crate) fn acquire(
         allocations[index] = Some(SegmentAllocation {
             owner: Arc::clone(leased.workspace()),
             retention: None,
+            full_buffer: None,
         });
         if matches!(
             segments[index].ownership,
@@ -205,7 +311,10 @@ pub(crate) fn acquire(
         }
     }
     for (index, segment) in segments.iter().enumerate() {
-        if segment.ownership != SegmentOwnership::ProvisionalOutput {
+        if !matches!(
+            segment.ownership,
+            SegmentOwnership::ProvisionalOutput | SegmentOwnership::StateTransaction
+        ) {
             continue;
         }
         let lease = Arc::new(
@@ -217,18 +326,30 @@ pub(crate) fn acquire(
         allocations[index] = Some(SegmentAllocation {
             owner,
             retention: Some(retention),
+            full_buffer: None,
         });
     }
     let segments = allocations
         .into_iter()
         .enumerate()
         .map(|(index, allocation)| {
-            allocation.ok_or_else(|| format!("CUDA memory segment {index} was not acquired"))
+            let mut allocation = allocation
+                .ok_or_else(|| format!("CUDA memory segment {index} was not acquired"))?;
+            if cache_segment_buffers {
+                allocation.full_buffer = Some(CudaBuffer::from_segment(
+                    Arc::clone(&allocation.owner),
+                    0,
+                    allocation.owner.len(),
+                    allocation.retention.clone(),
+                )?);
+            }
+            Ok::<_, String>(allocation)
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
     Ok(InvocationResources {
         segments,
+        selected71: None,
         _workspace: workspace,
         _actual_workspace_bytes: actual_workspace_bytes,
     })
@@ -246,5 +367,49 @@ mod tests {
         assert_eq!(first, same_class);
         assert_ne!(first, other_device);
         assert_eq!(first.capacity_class, 512);
+    }
+}
+
+#[cfg(test)]
+#[path = "workspace_tests.rs"]
+mod planned_view_tests;
+
+fn validate_graph61_range(
+    offset: usize,
+    extra: usize,
+    bytes: usize,
+    available: usize,
+    capacity: usize,
+) -> Result<(), String> {
+    let end = extra
+        .checked_add(bytes)
+        .ok_or("graph61 value range overflow")?;
+    if end > available {
+        return Err("graph61 value exceeds planned range".into());
+    }
+    let end = offset
+        .checked_add(end)
+        .ok_or("graph61 segment range overflow")?;
+    if end > capacity {
+        return Err("graph61 value exceeds current lease".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod graph61_range_tests {
+    use super::validate_graph61_range;
+    #[test]
+    fn graph61_pure_range_checks_alias_bounds_current_capacity_and_overflow() {
+        assert!(validate_graph61_range(256, 16, 64, 80, 336).is_ok());
+        for values in [
+            (256, 17, 64, 80, 1000),
+            (256, 16, 64, 80, 335),
+            (0, usize::MAX, 1, usize::MAX, usize::MAX),
+            (usize::MAX, 0, 1, 1, usize::MAX),
+        ] {
+            assert!(
+                validate_graph61_range(values.0, values.1, values.2, values.3, values.4).is_err()
+            );
+        }
     }
 }

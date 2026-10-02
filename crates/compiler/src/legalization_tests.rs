@@ -51,6 +51,85 @@ fn evaluate(expression: &KernelExpr, inputs: &[f32]) -> f32 {
 }
 
 #[test]
+fn grouped_expert_projection_preserves_identity_and_ordinary_matmul_numerics() {
+    for dtype in [DType::F32, DType::BF16] {
+        for optimize in [false, true] {
+            let x = input(0, dtype, &[7, 13]);
+            let weight = input(1, dtype, &[3, 5, 13]);
+            let indexes = input(2, DType::U32, &[7]);
+            let grouped = Node::new(NodeKind::GroupedExpertLinearRows {
+                x: x.clone(),
+                weight: weight.clone(),
+                indexes: indexes.clone(),
+            })
+            .unwrap();
+            let strict = Node::new(NodeKind::ExpertLinearRows { x, weight, indexes }).unwrap();
+            let ordinary = Node::new(NodeKind::Matmul {
+                a: input(3, dtype, &[2, 13]),
+                b: input(4, dtype, &[13, 5]),
+            })
+            .unwrap();
+            let prepared = ProgramRequest::from_roots(
+                vec![
+                    grouped.clone(),
+                    strict.clone(),
+                    grouped.clone(),
+                    ordinary.clone(),
+                ],
+                CompileOptions {
+                    optimize,
+                    ..CompileOptions::default()
+                },
+            )
+            .prepare()
+            .unwrap();
+            assert!(Arc::ptr_eq(&prepared.roots[0], &grouped));
+            assert!(Arc::ptr_eq(&prepared.roots[1], &strict));
+            assert!(Arc::ptr_eq(&prepared.roots[2], &grouped));
+            let index = &prepared.index;
+            let spec = OperationDTypeSpec::new(index, index.dense_id(grouped.id).unwrap()).unwrap();
+            let matmul =
+                OperationDTypeSpec::new(index, index.dense_id(ordinary.id).unwrap()).unwrap();
+            let strict_spec =
+                OperationDTypeSpec::new(index, index.dense_id(strict.id).unwrap()).unwrap();
+            assert_eq!(operation_name(spec.operation), "groupedExpertLinearRows");
+            assert_eq!(operation_name(strict_spec.operation), "expertLinearRows");
+            assert_eq!(
+                spec.operands
+                    .iter()
+                    .map(|operand| operand.role)
+                    .collect::<Vec<_>>(),
+                vec![ValueRole::Activation, ValueRole::Weight, ValueRole::Indices]
+            );
+            assert_eq!(
+                spec.required_numerics.compute_dtype,
+                matmul.required_numerics.compute_dtype
+            );
+            assert_eq!(
+                spec.required_numerics.permits_f32_compute,
+                matmul.required_numerics.permits_f32_compute
+            );
+            assert_eq!(
+                spec.required_numerics.accumulation,
+                matmul.required_numerics.accumulation
+            );
+            assert_eq!(
+                strict_spec.required_numerics.compute_dtype,
+                Some(DType::F32)
+            );
+            assert!(!strict_spec.required_numerics.permits_f32_compute);
+            let target = TestTarget::for_index(index);
+            let driver = CompilerDriver::new(&prepared, &target).unwrap();
+            assert_eq!(driver.legalization().work().materialized_conversions, 0);
+            let mapped = effect_torch_graph::remap_children(&grouped.kind, &|child| child.clone());
+            assert!(matches!(mapped, NodeKind::GroupedExpertLinearRows { .. }));
+            let rebuilt = Node::new(mapped).unwrap();
+            assert_eq!(rebuilt.value_spec(), grouped.value_spec());
+        }
+    }
+}
+
+#[test]
 fn half_regions_round_each_semantic_node_and_keep_graph_identity() {
     for (dtype, value) in [(DType::BF16, 256.0), (DType::F16, 2048.0)] {
         let root = cancellation(dtype);
@@ -315,6 +394,36 @@ fn reduction_accumulation_and_f64_precision_cannot_be_weakened() {
         validate_disposition(&[spec], DTypeDisposition::Native(invalid))
             .unwrap_err()
             .contains("compute")
+    );
+}
+
+#[test]
+fn stateful_attention_rounding_cannot_be_weakened_by_legalization() {
+    use effect_torch_graph::{AttentionRounding, KvAttentionMode};
+    let q = input(0, DType::BF16, &[1, 2, 1, 4]);
+    let root = Node::new(NodeKind::KvAttention {
+        q: q.clone(),
+        k: q.clone(),
+        v: q,
+        scale: 0.3,
+        layer: 7,
+        window: None,
+        mode: KvAttentionMode::BidirectionalBlock,
+        rounding: AttentionRounding::Stepwise,
+    })
+    .unwrap();
+    let index = GraphIndex::new(&[root]).unwrap();
+    let spec = OperationDTypeSpec::new(&index, index.roots[0]).unwrap();
+    let mut execution = spec.native_execution();
+    assert_eq!(
+        execution.operations[0].attention_rounding,
+        Some(AttentionRounding::Stepwise)
+    );
+    execution.operations[0].attention_rounding = Some(AttentionRounding::Fused);
+    assert!(
+        validate_disposition(&[spec], DTypeDisposition::Native(execution))
+            .unwrap_err()
+            .contains("rounding")
     );
 }
 

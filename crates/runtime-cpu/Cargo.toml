@@ -29,5 +29,8 @@ napi-derive = { version = "3", optional = true }
 safetensors = { version = "0.6", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
 
+[dev-dependencies]
+effect-torch-autodiff = { path = "../autodiff" }
+
 [build-dependencies]
 napi-build = "1"

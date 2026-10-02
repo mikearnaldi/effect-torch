@@ -16,6 +16,7 @@ it.effect(
   () =>
     Effect.flatMap(isAvailable, (available) => {
       if (!available) return Effect.void
+
       return Effect.gen(function*() {
         const a = yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2])
         const b = yield* Tensor.fromTypedArray(new Float32Array([10, 20, 30, 40]), [2, 2])
@@ -45,6 +46,7 @@ it.effect(
 it.effect("supports logical dtypes, broadcasting, and multiplication", () =>
   Effect.flatMap(isAvailable, (available) => {
     if (!available) return Effect.void
+
     return Effect.gen(function*() {
       const precise = yield* Tensor.ones([2], { dtype: "f64" })
       expect(Array.from<number | bigint>(yield* Tensor.toTypedArray(precise)).map(Number)).toEqual([1, 1])
@@ -63,6 +65,30 @@ it.effect("validates device ordinals before loading the addon", () =>
   Effect.gen(function*() {
     const exit = yield* Effect.exit(Runtime.Runtime.pipe(Effect.provide(layer({ device: -1 }))))
     expect(Exit.isFailure(exit)).toBe(true)
+  }))
+
+it.effect("accounts shared exported CUDA allocations until their last handle is cleared", () =>
+  Effect.flatMap(isAvailable, (available) => {
+    if (!available) return Effect.void
+
+    return Effect.gen(function*() {
+      const runtime = yield* Runtime.Runtime
+      const source = yield* Tensor.fromTypedArray(new Float32Array(4096).fill(2), [4096])
+      const before = yield* runtime.extensions.diagnostics.externalMemoryBytes
+      const [first, second] = yield* Tensor.compute([source, source] as const)
+      yield* Effect.ensuring(
+        Effect.gen(function*() {
+          const retained = yield* runtime.extensions.diagnostics.externalMemoryBytes
+          expect(retained - before).toBeGreaterThanOrEqual(4096 * 4)
+          yield* Tensor.clear(first)
+          expect(yield* runtime.extensions.diagnostics.externalMemoryBytes).toBe(retained)
+          expect((yield* Tensor.toNumberArray(second))[0]).toBe(2)
+          yield* Tensor.clear(second)
+          expect(yield* runtime.extensions.diagnostics.externalMemoryBytes).toBe(before)
+        }),
+        Effect.forEach([first, second], (tensor) => Tensor.clear(tensor).pipe(Effect.ignore), { discard: true })
+      )
+    }).pipe(Effect.provide(layer()))
   }))
 
 it.effect("clears unpublished native outputs after interruption", () =>
@@ -91,6 +117,10 @@ it.effect("clears unpublished native outputs after interruption", () =>
         super()
       }
 
+      retain() {
+        return new NativeTensorDouble(this.onClear)
+      }
+
       clear() {
         this.onClear()
       }
@@ -115,6 +145,7 @@ it.effect("clears unpublished native outputs after interruption", () =>
       readonly batch = 0
       readonly allowsWindowEviction = false
       readonly layers = 0
+      readonly kvLayers = []
       readonly kvHeads = 0
       readonly headDim = 0
       readonly kdaLayers = 0
@@ -162,11 +193,32 @@ it.effect("clears unpublished native outputs after interruption", () =>
 
       execute() {
         Effect.runSync(Deferred.succeed(started, undefined))
+
         return new Promise<Array<NativeTensorDouble>>((resume) => resolve = resume)
       }
 
       executeStateful() {
         return Promise.resolve<Array<NativeTensorDouble>>([])
+      }
+
+      executeReadOnly() {
+        return Promise.resolve<Array<NativeTensorDouble>>([])
+      }
+
+      supportsChain97(): boolean {
+        return false
+      }
+
+      executeChain97(): never {
+        throw new Error("unexpected private chain dispatch")
+      }
+
+      forkRequestRng99(): never {
+        throw new Error("unexpected private RNG fork")
+      }
+
+      executeChain96(): never {
+        throw new Error("unexpected private chain dispatch")
       }
 
       executeSampled() {
@@ -184,6 +236,10 @@ it.effect("clears unpublished native outputs after interruption", () =>
     class NativeKvSequenceDouble {
       readonly cursor = 0
 
+      snapshot() {
+        return new NativeKvPrefixDouble()
+      }
+
       fork() {
         return new NativeKvSequenceDouble()
       }
@@ -191,6 +247,22 @@ it.effect("clears unpublished native outputs after interruption", () =>
       release() {}
       prefillMatch() {
         return 0
+      }
+    }
+    class NativeKvPrefixDouble {
+      readonly cursor = 0
+      readonly retainedBytes = 0
+      readonly sharedBytes = 0
+      readonly copiedBytes = 0
+
+      fork() {
+        return new NativeKvSequenceDouble()
+      }
+
+      release() {}
+
+      inspect() {
+        return { cursor: 0, retainedBytes: 0, sharedBytes: 0, copiedBytes: 0, layers: [] }
       }
     }
     class NativeKvPoolDouble {
@@ -236,6 +308,10 @@ it.effect("clears unpublished native outputs after interruption", () =>
         return new NativeTensorDouble()
       }
 
+      materializeLiterals89(): Promise<Array<NativeTensorDouble>> {
+        throw new Error("literal89 is disabled in this test")
+      }
+
       fromMaterialized() {
         return new LazyTensorDouble()
       }
@@ -250,6 +326,7 @@ it.effect("clears unpublished native outputs after interruption", () =>
 
       compile(_roots: Array<LazyTensorDouble>, options?: NativeCompileOptions) {
         compiledOptions = options
+
         return executable
       }
     }
@@ -270,10 +347,12 @@ it.effect("clears unpublished native outputs after interruption", () =>
       },
       NativeExposure: NativeExposureDouble,
       NativeKvPool: NativeKvPoolDouble,
+      NativeKvPrefix: NativeKvPrefixDouble,
       NativeKvSequence: NativeKvSequenceDouble,
       NativeTargetMatchingOutput: NativeTargetMatchingOutputDouble,
       NativeTensor: NativeTensorDouble,
       deviceCount: () => 1,
+      externalMemoryBytes: () => 0,
       grad: () => [new LazyTensorDouble()],
       isAvailable: () => true,
       inspectGguf: () => Promise.resolve({ metadata: [], tensors: [] }),
@@ -282,20 +361,25 @@ it.effect("clears unpublished native outputs after interruption", () =>
       loadTensors: () => Promise.resolve({ entries: [], metadata: {} }),
       saveTensors: () => Promise.resolve()
     }
+
     const runtime = createRuntimeAdapter(native, 0)
     const root = yield* runtime.node({ op: "zeros", inputs: [], attributes: { shape: [1], dtype: "f32" } })
+
     const program = yield* runtime.compile({
       roots: [root],
       options: { optimize: false, constantWeights: true }
     })
+
     expect(compiledOptions).toEqual({ optimize: false, constantWeights: true })
     expect(program.diagnostics.instructions).toEqual([{ kind: "value", count: 1 }])
     expect(program.diagnostics.compilePhases).toEqual([{ phase: "graph_index", nanoseconds: 1 }])
+
     const fiber = yield* runtime.execute(program, {
       bindings: [],
       scalars: [],
       runtimeValues: {}
     }).pipe(Effect.forkChild({ startImmediately: true }))
+
     yield* Deferred.await(started)
     const interruption = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild({ startImmediately: true }))
     yield* Effect.sync(() => resolve([new NativeTensorDouble(clear)]))
@@ -307,11 +391,13 @@ it.effect("clears unpublished native outputs after interruption", () =>
     started = yield* Deferred.make<void>()
     const duplicateClear = vi.fn()
     const duplicateProgram = yield* runtime.compile({ roots: [root, root] })
+
     const duplicateFiber = yield* runtime.execute(duplicateProgram, {
       bindings: [],
       scalars: [],
       runtimeValues: {}
     }).pipe(Effect.forkChild({ startImmediately: true }))
+
     yield* Deferred.await(started)
     const duplicate = new NativeTensorDouble(duplicateClear)
     yield* Effect.sync(() => resolve([duplicate, duplicate]))
@@ -319,21 +405,26 @@ it.effect("clears unpublished native outputs after interruption", () =>
     expect(duplicateClear).toHaveBeenCalledTimes(1)
 
     started = yield* Deferred.make<void>()
+
     const lateArchiveClear = vi.fn(() => {
       throw new Error("cleanup failed")
     })
+
     const lateTrailingClear = vi.fn()
     let resolveArchive!: (archive: Awaited<ReturnType<NativeAddon["loadTensors"]>>) => void
     native.loadTensors = (_path, ordinal, _token, names) => {
       expect(ordinal).toBe(0)
       expect(names).toEqual(["selected"])
       Effect.runSync(Deferred.succeed(started, undefined))
+
       return new Promise((resume) => resolveArchive = resume)
     }
+
     const loading = yield* runtime.extensions.pathSafetensors.load("selected.safetensors", { names: ["selected"] })
       .pipe(
         Effect.forkChild({ startImmediately: true })
       )
+
     yield* Deferred.await(started)
     const stopLoading = yield* Fiber.interrupt(loading).pipe(Effect.forkChild({ startImmediately: true }))
     yield* Effect.sync(() =>
@@ -353,6 +444,7 @@ it.effect("clears unpublished native outputs after interruption", () =>
     const validClear = vi.fn(() => {
       throw new Error("cleanup failed")
     })
+
     const invalidClear = vi.fn()
     const malformed = new NativeTensorDouble(invalidClear)
     Object.defineProperty(malformed, "dtype", { value: "invalid" })

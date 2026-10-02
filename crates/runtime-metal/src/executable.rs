@@ -125,8 +125,10 @@ pub(crate) struct ConvGeometry {
 /// Static recurrent-state schema for a decode executable. It contains the KV
 /// pool shape, paging parameters, and KDA and convolution geometries. Each
 /// invocation compares it with the decode context and rejects mismatches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct KvStateSchema {
+    pub access: effect_torch_runtime::StateAccessMode,
+    pub kv_layers: Vec<effect_torch_runtime::KvLayerDescriptor>,
     pub max_tokens: usize,
     pub block_size: usize,
     pub kv_dtype: DType,
@@ -169,7 +171,14 @@ impl KvStateSchema {
         if self.layers == 0 && (self.kv_heads != 0 || self.head_dim != 0) {
             return Err("compile: KV heads and head_dim require at least one layer".to_string());
         }
-        if self.layers > 0 && (self.kv_heads == 0 || self.head_dim == 0) {
+        if self.kv_layers.len() != self.layers
+            || self.kv_layers.iter().enumerate().any(|(i, layer)| {
+                layer.layer_id as usize != i
+                    || layer.kv_heads == 0
+                    || layer.head_dim == 0
+                    || layer.dtype != self.kv_dtype
+            })
+        {
             return Err("compile: KV layers require positive heads and head_dim".to_string());
         }
         if self
@@ -192,31 +201,21 @@ impl KvStateSchema {
                 .try_fold(1usize, |total, value| total.checked_mul(*value))
                 .ok_or_else(|| format!("compile: {label} byte size overflow"))
         };
-        let kv_elements = checked(
-            &[
-                self.layers,
-                self.max_tokens,
-                self.kv_heads,
-                self.head_dim,
-                2,
-            ],
-            "KV slab",
-        )?;
-        let mut bytes = kv_elements
-            .checked_mul(self.kv_dtype.size_in_bytes())
-            .ok_or_else(|| "compile: KV slab byte size overflow".to_string())?;
-        if self.kv_dtype == DType::U8 {
-            bytes = bytes
-                .checked_add(
-                    checked(
-                        &[self.layers, self.max_tokens, self.kv_heads, 2],
-                        "KV scale",
-                    )?
-                    .checked_mul(DType::F32.size_in_bytes())
-                    .ok_or_else(|| "compile: KV scale byte size overflow".to_string())?,
-                )
-                .ok_or_else(|| "compile: KV state byte size overflow".to_string())?;
-        }
+        let bytes = self.kv_layers.iter().try_fold(0usize, |bytes, layer| {
+            let row = layer.row_bytes().ok_or("compile: KV row size overflow")?;
+            let scales = if layer.dtype == DType::U8 {
+                layer
+                    .kv_heads
+                    .checked_mul(8)
+                    .ok_or("compile: KV scale size overflow")?
+            } else {
+                0
+            };
+            row.checked_add(scales)
+                .and_then(|row| row.checked_mul(self.max_tokens))
+                .and_then(|size| bytes.checked_add(size))
+                .ok_or("compile: KV state size overflow")
+        })?;
         let recurrent_elements = checked(
             &[
                 self.batch,
@@ -250,6 +249,8 @@ impl KvStateSchema {
 /// Live per-slot decode state: the compact block table plus carried
 /// KDA/conv state tensors.
 pub(crate) struct SeqState {
+    pub copied_bytes: usize,
+    pub transaction_tail: Option<u32>,
     /// Compact live block table; `head` is the absolute logical index of `blocks[0]`.
     pub blocks: Vec<u32>,
     /// Absolute logical index of `blocks[0]` (eviction frontier).
@@ -323,6 +324,7 @@ pub(crate) trait MetalDecodeContext {
         scale: f64,
         window: Option<usize>,
         mode: KvAttentionMode,
+        rounding: effect_torch_graph::AttentionRounding,
         output: &crate::run::MetalTensor,
         staging: &[crate::run::MetalTensor],
         scratch: &[crate::run::MetalTensor],
@@ -528,6 +530,11 @@ pub(super) enum MetalOp {
     Unary(MetalUnaryOp),
     Binary(MetalBinaryOp),
     Where,
+    ExpertLinearRows,
+    GroupedExpertLinearRows,
+    TopKIndices {
+        k: usize,
+    },
     Argmax {
         dim: usize,
     },
@@ -601,6 +608,7 @@ pub(super) enum MetalOp {
         layer: u32,
         window: Option<usize>,
         mode: KvAttentionMode,
+        rounding: effect_torch_graph::AttentionRounding,
     },
     RotaryEmbedding {
         theta: f64,
@@ -753,7 +761,10 @@ impl MetalOp {
             Self::Unary(_) => "unary",
             Self::Binary(_) => "binary",
             Self::Where => "where",
+            Self::ExpertLinearRows => "expertLinearRows",
+            Self::GroupedExpertLinearRows => "groupedExpertLinearRows",
             Self::Argmax { .. } | Self::Argmin { .. } => "arg_reduce",
+            Self::TopKIndices { .. } => "topKIndices",
             Self::Cumsum { .. } => "cumsum",
             Self::ScatterAdd { .. } => "scatter_add",
             Self::Gather { .. } => "gather",
@@ -912,8 +923,10 @@ impl MetalResourceId for OutputDecl {
     }
 }
 
-/// One step of the physical execution stream. Encoding never blocks:
-/// status-producing kernels are followed by a `StatusGate`/`Commit`
+/// One step of the physical execution stream. Ordinary kernel encoding is
+/// nonblocking. Grouped expert projection performs an explicit route-data host
+/// fence before selecting its exact-M launch list. Status-producing kernels
+/// are followed by a `StatusGate`/`Commit`
 /// pair that closes the command buffer so the host can read the status
 /// word after the fence; `Complete` terminates the stream exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,6 +962,8 @@ pub(super) enum MetalCommandPlan {
     Direct,
     Gemm(crate::gemm::GemmRequirements),
     Linear(crate::linear::LinearRequirements),
+    ExpertLinearRows(crate::expert_linear::Plan),
+    GroupedExpertLinearRows(crate::grouped_expert_linear::Plan),
     Conv(crate::conv::ConvRequirements),
     Indexing(crate::indexing::IndexingRequirements),
     CeForward(crate::loss::CeForwardRequirements),
@@ -1448,6 +1463,55 @@ fn plan_command_resources(
             resources
                 .scratch
                 .push(scratch("arg_reduce_u32", &keepdim_shape, DType::U32));
+        }
+        MetalOp::GroupedExpertLinearRows => {
+            let x = input(0)?;
+            let weight = input(1)?;
+            let plan = crate::grouped_expert_linear::Plan::new(
+                [
+                    declaration_layout(x),
+                    declaration_layout(weight),
+                    declaration_layout(input(2)?),
+                ],
+                x.dtype,
+                environment.mma,
+            )?;
+            let (rows, inner, columns) = (x.shape[0], x.shape[1], weight.shape[1]);
+            resources.scratch = vec![
+                scratch("grouped_expert_activations", &[rows, inner], x.dtype),
+                scratch("grouped_expert_results", &[rows, columns], x.dtype),
+                scratch("grouped_expert_weight", &[inner, columns], x.dtype),
+            ];
+            if plan.split_k_elements != 0 {
+                resources.scratch.push(scratch(
+                    "grouped_expert_split_k",
+                    &[plan.split_k_elements],
+                    DType::F32,
+                ));
+            }
+            // N U32 control words uploaded after the explicit route readback.
+            resources
+                .staging
+                .push(staging("grouped_expert_permutation", &[rows], DType::U32));
+            resources.plan = MetalCommandPlan::GroupedExpertLinearRows(plan);
+        }
+        MetalOp::ExpertLinearRows => {
+            resources.plan = MetalCommandPlan::ExpertLinearRows(crate::expert_linear::Plan::new(
+                [
+                    declaration_layout(input(0)?),
+                    declaration_layout(input(1)?),
+                    declaration_layout(input(2)?),
+                ],
+                input(0)?.dtype,
+            )?);
+            resources
+                .status
+                .push(status("expert_route_status", &[1], DType::U32));
+        }
+        MetalOp::TopKIndices { .. } => {
+            resources
+                .status
+                .push(status("top_k_nan_status", &[1], DType::U32));
         }
         MetalOp::Cumsum { .. } => {}
         MetalOp::IndexSelect { dim } => {
@@ -2182,12 +2246,17 @@ fn plan_command_resources(
             }
         }
         MetalOp::AdamW { .. } | MetalOp::AdamWGroup { .. } | MetalOp::Sgd { .. } => {}
-        MetalOp::KvAttention { layer, mode, .. } => {
+        MetalOp::KvAttention {
+            layer,
+            mode,
+            rounding,
+            ..
+        } => {
             let q = input(0)?;
             let k = input(1)?;
-            if q.shape.len() < 3 || q.dtype != DType::F32 {
+            if q.shape.len() < 3 || !matches!(q.dtype, DType::F32 | DType::F16 | DType::BF16) {
                 return Err(
-                    "compile: paged KV attention requires rank >= 3 f32 queries".to_string()
+                    "compile: paged KV attention requires rank >= 3 floating queries".to_string(),
                 );
             }
             let rank = q.shape.len();
@@ -2202,13 +2271,18 @@ fn plan_command_resources(
                 time,
                 head_dim: q.shape[rank - 1],
                 mode: *mode,
-                splits: if *mode == KvAttentionMode::Causal && time == 1 {
+                splits: if *mode == KvAttentionMode::Causal
+                    && time == 1
+                    && q.dtype == DType::F32
+                    && *rounding == effect_torch_graph::AttentionRounding::Fused
+                    && q.shape[rank - 1] <= 128
+                {
                     8
                 } else {
                     1
                 },
             };
-            if plan.time == 0 || plan.head_dim > 128 {
+            if plan.time == 0 || plan.head_dim == 0 {
                 return Err(format!(
                     "compile: paged KV attention does not support time {} and head dimension {}",
                     plan.time, plan.head_dim
@@ -2218,8 +2292,9 @@ fn plan_command_resources(
                 "compile: paged KV attention requires an explicit state schema".to_string()
             })?;
             if plan.batch != schema.graph_batch
-                || plan.kv_heads != schema.kv_heads
-                || plan.head_dim != schema.head_dim
+                || schema.kv_layers.get(*layer as usize).is_none_or(|layer| {
+                    plan.kv_heads != layer.kv_heads || plan.head_dim != layer.head_dim
+                })
                 || (*layer as usize) >= schema.layers
             {
                 return Err(format!(
@@ -2244,7 +2319,7 @@ fn plan_command_resources(
                 staging("kv_context_lengths", &[schema.graph_batch], DType::U32),
                 staging("kv_block_bases", &[schema.graph_batch], DType::U32),
                 staging("kv_token_advances", &[schema.graph_batch], DType::U32),
-                staging("kv_padding", &[schema.graph_batch], DType::U32),
+                staging("kv_prefix_start", &[schema.graph_batch], DType::U32),
             ]);
             if plan.splits > 1 {
                 resources.scratch.push(scratch(
@@ -2449,6 +2524,7 @@ pub(super) struct MetalExecutable {
     /// Memory report of the most recent invocation (observability).
     pub last_invocation_memory: Mutex<Option<InvocationMemoryReport>>,
     state_cursor: Option<ValueId>,
+    runs: AtomicU64,
 }
 
 /// Marks encode commands whose results feed only output 0, the logits row of a
@@ -2637,7 +2713,7 @@ impl<'a> Lowerer<'a> {
         state_schema: Option<KvStateSchema>,
         slots: &[ProgramSlot],
     ) -> Self {
-        let padded_slot = state_schema.and_then(|schema| {
+        let padded_slot = state_schema.as_ref().and_then(|schema| {
             slots
                 .iter()
                 .enumerate()
@@ -2654,7 +2730,10 @@ impl<'a> Lowerer<'a> {
             .enumerate()
             .map(|(slot, declaration)| {
                 let slot = u32::try_from(slot).expect("program slots fit u32");
-                let source = if state_schema.is_some_and(|schema| schema.cursor_slot == slot) {
+                let source = if state_schema
+                    .as_ref()
+                    .is_some_and(|schema| schema.cursor_slot == slot)
+                {
                     MetalDeclaredSource::StateCursor
                 } else if declaration.scalar {
                     let source = MetalDeclaredSource::Scalar(scalar);
@@ -3052,6 +3131,24 @@ impl<'a> Lowerer<'a> {
                     outputs,
                 )
             }
+            NativeRegion::DualArgmax(_)
+            | NativeRegion::RouterTail(_)
+            | NativeRegion::AttentionFfnEntrance(_)
+            | NativeRegion::RmsResidual(_)
+            | NativeRegion::FfnNextNorm(_)
+            | NativeRegion::FfnTail(_)
+            | NativeRegion::VNormKvAttention(_)
+            | NativeRegion::NormRope(_)
+            | NativeRegion::GroupedExpertGated(_)
+            | NativeRegion::SmallSoftmax(_)
+            | NativeRegion::Entropy(_)
+            | NativeRegion::Bf16Softmax(_)
+            | NativeRegion::SharedRmsNorm(_)
+            | NativeRegion::ExpertRouteRank(_)
+            | NativeRegion::OrderedScatterReduce(_)
+            | NativeRegion::ElementwiseArgReduce(_) => {
+                return Err("compile: elementwise index reduction requires target support".into())
+            }
             NativeRegion::ElementwiseReduce(region) => {
                 if !region.device.is_metal() {
                     return Err(format!(
@@ -3380,7 +3477,10 @@ impl<'a> Lowerer<'a> {
                         })?;
                         let is_state_cursor = source == MetalDeclaredSource::StateCursor;
                         if is_state_cursor {
-                            let schema = self.state_schema.expect("state cursor has a schema");
+                            let schema = self
+                                .state_schema
+                                .as_ref()
+                                .expect("state cursor has a schema");
                             let expected_shape = if schema.cursor_tensor {
                                 vec![schema.graph_batch]
                             } else {
@@ -3394,7 +3494,7 @@ impl<'a> Lowerer<'a> {
                         }
                         let padded = self.padded_slot == Some(*slot)
                             && matches!(source, MetalDeclaredSource::Tensor(_))
-                            && self.state_schema.is_some_and(|schema| {
+                            && self.state_schema.as_ref().is_some_and(|schema| {
                                 node.shape.first() == Some(&schema.graph_batch)
                             });
                         let geometry = node.value_spec().canonical_geometry()?;
@@ -3641,6 +3741,9 @@ impl<'a> Lowerer<'a> {
             }
         };
         let op = match &node.kind {
+            NodeKind::SdpaConfigured { .. } | NodeKind::RotaryEmbeddingExplicit { .. } => {
+                return Err("compile: semantic operation escaped native preparation".into());
+            }
             NodeKind::Randn { shape, dtype, .. } => MetalOp::Randn {
                 shape: shape.clone().into_boxed_slice(),
                 dtype: *dtype,
@@ -3687,6 +3790,9 @@ impl<'a> Lowerer<'a> {
             NodeKind::Sign { .. } => MetalOp::Unary(MetalUnaryOp::Sign),
             NodeKind::Where { .. } => MetalOp::Where,
             NodeKind::Argmax { dim, .. } => MetalOp::Argmax { dim: *dim },
+            NodeKind::TopKIndices { k, .. } => MetalOp::TopKIndices { k: *k },
+            NodeKind::ExpertLinearRows { .. } => MetalOp::ExpertLinearRows,
+            NodeKind::GroupedExpertLinearRows { .. } => MetalOp::GroupedExpertLinearRows,
             NodeKind::Argmin { dim, .. } => MetalOp::Argmin { dim: *dim },
             NodeKind::Cumsum { dim, .. } => MetalOp::Cumsum { dim: *dim },
             NodeKind::ScatterAdd { dim, .. } => MetalOp::ScatterAdd { dim: *dim },
@@ -3765,12 +3871,14 @@ impl<'a> Lowerer<'a> {
                 layer,
                 window,
                 mode,
+                rounding,
                 ..
             } => MetalOp::KvAttention {
                 scale: *scale,
                 layer: *layer,
                 window: *window,
                 mode: *mode,
+                rounding: *rounding,
             },
             NodeKind::RotaryEmbedding {
                 x,
@@ -4390,6 +4498,10 @@ impl<'a> Lowerer<'a> {
 
         let pipeline_count = driver.phase(PIPELINE_PREPARATION_PHASE, || {
             let mut pipeline_count = 0usize;
+            if self.state_schema.is_some() {
+                crate::kernels::warm_byte_copy(device::MetalDevice::get())?;
+                pipeline_count += 1;
+            }
             for physical_command in &physical {
                 let MetalPhysicalCommand::Encode(id) = *physical_command else {
                     continue;
@@ -4890,39 +5002,54 @@ impl<'a> Lowerer<'a> {
                         let query = &self.values[command.inputs[0].index()];
                         let key = &self.values[command.inputs[1].index()];
                         let rank = query.shape.len();
-                        pipeline_count += crate::paged::warm_all(
+                        let schema = self
+                            .state_schema
+                            .as_ref()
+                            .ok_or("compile: KV state schema missing")?;
+                        crate::paged_state::warm(
+                            query.dtype,
+                            schema.kv_dtype,
                             query.shape[rank - 1],
-                            query.shape[rank - 3],
-                            key.shape[rank - 3],
-                            *scale,
-                            query.shape[rank - 2],
                         )?;
-                        if let MetalCommandPlan::KvAttention(plan) = command_plan {
-                            if plan.splits > 1 {
-                                pipeline_count += crate::paged::warm_all_split(
-                                    query.shape[rank - 1],
-                                    query.shape[rank - 3],
-                                    key.shape[rank - 3],
-                                    *scale,
-                                    plan.splits,
-                                )?;
-                            }
-                        }
-                        if *mode == KvAttentionMode::BidirectionalBlock {
-                            crate::paged::warm_attention_block(
+                        pipeline_count += 2;
+                        // The legacy row-parallel kernels have a 128-column register limit.
+                        // Wider heads use the typed state kernel prepared above.
+                        if query.shape[rank - 1] <= 128 {
+                            pipeline_count += crate::paged::warm_all(
                                 query.shape[rank - 1],
                                 query.shape[rank - 3],
                                 key.shape[rank - 3],
-                                self.state_schema
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        "compile: block attention requires state schema".to_string()
-                                    })?
-                                    .kv_dtype,
                                 *scale,
                                 query.shape[rank - 2],
                             )?;
-                            pipeline_count += 1;
+                            if let MetalCommandPlan::KvAttention(plan) = command_plan {
+                                if plan.splits > 1 {
+                                    pipeline_count += crate::paged::warm_all_split(
+                                        query.shape[rank - 1],
+                                        query.shape[rank - 3],
+                                        key.shape[rank - 3],
+                                        *scale,
+                                        plan.splits,
+                                    )?;
+                                }
+                            }
+                            if *mode == KvAttentionMode::BidirectionalBlock {
+                                crate::paged::warm_attention_block(
+                                    query.shape[rank - 1],
+                                    query.shape[rank - 3],
+                                    key.shape[rank - 3],
+                                    self.state_schema
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            "compile: block attention requires state schema"
+                                                .to_string()
+                                        })?
+                                        .kv_dtype,
+                                    *scale,
+                                    query.shape[rank - 2],
+                                )?;
+                                pipeline_count += 1;
+                            }
                         }
                     }
                     MetalOp::RotaryEmbedding {
@@ -5203,6 +5330,24 @@ impl<'a> Lowerer<'a> {
                         )?;
                         pipeline_count += 2;
                     }
+                    MetalOp::GroupedExpertLinearRows => {
+                        let MetalCommandPlan::GroupedExpertLinearRows(plan) = command_plan else {
+                            return Err("groupedExpertLinearRows: missing compiled plan".into());
+                        };
+                        pipeline_count += plan.warm()?;
+                    }
+                    MetalOp::ExpertLinearRows => {
+                        let MetalCommandPlan::ExpertLinearRows(plan) = command_plan else {
+                            return Err("expertLinearRows: missing compiled plan".into());
+                        };
+                        plan.warm()?;
+                        pipeline_count += 2;
+                    }
+                    MetalOp::TopKIndices { k } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        crate::kernels::warm_top_k_indices(&declaration_layout(input), *k)?;
+                        pipeline_count += 2;
+                    }
                     MetalOp::Cumsum { dim } => {
                         let input = &self.values[command.inputs[0].index()];
                         crate::kernels::warm_cumsum(&input.shape, input.dtype, *dim)?;
@@ -5477,6 +5622,20 @@ impl<'a> Lowerer<'a> {
             .iter()
             .filter(|command| matches!(command, MetalPhysicalCommand::Complete))
             .count();
+        // Grouped expert projection has a data-dependent exact-M launch list:
+        // one control-data host fence per nonempty route vector, in addition
+        // to terminal completion. It is not a GPU-only capture operation.
+        let synchronization_count = synchronization_count
+            + program
+                .instructions
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command.kind.operation(),
+                        Some((MetalOp::GroupedExpertLinearRows, _))
+                    ) && self.values[command.inputs[0].index()].shape[0] != 0
+                })
+                .count();
         let diagnostics = build_executable_diagnostics(
             &program,
             &memory,
@@ -5509,6 +5668,7 @@ impl<'a> Lowerer<'a> {
                 compiler_work: CompilerWorkReport::default(),
                 last_invocation_memory: Mutex::new(None),
                 state_cursor: self.state_cursor,
+                runs: AtomicU64::new(0),
             },
             self.generated,
             self.generated_order,
@@ -5680,7 +5840,7 @@ pub(super) fn compile_with_state(
     options.environment.metal_private_intermediates = environment.private_intermediates;
     options.environment.metal_mma = environment.mma;
     let mut request = ProgramRequest::from_roots(roots.to_vec(), options);
-    if let Some(schema) = state_schema {
+    if let Some(schema) = &state_schema {
         request = request.with_state_cursor(StateCursorSlot::new(
             schema.cursor_slot,
             schema.cursor_tensor,
@@ -5712,8 +5872,9 @@ pub(super) fn compile_prepared_with_state(
     if ce_chunk_size == 0 {
         return Err("compile: CE chunk size must be positive".to_string());
     }
-    let state_cursor =
-        state_schema.map(|schema| StateCursorSlot::new(schema.cursor_slot, schema.cursor_tensor));
+    let state_cursor = state_schema
+        .as_ref()
+        .map(|schema| StateCursorSlot::new(schema.cursor_slot, schema.cursor_tensor));
     if program.state_cursor != state_cursor {
         return Err("compile: Metal state cursor does not match the prepared program".to_string());
     }
@@ -5832,11 +5993,10 @@ struct DeferredCeCheck {
     classes: usize,
 }
 
-/// A quantized-embedding status readback deferred until after the GPU
-/// fence: nonzero means an out-of-range index.
-struct DeferredQuantizedEmbeddingCheck {
+/// A one-word device error status checked after the GPU fence.
+struct DeferredU32Check {
     buffer: Value,
-    rows: usize,
+    error: String,
 }
 
 /// Runs all deferred cross-entropy status checks in command order,
@@ -5877,23 +6037,15 @@ fn run_ce_checks(checks: &[DeferredCeCheck]) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs all deferred quantized-embedding status checks in command
-/// order; a nonzero status word means an index escaped `0..rows`.
-fn run_quantized_embedding_checks(
-    checks: &[DeferredQuantizedEmbeddingCheck],
-) -> Result<(), String> {
+/// Runs deferred one-word device error checks in command order.
+fn run_u32_checks(checks: &[DeferredU32Check]) -> Result<(), String> {
     for check in checks {
         let tensor = check.buffer.as_metal()?;
         if tensor.dtype != DType::U32 || !tensor.layout.is_contiguous() || tensor.numel() != 1 {
-            return Err(
-                "quantized_embedding: deferred status must be one contiguous u32".to_string(),
-            );
+            return Err("deferred status must be one contiguous u32".to_string());
         }
         if tensor.to_u32_vec()?[0] != 0 {
-            return Err(format!(
-                "quantized_embedding: index is outside 0..{}",
-                check.rows
-            ));
+            return Err(check.error.clone());
         }
     }
     Ok(())
@@ -6641,14 +6793,15 @@ struct PreparedExecution {
     sampling_result: Option<crate::run::MetalTensor>,
     sampling_encoded: usize,
     ce_checks: Vec<DeferredCeCheck>,
-    quantized_embedding_checks: Vec<DeferredQuantizedEmbeddingCheck>,
+    u32_checks: Vec<DeferredU32Check>,
     dispatch_result: Result<(), String>,
     _resources: crate::workspace::InvocationResources,
     _submission: Option<device::MetalSubmissionGuard<'static>>,
 }
 
-/// Validates, resolves, and encodes one invocation without any host
-/// fence: every physical command is dispatched and the outcome is
+/// Validates, resolves, and encodes one invocation. Grouped expert commands
+/// fence to read routing controls; other commands defer their host checks.
+/// Every physical command is dispatched and the outcome is
 /// packaged as a [`PreparedExecution`]. When `submission` is `None` an
 /// owned explicit submission is opened (and stored in the result); when
 /// `Some`, the caller's stream is used so consecutive deferred
@@ -6900,12 +7053,15 @@ fn prepare_execution(
         None
     };
     let mut ce_checks = Vec::new();
-    let mut quantized_embedding_checks = Vec::new();
+    let mut u32_checks = Vec::new();
     let owned_submission = match submission {
         Some(_) => None,
         None => Some(metal.begin_submission()?),
     };
-    let invocation_nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
+    let invocation_nonce = executable.options.random_seed.map_or_else(
+        || INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel),
+        |seed| seed.wrapping_add(executable.runs.fetch_add(1, Ordering::AcqRel)),
+    );
     let mut sampling_encoded = 0;
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _dispatch_guard = metal.begin_executable_dispatch()?;
@@ -7006,8 +7162,9 @@ fn prepare_execution(
                                     None
                                 },
                                 &mut ce_checks,
-                                &mut quantized_embedding_checks,
+                                &mut u32_checks,
                                 random_seed(invocation_nonce, *random_seed_token),
+                                cancelled,
                             )
                             .map_err(|error| format!("{}: {error}", op.name()))?;
                             last_encoded = Some(id);
@@ -7066,7 +7223,7 @@ fn prepare_execution(
         sampling_result,
         sampling_encoded,
         ce_checks,
-        quantized_embedding_checks,
+        u32_checks,
         dispatch_result,
         _resources: resources,
         _submission: owned_submission,
@@ -7095,15 +7252,14 @@ fn finish_prepared(
     // sufficient for every deferred host check in command order.
     let sampled_tokens = if let Some(result) = prepared.sampling_result.as_ref() {
         let ce_result = run_ce_checks(&prepared.ce_checks);
-        let quantized_embedding_result =
-            run_quantized_embedding_checks(&prepared.quantized_embedding_checks);
+        let u32_result = run_u32_checks(&prepared.u32_checks);
         let sampled_result = read_sampling_results(result, prepared.sampling_encoded);
         ce_result?;
-        quantized_embedding_result?;
+        u32_result?;
         Some(sampled_result?)
     } else {
         run_ce_checks(&prepared.ce_checks)?;
-        run_quantized_embedding_checks(&prepared.quantized_embedding_checks)?;
+        run_u32_checks(&prepared.u32_checks)?;
         None
     };
     prepared.dispatch_result?;
@@ -7189,7 +7345,7 @@ impl PendingExecution {
     /// after the stream fence.
     fn run_host_checks(&self) -> Result<(), String> {
         run_ce_checks(&self.prepared.ce_checks)?;
-        run_quantized_embedding_checks(&self.prepared.quantized_embedding_checks)
+        run_u32_checks(&self.prepared.u32_checks)
     }
 
     /// Fences the stream once, finishes each pending in order, and releases its
@@ -7234,8 +7390,9 @@ impl Drop for PendingExecution {
     }
 }
 
-/// Executes a stateful invocation without a host fence: validates,
-/// resolves, and dispatches every physical command onto the caller's
+/// Executes a stateful invocation with deferred completion. Grouped expert
+/// commands still fence for their routing controls. Validates, resolves, and
+/// dispatches every physical command onto the caller's
 /// submission stream, encodes the state transactions as GPU-ordered
 /// device copies (so the next deferred chunk's kernels read canonical
 /// state in stream order), applies the CPU-side cursor commits and
@@ -7337,8 +7494,9 @@ fn execute_op_into(
     kv: Option<&dyn MetalDecodeContext>,
     decode_lane: Option<usize>,
     ce_checks: &mut Vec<DeferredCeCheck>,
-    quantized_embedding_checks: &mut Vec<DeferredQuantizedEmbeddingCheck>,
+    u32_checks: &mut Vec<DeferredU32Check>,
     random_seed: u64,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     let input = |index: usize| {
         inputs
@@ -7508,6 +7666,55 @@ fn execute_op_into(
                 &contiguous_tensor_view(scratch_tensors[0], &output(0)?.shape(), 0)?,
                 output(0)?.as_metal()?,
             )
+        }
+        MetalOp::GroupedExpertLinearRows => {
+            let MetalCommandPlan::GroupedExpertLinearRows(plan) = plan else {
+                return Err("groupedExpertLinearRows: missing compiled plan".into());
+            };
+            plan.execute_into(
+                [
+                    input(0)?.as_metal()?,
+                    input(1)?.as_metal()?,
+                    input(2)?.as_metal()?,
+                ],
+                output(0)?.as_metal()?,
+                &scratch_tensors,
+                staging[0].as_metal()?,
+                cancelled,
+            )
+        }
+        MetalOp::ExpertLinearRows => {
+            let MetalCommandPlan::ExpertLinearRows(plan) = plan else {
+                return Err("expertLinearRows: missing compiled plan".into());
+            };
+            plan.execute_into(
+                [
+                    input(0)?.as_metal()?,
+                    input(1)?.as_metal()?,
+                    input(2)?.as_metal()?,
+                ],
+                output(0)?.as_metal()?,
+                status[0].as_metal()?,
+            )?;
+            u32_checks.push(DeferredU32Check {
+                buffer: status[0].clone(),
+                error: "expertLinearRows: expert index is out of range".into(),
+            });
+            Ok(())
+        }
+        MetalOp::TopKIndices { k } => {
+            crate::kernels::top_k_indices_into(
+                device::MetalDevice::get(),
+                input(0)?.as_metal()?,
+                *k,
+                output(0)?.as_metal()?,
+                status[0].as_metal()?,
+            )?;
+            u32_checks.push(DeferredU32Check {
+                buffer: status[0].clone(),
+                error: "topKIndices: NaN input".to_string(),
+            });
+            Ok(())
         }
         MetalOp::Cumsum { dim } => {
             metal_ops::cumsum_into(input(0)?.as_metal()?, *dim, output(0)?.as_metal()?)
@@ -8379,6 +8586,7 @@ fn execute_op_into(
             layer,
             window,
             mode,
+            rounding,
         } => {
             let MetalCommandPlan::KvAttention(requirements) = plan else {
                 return Err("KV attention is missing exact paged requirements".to_string());
@@ -8411,6 +8619,7 @@ fn execute_op_into(
                 *scale,
                 *window,
                 *mode,
+                *rounding,
                 output(0)?.as_metal()?,
                 &staging_tensors,
                 &kv_scratch_tensors,
@@ -8540,9 +8749,12 @@ fn execute_op_into(
                 status[0].as_metal()?,
                 requirements,
             )?;
-            quantized_embedding_checks.push(DeferredQuantizedEmbeddingCheck {
+            u32_checks.push(DeferredU32Check {
                 buffer: status[0].clone(),
-                rows: requirements.rows,
+                error: format!(
+                    "quantized_embedding: index is outside 0..{}",
+                    requirements.rows
+                ),
             });
             Ok(())
         }
@@ -10017,6 +10229,16 @@ mod tests {
                     mma: true,
                 },
                 Some(KvStateSchema {
+                    access: effect_torch_runtime::StateAccessMode::Append,
+                    kv_layers: (0..geometry.layers)
+                        .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                            layer_id: layer_id as u32,
+                            kv_heads: geometry.kv_heads,
+                            head_dim: geometry.head_dim,
+                            dtype: DType::F32,
+                            retention: None,
+                        })
+                        .collect(),
                     max_tokens: 16,
                     block_size: 16,
                     kv_dtype: DType::F32,
@@ -10194,6 +10416,16 @@ mod tests {
         })
         .unwrap();
         let schema = KvStateSchema {
+            access: effect_torch_runtime::StateAccessMode::Append,
+            kv_layers: (0..0)
+                .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                    layer_id: layer_id as u32,
+                    kv_heads: 0,
+                    head_dim: 0,
+                    dtype: DType::F32,
+                    retention: None,
+                })
+                .collect(),
             max_tokens: 64,
             block_size: 16,
             kv_dtype: DType::F32,
@@ -10208,7 +10440,7 @@ mod tests {
             cursor_slot: u32::MAX,
             cursor_tensor: false,
         };
-        let compilation = compile_graph_with_state(&[root], false, schema);
+        let compilation = compile_graph_with_state(&[root], false, schema.clone());
         let padded = compilation.executable.padded_bindings[0].value;
         let Location::Segment { segment, .. } =
             compilation.executable.memory.locations[padded.index()]
@@ -10388,6 +10620,64 @@ mod tests {
             Value::dense(tensor),
         ))))
         .unwrap()
+    }
+
+    #[test]
+    fn configured_semantic_attention_uses_stepwise_bf16_on_metal() {
+        use effect_torch_graph::{AttentionRounding, AttentionWindow};
+        let root = Node::new(NodeKind::SdpaConfigured {
+            q: half_leaf(vec![1.], vec![1, 1], DType::BF16),
+            k: half_leaf(vec![3., -2.], vec![2, 1], DType::BF16),
+            v: half_leaf(vec![0., 1.], vec![2, 1], DType::BF16),
+            scale: 0.3,
+            causal: false,
+            window: AttentionWindow::Inherit,
+            rounding: AttentionRounding::Stepwise,
+            layer_id: Some(9),
+            retention: AttentionWindow::Local(0),
+        })
+        .unwrap();
+        for optimize in [false, true] {
+            let compilation = compile_graph(std::slice::from_ref(&root), optimize);
+            assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [0.1826171875]);
+        }
+    }
+
+    #[test]
+    fn explicit_rotary_rounds_each_half_operation_on_metal() {
+        for (dtype, expected) in [
+            (
+                DType::BF16,
+                [
+                    [-3.59375, -2.296875, -0.0703125, 0.7421875],
+                    [1.0625, 2.640625, 3.078125, 1.0625],
+                ],
+            ),
+            (
+                DType::F16,
+                [
+                    [-3.58203125, -2.298828125, -0.0673828125, 0.73828125],
+                    [1.05859375, 2.646484375, 3.06640625, 1.060546875],
+                ],
+            ),
+        ] {
+            for (layout, expected) in [RotaryLayout::HalfSplit, RotaryLayout::InterleavedPairs]
+                .into_iter()
+                .zip(expected)
+            {
+                let root = Node::new(NodeKind::RotaryEmbeddingExplicit {
+                    x: half_leaf(vec![1.75, -2.25, 3.125, 0.875], vec![1, 4], dtype),
+                    positions: leaf_u32(&[3], vec![1]),
+                    inverse_frequencies: leaf_shape(vec![0.7, 0.02], vec![2]),
+                    layout,
+                })
+                .unwrap();
+                for optimize in [false, true] {
+                    let compilation = compile_graph(std::slice::from_ref(&root), optimize);
+                    assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), expected);
+                }
+            }
+        }
     }
 
     #[test]
@@ -11203,6 +11493,7 @@ mod tests {
                 .map(|timing| timing.phase.as_str())
                 .collect::<Vec<_>>(),
             [
+                "semantic_preparation",
                 "graph_index",
                 "optimization",
                 "target_legalization",
@@ -11376,6 +11667,16 @@ mod tests {
             &[recurrence, ce],
             false,
             KvStateSchema {
+                access: effect_torch_runtime::StateAccessMode::Append,
+                kv_layers: (0..0)
+                    .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                        layer_id: layer_id as u32,
+                        kv_heads: 0,
+                        head_dim: 0,
+                        dtype: DType::F32,
+                        retention: None,
+                    })
+                    .collect(),
                 max_tokens: 64,
                 block_size: 16,
                 kv_dtype: DType::F32,
@@ -11544,6 +11845,7 @@ mod tests {
             layer: 0,
             window: None,
             mode: KvAttentionMode::Causal,
+            rounding: effect_torch_graph::AttentionRounding::Fused,
         })
         .unwrap();
         let error = compile(
@@ -11559,6 +11861,16 @@ mod tests {
         .unwrap();
         assert!(error.contains("requires an explicit state schema"));
         let schema = KvStateSchema {
+            access: effect_torch_runtime::StateAccessMode::Append,
+            kv_layers: (0..1)
+                .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                    layer_id: layer_id as u32,
+                    kv_heads: 1,
+                    head_dim: 2,
+                    dtype: DType::F16,
+                    retention: None,
+                })
+                .collect(),
             max_tokens: 64,
             block_size: 16,
             kv_dtype: DType::F16,
@@ -11615,6 +11927,16 @@ mod tests {
             &[root],
             true,
             KvStateSchema {
+                access: effect_torch_runtime::StateAccessMode::Append,
+                kv_layers: (0..0)
+                    .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                        layer_id: layer_id as u32,
+                        kv_heads: 0,
+                        head_dim: 0,
+                        dtype: DType::F32,
+                        retention: None,
+                    })
+                    .collect(),
                 max_tokens: 64,
                 block_size: 16,
                 kv_dtype: DType::F32,
@@ -11939,6 +12261,16 @@ mod tests {
             &[recurrence],
             false,
             KvStateSchema {
+                access: effect_torch_runtime::StateAccessMode::Append,
+                kv_layers: (0..0)
+                    .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                        layer_id: layer_id as u32,
+                        kv_heads: 0,
+                        head_dim: 0,
+                        dtype: DType::F32,
+                        retention: None,
+                    })
+                    .collect(),
                 max_tokens: 64,
                 block_size: 16,
                 kv_dtype: DType::F32,
@@ -12000,6 +12332,16 @@ mod tests {
             &[recurrence(0), recurrence(1)],
             false,
             KvStateSchema {
+                access: effect_torch_runtime::StateAccessMode::Append,
+                kv_layers: (0..0)
+                    .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                        layer_id: layer_id as u32,
+                        kv_heads: 0,
+                        head_dim: 0,
+                        dtype: DType::F32,
+                        retention: None,
+                    })
+                    .collect(),
                 max_tokens: 64,
                 block_size: 16,
                 kv_dtype: DType::F32,
@@ -12072,6 +12414,7 @@ mod tests {
             _scale: f64,
             _window: Option<usize>,
             _mode: KvAttentionMode,
+            _rounding: effect_torch_graph::AttentionRounding,
             _output: &crate::run::MetalTensor,
             _staging: &[crate::run::MetalTensor],
             _scratch: &[crate::run::MetalTensor],
@@ -12089,6 +12432,16 @@ mod tests {
 
     fn last_token_row_schema() -> KvStateSchema {
         KvStateSchema {
+            access: effect_torch_runtime::StateAccessMode::Append,
+            kv_layers: (0..0)
+                .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                    layer_id: layer_id as u32,
+                    kv_heads: 0,
+                    head_dim: 0,
+                    dtype: DType::F32,
+                    retention: None,
+                })
+                .collect(),
             max_tokens: 64,
             block_size: 16,
             kv_dtype: DType::F32,
@@ -12109,6 +12462,8 @@ mod tests {
         TestDecodeContext {
             schema: last_token_row_schema(),
             slots: vec![Arc::new(Mutex::new(SeqState {
+                copied_bytes: 0,
+                transaction_tail: None,
                 blocks: Vec::with_capacity(4),
                 head: 0,
                 cursor: 0,
@@ -12131,6 +12486,8 @@ mod tests {
                 .iter()
                 .map(|advance| {
                     Arc::new(Mutex::new(SeqState {
+                        copied_bytes: 0,
+                        transaction_tail: None,
                         blocks: Vec::with_capacity(4),
                         head: 0,
                         cursor: 0,
@@ -12379,6 +12736,16 @@ mod tests {
         })
         .unwrap();
         let schema = KvStateSchema {
+            access: effect_torch_runtime::StateAccessMode::Append,
+            kv_layers: (0..0)
+                .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                    layer_id: layer_id as u32,
+                    kv_heads: 0,
+                    head_dim: 0,
+                    dtype: DType::F32,
+                    retention: None,
+                })
+                .collect(),
             max_tokens: 64,
             block_size: 16,
             kv_dtype: DType::F32,
@@ -12398,7 +12765,7 @@ mod tests {
             cursor_slot: u32::MAX,
             cursor_tensor: false,
         };
-        let compilation = compile_graph_with_state(&[recurrence], false, schema);
+        let compilation = compile_graph_with_state(&[recurrence], false, schema.clone());
         let persistent = crate::run::MetalTensor::from_f32(
             device::MetalDevice::get(),
             vec![0.0; 4],
@@ -12407,6 +12774,8 @@ mod tests {
         let context = TestDecodeContext {
             schema,
             slots: vec![Arc::new(Mutex::new(SeqState {
+                copied_bytes: 0,
+                transaction_tail: None,
                 blocks: Vec::with_capacity(4),
                 head: 0,
                 cursor: 0,
@@ -12467,6 +12836,16 @@ mod tests {
         })
         .unwrap();
         let schema = KvStateSchema {
+            access: effect_torch_runtime::StateAccessMode::Append,
+            kv_layers: (0..0)
+                .map(|layer_id| effect_torch_runtime::KvLayerDescriptor {
+                    layer_id: layer_id as u32,
+                    kv_heads: 0,
+                    head_dim: 0,
+                    dtype: DType::F32,
+                    retention: None,
+                })
+                .collect(),
             max_tokens: 64,
             block_size: 16,
             kv_dtype: DType::F32,
@@ -12486,12 +12865,14 @@ mod tests {
             cursor_slot: u32::MAX,
             cursor_tensor: false,
         };
-        let compilation = compile_graph_with_state(&[recurrence], false, schema);
+        let compilation = compile_graph_with_state(&[recurrence], false, schema.clone());
         let persistent =
             crate::run::MetalTensor::from_f32(device::MetalDevice::get(), initial, vec![1, 2, 2]);
         let context = TestDecodeContext {
             schema,
             slots: vec![Arc::new(Mutex::new(SeqState {
+                copied_bytes: 0,
+                transaction_tail: None,
                 blocks: Vec::with_capacity(4),
                 head: 0,
                 cursor: 0,
@@ -12712,6 +13093,62 @@ mod tests {
         let state = context.slots[0].lock().unwrap();
         assert_eq!(state.cursor, 0);
         assert_eq!(state.advance, 1);
+    }
+
+    #[test]
+    fn grouped_expert_plan_reports_control_staging_and_fence() {
+        for rows in [0, 7] {
+            let root = Node::new(NodeKind::GroupedExpertLinearRows {
+                x: leaf_shape(vec![1.0; rows * 3], vec![rows, 3]),
+                weight: leaf_shape(vec![1.0; 4 * 2 * 3], vec![4, 2, 3]),
+                indexes: leaf_u32(&vec![2; rows], vec![rows]),
+            })
+            .unwrap();
+            let compilation = compile_graph(&[root], false);
+            assert_eq!(
+                compilation.executable.diagnostics.synchronization_count,
+                1 + usize::from(rows != 0)
+            );
+            let command = compilation
+                .executable
+                .program
+                .instructions
+                .iter()
+                .find(|command| {
+                    matches!(
+                        command.kind.operation(),
+                        Some((MetalOp::GroupedExpertLinearRows, _))
+                    )
+                })
+                .unwrap();
+            assert_eq!(command.staging.len(), 1);
+            let staging = &compilation.executable.program.values[command.staging[0].value.index()];
+            assert!(staging
+                .declaration
+                .name
+                .contains("grouped_expert_permutation"));
+            assert_eq!(staging.declaration.bytes, (rows * 4).max(1));
+            assert!(matches!(
+                &staging.declaration.storage,
+                ValueStorage::Planned {
+                    ownership: SegmentOwnership::InvocationStaging,
+                    ..
+                }
+            ));
+            assert_eq!(command.scratch.len(), 3);
+            let weight_scratch =
+                &compilation.executable.program.values[command.scratch[2].value.index()];
+            assert_eq!(weight_scratch.declaration.bytes, 2 * 3 * 4);
+            let output = run(&compilation);
+            assert_eq!(output[0].to_f32_vec().unwrap(), vec![3.0; rows * 2]);
+            let retained = output[0].clone();
+            let second = run(&compilation);
+            drop(compilation);
+            assert_eq!(
+                second[0].to_f32_vec().unwrap(),
+                retained.to_f32_vec().unwrap()
+            );
+        }
     }
 
     #[test]

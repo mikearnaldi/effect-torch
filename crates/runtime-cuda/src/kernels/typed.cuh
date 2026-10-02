@@ -14,7 +14,7 @@ struct CudaKernelArgs {
     unsigned int output_dtype;
     unsigned int compute_dtype;
     unsigned int operation;
-    unsigned int reserved;
+    unsigned int error_context;
 };
 static_assert(sizeof(CudaKernelArgs) == 360, "CUDA descriptor ABI size");
 
@@ -45,7 +45,10 @@ __device__ et_u64 et_broadcast(const CudaKernelArgs &a, et_u64 index, int role) 
     return result;
 }
 __device__ void et_error(const CudaKernelArgs &a, unsigned int code) {
-    if (a.scratch[3]) atomicCAS((unsigned int *)a.scratch[3], 0U, code);
+    if (a.scratch[3]) {
+        et_u64 failure = ((et_u64)a.error_context << 32) | code;
+        atomicCAS((unsigned long long *)a.scratch[3], 0ULL, failure);
+    }
 }
 __device__ unsigned int et_bytes(unsigned int dtype) {
     return dtype == 0 || dtype == 4 ? 8 : dtype == 1 || dtype == 5 ? 4 : dtype == 6 ? 1 : 2;
@@ -102,7 +105,19 @@ __device__ unsigned short et_to16(et_i64 x, bool bf) {
 }
 __device__ unsigned short et_to16(unsigned int x, bool bf) { return et_pack16(x, 0, 0, bf); }
 __device__ unsigned short et_to16(unsigned char x, bool bf) { return et_pack16(x, 0, 0, bf); }
-__device__ unsigned short et_to16(float x, bool bf) { return et_to16((double)x, bf); }
+__device__ unsigned short et_to16(float x, bool bf) {
+#ifdef ET_CUDA_F32_BF16_BITS
+    if (bf) {
+        unsigned int bits = __float_as_uint(x);
+        // Match the generic packer's signed canonical quiet NaN. Integer
+        // rounding retains subnormals and signed zeros without FP32 FTZ.
+        if ((bits & 0x7fffffffU) > 0x7f800000U)
+            return (unsigned short)((bits >> 16 & 0x8000U) | 0x7fc0U);
+        return (unsigned short)((bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
+    }
+#endif
+    return et_to16((double)x, bf);
+}
 
 template<class T> __device__ T et_load(et_u64 p, unsigned int dtype, et_u64 i) {
     switch (dtype) {

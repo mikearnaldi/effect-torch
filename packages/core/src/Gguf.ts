@@ -34,7 +34,7 @@ export class GgufError extends Data.TaggedError("GgufError")<{
  * @since 0.1.0
  * @category models
  */
-export type ModelConfig = ReadonlyMap<string, unknown>
+export type Metadata = ReadonlyMap<string, unknown>
 
 /**
  * An explicitly selected GGUF model definition. Model modules provide one
@@ -43,11 +43,11 @@ export type ModelConfig = ReadonlyMap<string, unknown>
  * @since 0.1.0
  * @category models
  */
-export interface ModelDefinition {
+export interface ModelLoader {
   /** Exact value required for `general.architecture`. */
   readonly architecture: string
   /** Constructs a model template from canonical metadata. */
-  readonly create: (metadata: ModelConfig) => Effect.Effect<Model.Model, Model.ModelError>
+  readonly create: (metadata: Metadata) => Effect.Effect<Model.Definition, Model.ModelError>
 }
 
 /**
@@ -57,14 +57,14 @@ export interface ModelDefinition {
  * @since 0.1.0
  * @category models
  */
-export interface LoadedModel {
+export interface Loaded {
   /** The model constructed from the artifact's architecture configuration. */
-  readonly model: Model.Model
+  readonly definition: Model.Definition
   /**
-   * Caller-owned loaded tensors in `model.parameterSpecs` order. Release each
+   * Caller-owned loaded tensors in `definition.parameterSpecs` order. Release each
    * handle when no longer needed; repeated releases are no-ops.
    */
-  readonly params: ReadonlyArray<Tensor.Concrete>
+  readonly parameters: ReadonlyArray<Tensor.Concrete>
   /**
    * Canonical configuration passed to the architecture. The architecture
    * prefix and `general.` are stripped, other keys remain, and
@@ -97,12 +97,12 @@ export interface TensorSpec {
  * @since 0.1.0
  * @category models
  */
-export interface LoadedParameters {
-  /** Validated parameter specifications in the same order as `params`. */
+export interface ParameterSet {
+  /** Validated parameter specifications in the same order as `parameters`. */
   readonly parameterSpecs: ReadonlyArray<TensorSpec>
   /** Caller-owned tensors in the requested parameter-catalog order. */
-  readonly params: ReadonlyArray<Tensor.Concrete>
-  /** Canonical metadata using the same normalization as {@link loadModel}. */
+  readonly parameters: ReadonlyArray<Tensor.Concrete>
+  /** Canonical metadata using the same normalization as {@link load}. */
   readonly metadata: ReadonlyMap<string, unknown>
 }
 
@@ -113,7 +113,7 @@ export interface LoadedParameters {
  * @since 0.1.0
  * @category models
  */
-export interface ParameterArtifactDefinition {
+export interface ParameterLoader {
   /** Exact value required for `general.architecture`. */
   readonly architecture: string
   /** Builds the exact tensor catalog from canonical metadata and inspected descriptors. */
@@ -240,7 +240,7 @@ const descriptorEqual = (left: Runtime.GgufTensorDescriptor, right: Runtime.Gguf
 const modelConfig = (
   inspection: Runtime.GgufInspection,
   architecture: string
-): ModelConfig => {
+): Metadata => {
   const prefix = `${architecture}.`
   const entries = inspection.metadata.map((entry) => ({
     source: entry.key,
@@ -342,7 +342,7 @@ const loadArchive = (
   parameterSpecs: ReadonlyArray<TensorSpec>,
   metadata: ReadonlyMap<string, unknown>,
   names?: ReadonlyArray<string>
-): Effect.Effect<LoadedParameters, GgufError> =>
+): Effect.Effect<ParameterSet, GgufError> =>
   Effect.flatMap(
     fromBackend("load", runtime.extensions.gguf.load(path, names === undefined ? {} : { names })),
     (archive) => {
@@ -383,26 +383,28 @@ const loadArchive = (
         if (params.some((tensor) => tensor === undefined)) {
           throw fail("validate", "loaded GGUF parameter bijection failed")
         }
-        return {
+        const loadedParameters: ParameterSet = {
           parameterSpecs,
-          params: params.filter((tensor) => tensor !== undefined),
+          parameters: params.filter((tensor) => tensor !== undefined),
           metadata
-        } satisfies LoadedParameters
+        }
+
+        return loadedParameters
       })
       return Effect.onExit(validated, (exit) => Exit.isFailure(exit) ? clearLoaded(runtime, entries) : Effect.void)
     }
   )
 
 /**
- * Loads GGUF parameters without constructing a {@link Model.Model}. Omitting
+ * Loads GGUF parameters without constructing a {@link Model.Definition}. Omitting
  * `options.names` requires an exact full-file catalog and loads every tensor.
  * Supplying names validates and loads only those catalog entries, in selection
  * order. Missing or duplicate names fail before payload loading. An empty
  * selection loads no tensors. Unselected payloads are never read or allocated.
  * This loader supports target-coupled checkpoints such as DFlash. It follows
- * the same two-read and ownership rules as {@link loadModel} for inspection,
+ * the same two-read and ownership rules as {@link load} for inspection,
  * architecture validation, catalog construction, and loading. On success, the
- * caller owns every tensor in `params`; on post-load validation failure every
+ * caller owns every tensor in `parameters`; on post-load validation failure every
  * discoverable returned handle receives a best-effort release attempt.
  *
  * @since 0.1.0
@@ -410,23 +412,23 @@ const loadArchive = (
  */
 export const loadParameters = (
   path: string,
-  definition: ParameterArtifactDefinition,
+  loader: ParameterLoader,
   options: LoadOptions = {}
-): Effect.Effect<LoadedParameters, GgufError | Model.ModelError, Runtime.Runtime> =>
+): Effect.Effect<ParameterSet, GgufError | Model.ModelError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const names = yield* validateEffect(() => snapshotNames(options.names))
     const runtime = yield* Runtime.Runtime
     const inspected = yield* fromBackend("inspect", runtime.extensions.gguf.inspect(path))
     const inspection = yield* validateEffect(() => validateInspection(inspected))
     const architectureEntry = inspection.metadata.find((entry) => entry.key === "general.architecture")
-    if (architectureEntry?.value !== definition.architecture) {
+    if (architectureEntry?.value !== loader.architecture) {
       return yield* fail(
         "validate",
-        `GGUF general.architecture must be exactly ${JSON.stringify(definition.architecture)}`
+        `GGUF general.architecture must be exactly ${JSON.stringify(loader.architecture)}`
       )
     }
-    const metadata = yield* validateEffect(() => modelConfig(inspection, definition.architecture))
-    const catalog = yield* definition.parameterSpecs(metadata, inspection.tensors)
+    const metadata = yield* validateEffect(() => modelConfig(inspection, loader.architecture))
+    const catalog = yield* loader.parameterSpecs(metadata, inspection.tensors)
     const selection = yield* validateEffect(() => {
       const parameters = snapshotParameters(catalog)
       if (names === undefined) {
@@ -502,26 +504,26 @@ const clearLoaded = (
  * @since 0.1.0
  * @category loading
  */
-export const loadModel = (
+export const load = (
   path: string,
-  definition: ModelDefinition
-): Effect.Effect<LoadedModel, GgufError | Model.ModelError, Runtime.Runtime> =>
+  loader: ModelLoader
+): Effect.Effect<Loaded, GgufError | Model.ModelError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const gguf = runtime.extensions.gguf
     const inspected = yield* fromBackend("inspect", gguf.inspect(path))
     const inspection = yield* validateEffect(() => validateInspection(inspected))
     const architectureEntry = inspection.metadata.find((entry) => entry.key === "general.architecture")
-    if (architectureEntry?.value !== definition.architecture) {
+    if (architectureEntry?.value !== loader.architecture) {
       return yield* fail(
         "validate",
-        `GGUF general.architecture must be exactly ${JSON.stringify(definition.architecture)}`
+        `GGUF general.architecture must be exactly ${JSON.stringify(loader.architecture)}`
       )
     }
-    const config = yield* validateEffect(() => modelConfig(inspection, definition.architecture))
-    const model = yield* definition.create(config)
+    const config = yield* validateEffect(() => modelConfig(inspection, loader.architecture))
+    const model = yield* loader.create(config)
     yield* validateEffect(() => validateCatalog(model.parameterSpecs, inspection.tensors))
     const parameters = yield* validateEffect(() => snapshotParameters(model.parameterSpecs))
     const loaded = yield* loadArchive(path, runtime, inspection.tensors, parameters, config)
-    return { model, params: loaded.params, metadata: loaded.metadata }
+    return { definition: model, parameters: loaded.parameters, metadata: loaded.metadata }
   })

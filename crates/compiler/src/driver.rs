@@ -5,7 +5,7 @@
 //! dispatched callbacks, and the driver records each boundary as a named
 //! [`CompilePhaseTiming`]. The `*_PHASE` constants below define this order:
 //!
-//! `graph_index`, `optimization`, `target_legalization`, `lowering`,
+//! `semantic_preparation`, `graph_index`, `optimization`, `target_legalization`, `lowering`,
 //! `lowered_program_validation`, `memory_planning`, the backend phases
 //! `physical_planning`, `pipeline_preparation`, `artifact_assembly`, and
 //! `compile_submission`, then `publication`.
@@ -23,6 +23,8 @@ use effect_torch_runtime::{CompilePhaseTiming, MemoryPlan};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Mandatory same-device semantic decomposition after decode specialization.
+pub const SEMANTIC_PREPARATION_PHASE: &str = "semantic_preparation";
 /// Builds the program's graph index during preparation.
 pub const GRAPH_INDEX_PHASE: &str = "graph_index";
 /// Region selection and lowering-order construction.
@@ -53,10 +55,12 @@ fn timing(phase: &str, elapsed: Duration) -> CompilePhaseTiming {
     }
 }
 
-/// Prepares one semantic graph generation and records its graph-index build.
+/// Prepares one semantic graph generation and records mandatory decomposition
+/// and graph-index phases. Decode specialization precedes this entry point.
 ///
 /// Validates that the request has at least one root, sound options, and one
-/// device across the graph. It then builds the shared [`GraphIndex`] and
+/// device across the graph. It decomposes ordinary configured operations,
+/// retains the immutable source roots, and builds the shared [`GraphIndex`] and
 /// resolves the invocation contract. Callers provide explicit contracts.
 /// Native requests derive them from the graph. The returned
 /// [`PreparedProgram`] contains everything later stages need.
@@ -68,6 +72,10 @@ pub fn prepare_program(request: ProgramRequest) -> Result<PreparedProgram, Strin
     };
     options.validate()?;
     let expected_device = first_root.device.clone();
+    let source_roots = roots;
+    let started = Instant::now();
+    let roots = crate::semantic::prepare_semantics(&source_roots)?;
+    let semantic_timing = timing(SEMANTIC_PREPARATION_PHASE, started.elapsed());
     let started = Instant::now();
     let index = GraphIndex::new(&roots);
     let graph_index_timing = timing(GRAPH_INDEX_PHASE, started.elapsed());
@@ -86,12 +94,13 @@ pub fn prepare_program(request: ProgramRequest) -> Result<PreparedProgram, Strin
     };
     crate::request::resolve_binding_storage(&mut index, &signature, state_cursor)?;
     Ok(PreparedProgram {
+        source_roots: source_roots.into_boxed_slice(),
         roots: roots.into_boxed_slice(),
         index: Arc::new(index),
         signature,
         options,
         state_cursor,
-        preparation_phases: vec![graph_index_timing].into_boxed_slice(),
+        preparation_phases: vec![semantic_timing, graph_index_timing].into_boxed_slice(),
     })
 }
 
@@ -359,6 +368,7 @@ mod tests {
                 .map(|phase| phase.phase.as_str())
                 .collect::<Vec<_>>(),
             [
+                SEMANTIC_PREPARATION_PHASE,
                 GRAPH_INDEX_PHASE,
                 OPTIMIZATION_PHASE,
                 TARGET_LEGALIZATION_PHASE,

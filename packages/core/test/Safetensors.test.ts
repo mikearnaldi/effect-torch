@@ -189,7 +189,7 @@ onDevices("Safetensors", () => (it) => {
           parameterSpecs: [{ name: "selected", shape: [1], initializer: { _tag: "Constant", value: 0 } }],
           forward: ([value], input) => Tensor.mul(input, value)
         })
-        const parameters = yield* Safetensors.loadModel(model, file)
+        const parameters = yield* Safetensors.loadParameters(model, file)
         expect(parameters).toHaveLength(1)
         expect(yield* Tensor.toNumberArray(parameters[0])).toEqual([1])
         yield* Tensor.clearAll(parameters)
@@ -288,14 +288,14 @@ onDevices("Safetensors", () => (it) => {
     }))
 
   describe("model parameters", () => {
-    it.effect("saveModel/loadModel round-trips values and order", () =>
+    it.effect("saveParameters/loadParameters round-trips values and order", () =>
       withDirectory((dir) =>
         Effect.gen(function*() {
           const file = path.join(dir, "mlp.safetensors")
           const model = yield* mlp
           const params = yield* Tensor.compute(yield* Model.initialize(model))
-          yield* Safetensors.saveModel(model, params, file)
-          const loaded = yield* Safetensors.loadModel(model, file)
+          yield* Safetensors.saveParameters(model, params, file)
+          const loaded = yield* Safetensors.loadParameters(model, file)
           expect(loaded.length).toBe(model.parameterSpecs.map(({ name }) => name).length)
           for (let i = 0; i < params.length; i++) {
             expect(loaded[i].shape).toEqual(params[i].shape)
@@ -308,13 +308,13 @@ onDevices("Safetensors", () => (it) => {
         })
       ))
 
-    it.effect("saveModel fails with ModelError on an arity mismatch", () =>
+    it.effect("saveParameters fails with ModelError on an arity mismatch", () =>
       withDirectory((dir) =>
         Effect.gen(function*() {
           const model = yield* mlp
           const params = yield* Tensor.compute(yield* Model.initialize(model))
           const error = yield* Effect.flip(
-            Safetensors.saveModel(model, params.slice(0, 3), path.join(dir, "x.safetensors"))
+            Safetensors.saveParameters(model, params.slice(0, 3), path.join(dir, "x.safetensors"))
           )
           expect(error._tag).toBe("ModelError")
           expect(error.op).toBe("save")
@@ -322,14 +322,14 @@ onDevices("Safetensors", () => (it) => {
         })
       ))
 
-    it.effect("loadModel fails with ModelError on missing keys", () =>
+    it.effect("loadParameters fails with ModelError on missing keys", () =>
       withDirectory((dir) =>
         Effect.gen(function*() {
           const file = path.join(dir, "partial.safetensors")
           const small = yield* Model.linear("fc1", 2, 8)
           const params = yield* Tensor.compute(yield* Model.initialize(small))
-          yield* Safetensors.saveModel(small, params, file)
-          const error = yield* Effect.flip(Safetensors.loadModel(yield* mlp, file))
+          yield* Safetensors.saveParameters(small, params, file)
+          const error = yield* Effect.flip(Safetensors.loadParameters(yield* mlp, file))
           expect(error._tag).toBe("ModelError")
           expect(error.op).toBe("load")
           expect(error.message).toContain("fc2.weight")
@@ -345,13 +345,13 @@ onDevices("Safetensors", () => (it) => {
             yield* Model.tanh,
             yield* Model.linear("fc2", 8, 1)
           )
-          yield* Safetensors.saveModel(wide, yield* Tensor.compute(yield* Model.initialize(wide)), file)
+          yield* Safetensors.saveParameters(wide, yield* Tensor.compute(yield* Model.initialize(wide)), file)
           const narrow = yield* Model.chain(
             yield* Model.linear("fc1", 2, 8),
             yield* Model.tanh,
             yield* Model.linear("fc2", 8, 1)
           )
-          const params = yield* Safetensors.loadModel(narrow, file)
+          const params = yield* Safetensors.loadParameters(narrow, file)
           const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
           const error = yield* Effect.flip(narrow.forward(params, x))
           expect(error._tag).toBe("TensorError")
